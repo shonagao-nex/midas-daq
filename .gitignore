@@ -82,3 +82,6 @@ Testing/
 # Core dumps
 core
 core.*
+
+# CODEX
+AGENTS.md
