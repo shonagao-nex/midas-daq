@@ -1,0 +1,17 @@
+/easiroc_test
+/easiroc_event_test
+/easiroc_stream_test
+/easiroc_daq_control_test
+/easiroc_slow_control_test
+/easiroc_readout_test
+/easiroc_read_one
+/easiroc_read_many
+/feeasiroc
+/*.o
+
+# Generated/local files in the archived legacy controller tree.
+/reference/controller_20170425/.bundle/
+/reference/controller_20170425/.history
+/reference/controller_20170425/gems/
+/reference/controller_20170425/hist
+/reference/controller_20170425/objs/

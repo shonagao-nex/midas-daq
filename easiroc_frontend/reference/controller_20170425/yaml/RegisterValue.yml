@@ -1,0 +1,32 @@
+EASIROC1:
+        Capacitor HG PA Fdbck: 100fF
+        Capacitor LG PA Fdbck: 100fF
+        Time Constant HG Shaper: 100ns
+        Time Constant LG Shaper: 50ns
+        DAC code: 600
+
+EASIROC2:
+        Capacitor HG PA Fdbck: same
+        Capacitor LG PA Fdbck: same
+        Time Constant HG Shaper: same
+        Time Constant LG Shaper: same
+        DAC code: same
+
+High Gain Channel 1: -1
+High Gain Channel 2: -1
+Probe Channel 1: -1
+Probe Channel 2: -1
+Probe 1: Out_fs
+Probe 2: Out_fs #Out_PA_HG,Out_PA_LG,Out_ssh_HG,Out_ssh_LG,Out_fs
+SelectableLogic: 
+        Pattern: Or64 #OneCh_#,Or32u,Or32d,Or64,Or32And,Or16And,And32u,And32d,And64,And32Or
+        HitNum Threshold: 4 # Threshold for each OR logic. 0~64. Default: 0
+        And Channels: -1 # Cannels used in And Logic. 0~63. Default: -1
+TimeWindow: 4095ns
+UsrClkOut: "OFF" #"OFF","ON",1Hz,10Hz,100Hz,1kHz.10kHz,100kHz,3MHz,25MHz
+Trigger:  ## This "Trigger" values are not used for this version.
+        Mode: 0  #0-7
+        DelayTrigger: -1  #500MHz #default:-1, 0-253 #trig -> hold -> l1 -> l2
+        DelayHold: -1     #25MHz
+        DelayL1Trig: -1   #6MHz
+        Width: raw          

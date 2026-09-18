@@ -1,0 +1,155 @@
+---
+- - EN_input_dac
+  - Bits: 1
+    ActiveLow: false
+- - 8-bit DAC reference
+  - Bits: 1
+    ActiveLow: false
+- - Input 8-bit DAC
+  - Bits: 9
+    Array: 32
+    BitOrder: LSBtoMSB
+    ActiveLow: false
+- - Low Gain PA bias
+  - Bits: 1
+    ActiveLow: false
+- - High Gain PreAmplifier PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_High_Gain_PA
+  - Bits: 1
+    ActiveLow: false
+- - Low Gain PreAmplifier PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_Low_Gain_PA
+  - Bits: 1
+    ActiveLow: false
+- - Capacitor HG PA Comp
+  - Bits: 4
+    BitOrder: LSBtoMSB
+    ActiveLow: false
+- - Capacitor HG PA Fdbck
+  - Bits: 4
+    BitOrder: LSBtoMSB
+    ActiveLow: false
+- - Capacitor LG PA Fdbck
+  - Bits: 4
+    BitOrder: MSBtoLSB
+    ActiveLow: false
+- - Capacitor LG PA Comp
+  - Bits: 4
+    BitOrder: MSBtoLSB
+    ActiveLow: false
+- - DisablePA & In_calib_EN
+  - Bits: 2
+    Array: 32
+    BitOrder: MSBtoLSB
+    ActiveLow: false
+- - Low Gain Slow Shaper PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_Low_Gain_Slow Shaper
+  - Bits: 1
+    ActiveLow: false
+- - Time Constant LG Shaper
+  - Bits: 3
+    BitOrder: LSBtoMSB
+    ActiveLow: true
+- - High Gain Slow Shaper PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_High_Gain_Slow Shaper
+  - Bits: 1
+    ActiveLow: false
+- - Time Constant HG Shaper
+  - Bits: 3
+    BitOrder: LSBtoMSB
+    ActiveLow: true
+- - Fast Shapers Follower PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_Fast Shaper
+  - Bits: 1
+    ActiveLow: false
+- - Fast Shaper PP
+  - Bits: 1
+    ActiveLow: false
+- - T&H(Widlar SCA) PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_T&H(Widlar SCA)
+  - Bits: 1
+    ActiveLow: false
+- - T&H bias(Widlar)
+  - Bits: 1
+    ActiveLow: false
+- - EN_discri
+  - Bits: 1
+    ActiveLow: false
+- - Discriminator PP
+  - Bits: 1
+    ActiveLow: false
+- - RS_or_discri
+  - Bits: 1
+    ActiveLow: false
+- - Discriminator Mask
+  - Bits: 1
+    Array: 32
+    ActiveLow: true
+- - DAC code
+  - Bits: 10
+    BitOrder: LSBtoMSB
+    ActiveLow: false
+- - DAC slope
+  - Bits: 1
+    ActiveLow: false
+- - DAC PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_DAC
+  - Bits: 1
+    ActiveLow: false
+- - BandGap PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_BandGap
+  - Bits: 1
+    ActiveLow: false
+- - High Gain OTAq PP
+  - Bits: 1
+    ActiveLow: false
+- - Low Gain OTAq PP
+  - Bits: 1
+    ActiveLow: false
+- - Probe OTAq PP
+  - Bits: 1
+    ActiveLow: false
+- - LVDS receivers PP
+  - Bits: 1
+    ActiveLow: false
+- - EN_High Gain OTAq
+  - Bits: 1
+    ActiveLow: false
+- - EN_Low Gain OTAq
+  - Bits: 1
+    ActiveLow: false
+- - EN_Probe OTAq
+  - Bits: 1
+    ActiveLow: false
+- - EN_LVDS receivers
+  - Bits: 1
+    ActiveLow: false
+- - EN_out_dig
+  - Bits: 1
+    ActiveLow: false
+- - EN_OR32
+  - Bits: 1
+    ActiveLow: true
+- - EN_32_triggers
+  - Bits: 1
+    ActiveLow: true
+- - NC
+  - Bits: 4
+    BitOrder: MSBtoLSB
+    ActiveLow: false

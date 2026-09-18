@@ -1,0 +1,144 @@
+---
+Input 8-bit DAC:
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+- 256
+Time Constant HG Shaper: 50ns
+Time Constant LG Shaper: 50ns
+DAC code: 840
+8-bit DAC reference: external
+Capacitor HG PA Comp: 14
+Capacitor HG PA Fdbck: 200fF
+Capacitor LG PA Comp: 9
+Capacitor LG PA Fdbck: 200fF
+Low Gain PA bias: high bias
+DisablePA & In_calib_EN:
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+T&H bias(Widlar): high bias
+RS_or_discri: trigger
+Discriminator Mask:
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+- 0
+DAC slope: fine
+High Gain PreAmplifier PP: Enable
+High Gain Slow Shaper PP: Enable
+High Gain OTAq PP: Enable
+Low Gain PreAmplifier PP: Enable
+Low Gain Slow Shaper PP: Enable
+Low Gain OTAq PP: Enable
+T&H(Widlar SCA) PP: Enable
+Probe OTAq PP: Enable
+Fast Shaper PP: Enable
+Fast Shapers Follower PP: Enable
+Discriminator PP: Enable
+DAC PP: Enable
+LVDS receivers PP: Enable
+BandGap PP: Enable
+EN_input_dac: Enable
+EN_High_Gain_PA: Enable
+EN_High_Gain_Slow Shaper: Enable
+EN_High Gain OTAq: Enable
+EN_Low_Gain_PA: Enable
+EN_Low_Gain_Slow Shaper: Enable
+EN_Low Gain OTAq: Enable
+EN_T&H(Widlar SCA): Enable
+EN_Probe OTAq: Enable
+EN_Fast Shaper: Enable
+EN_discri: Enable
+EN_DAC: Enable
+EN_32_triggers: Enable
+EN_out_dig: Enable
+EN_OR32: Enable
+EN_LVDS receivers: Enable
+EN_BandGap: Enable
+NC: 0

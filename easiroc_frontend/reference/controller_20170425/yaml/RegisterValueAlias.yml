@@ -1,0 +1,47 @@
+---
+Time Constant [HL]G Shaper:
+  25ns: 1
+  50ns: 2
+  75ns: 3
+  100ns: 4
+  125ns: 5
+  150ns: 6
+  175ns: 7
+Capacitor [HL]G PA Fdbck:
+  NoC: 0
+  100fF: 8
+  200fF: 4
+  300fF: 12
+  400fF: 2
+  500fF: 10
+  600fF: 6
+  700fF: 14
+  800fF: 1
+  900fF: 9
+  1.0pF: 5
+  1.1pF: 13
+  1.2pF: 3
+  1.3pF: 11
+  1.4pF: 7
+  1.5pF: 15
+8-bit DAC reference:
+  external: 1
+  internal: 0
+Low Gain PA bias:
+  weakbias: 1
+  highbias: 0
+T&H bias\(Widlar\):
+  weakbias: 1
+  highbias: 0
+RS_or_discri:
+  RS: 1
+  trigger: 0
+DAC slope:
+  fine: 1
+  coarse: 0
+"^EN_.*":
+  Enable: 1
+  Disable: 0
+".* PP$":
+  Enable: 1
+  Disable: 0
