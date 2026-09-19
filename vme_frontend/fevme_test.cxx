@@ -7,12 +7,17 @@
 #include "mvmestd.h"
 #include "vme/v792.h"
 #include "v775.h"
+#include "v1720e.h"
 
 /* Module locations. */
 #define V792_BASE 0x00600000
 #define V1190_BASE 0x00C10000
 #define V775_BASE 0x00000000
+#define V1720E_BASE V1720E_BASE_ADDRESS
 
+#ifndef ENABLE_V775
+#define ENABLE_V775 1
+#endif
 #ifndef ENABLE_V792_SW_TRIGGER_TEST
 #define ENABLE_V792_SW_TRIGGER_TEST 0
 #endif
@@ -48,6 +53,7 @@ static const WORD V775_RUN_CLEAR_BITS = V775_BIT2_SLIDE_ENABLE |
 /* Finite ready/handshake polling limits. */
 static const unsigned V1190_READY_MAX_POLLS = 100;
 static const unsigned V775_READY_MAX_POLLS = 100;
+static const unsigned V1720E_READY_MAX_POLLS = 100;
 static const unsigned V775_SW_TRIGGER_MAX_POLLS = 100;
 static const unsigned V1190_MICRO_MAX_POLLS = 1000;
 
@@ -120,9 +126,22 @@ struct RunStatistics {
     uint64_t counter_mismatch_count;
     uint32_t first_mismatch_serial;
     uint32_t last_mismatch_serial;
+    uint64_t v1720_malformed_count;
+    uint64_t v1720_size_error_count;
+    uint64_t v1720_mask_error_count;
+    uint64_t v1720_read_timeout_count;
+    uint64_t v1720_counter_discontinuity_count;
+    uint64_t v1720_ttt_count;
+    DWORD v1720_first_counter;
+    DWORD v1720_last_counter;
+    DWORD v1720_previous_counter;
+    DWORD v1720_previous_ttt;
+    DWORD v1720_min_ttt_delta;
+    DWORD v1720_max_ttt_delta;
+    bool v1720_have_previous;
 };
 
-static RunStatistics gRunStatistics = {0, 0, 0};
+static RunStatistics gRunStatistics = {};
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
 static WORD gV1190SavedControl = 0;
@@ -131,7 +150,7 @@ static bool gV1190ModeMayHaveChanged = false;
 static bool gV1190EmptyEventMayHaveChanged = false;
 #endif
 
-#if ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
 static WORD gV775SavedBitSet2 = 0;
 static bool gV775DiagnosticSaved = false;
 static bool gV775EmptyProgramMayHaveChanged = false;
@@ -161,6 +180,8 @@ struct V775EventInfo {
     unsigned geo;
     bool valid;
 };
+
+static bool gV1720Started = false;
 
 /* Low-level VME access helpers. */
 static bool vme_read16(DWORD address, WORD &value, const char *description)
@@ -489,6 +510,7 @@ static bool wait_for_v1190_data_ready()
 }
 
 /* Read exactly one V775 event through its EOB using D32 single cycles. */
+#if ENABLE_V775
 static V775EventInfo read_v775_single_event(DWORD (&data)[V775_MAX_EVENT_WORDS])
 {
     V775EventInfo event = {};
@@ -604,6 +626,33 @@ static bool wait_for_v775_data_ready()
     cm_msg(MERROR, frontend_name,
            "V775 DataReady timeout after %u polls; V792 FIFO was not consumed",
            V775_READY_MAX_POLLS);
+    return false;
+}
+#endif
+
+static bool wait_for_v1720e_data_ready()
+{
+    DWORD event_stored = 0;
+    for (unsigned poll = 0; poll < V1720E_READY_MAX_POLLS; ++poll) {
+        int ready = 0;
+        const int status = v1720e_data_ready(gVme, V1720E_BASE, &ready,
+                                            &event_stored);
+        if (status != MVME_SUCCESS) {
+            ++gRunStatistics.v1720_read_timeout_count;
+            cm_msg(MERROR, frontend_name,
+                   "V1720E ready read failed: status %d", status);
+            return false;
+        }
+        if (ready)
+            return true;
+        if (poll + 1 < V1720E_READY_MAX_POLLS)
+            ss_sleep(1);
+    }
+    ++gRunStatistics.v1720_read_timeout_count;
+    cm_msg(MERROR, frontend_name,
+           "V1720E DataReady timeout after %u polls (Event Stored %u); "
+           "V792 FIFO was not consumed",
+           V1720E_READY_MAX_POLLS, event_stored);
     return false;
 }
 
@@ -730,7 +779,7 @@ static bool setup_v1190_soft_trigger_test()
 }
 #endif
 
-#if ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
 static bool restore_v775_diagnostic_settings()
 {
     if (!gV775DiagnosticSaved)
@@ -882,6 +931,7 @@ static bool check_module_communication()
     printf("V1190A detected: Status=0x%04X Event Stored=%u.\n",
            v1190_status, v1190_events);
 
+#if ENABLE_V775
     printf("Checking V775 at 0x%08X...\n", V775_BASE);
     if (!v775_isPresent(gVme, V775_BASE)) {
         cm_msg(MERROR, frontend_name,
@@ -890,6 +940,28 @@ static bool check_module_communication()
     }
     printf("V775 detected.\n");
     v775_Status(gVme, V775_BASE);
+#else
+    printf("V775 disabled by ENABLE_V775=0; communication check skipped.\n");
+#endif
+
+    V1720E_BOARD_INFO v1720 = {};
+    printf("Checking V1720E at 0x%08X...\n", V1720E_BASE);
+    const int v1720_status = v1720e_probe(gVme, V1720E_BASE, &v1720);
+    if (v1720_status != MVME_SUCCESS ||
+        (v1720.board_info & 0xFFu) != 0x03u ||
+        ((v1720.board_info >> 8) & 0xFFu) != 0x02u ||
+        ((v1720.board_info >> 16) & 0xFFu) != 8u) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E identification failed at 0x%08X: status %d "
+               "BoardInfo 0x%08X",
+               V1720E_BASE, v1720_status, v1720.board_info);
+        return false;
+    }
+    printf("V1720E detected: BoardInfo=0x%08X ROC-FW=0x%08X "
+           "AcqControl=0x%08X AcqStatus=0x%08X EventStored=%u.\n",
+           v1720.board_info, v1720.roc_firmware,
+           v1720.acquisition_control, v1720.acquisition_status,
+           v1720.event_stored);
     return true;
 }
 
@@ -921,22 +993,28 @@ static bool read_v1190_configuration(V1190Configuration &c)
 static bool log_current_configuration(const char *phase)
 {
     WORD vf = 0, vs1 = 0, vs2 = 0, vb = 0, iped = 0;
+#if ENABLE_V775
     WORD tf = 0, ts1 = 0, ts2 = 0, tb = 0, fsr = 0;
-    WORD vth[V792_MAX_CHANNELS], tth[V775_MAX_CHANNELS];
+    WORD tth[V775_MAX_CHANNELS];
+#endif
+    WORD vth[V792_MAX_CHANNELS];
     V1190Configuration c = {};
     if (!vme_read16(V792_BASE + V792_FIRM_REV, vf, "V792 Firmware") ||
         !vme_read16(V792_BASE + V792_CSR1_RO, vs1, "V792 Status 1") ||
         !vme_read16(V792_BASE + V792_CSR2_RO, vs2, "V792 Status 2") ||
         !vme_read16(V792_BASE + V792_BIT_SET2_RW, vb, "V792 Bit Set 2") ||
         !vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped") ||
-        !read_v1190_configuration(c) ||
+        !read_v1190_configuration(c)) return false;
+#if ENABLE_V775
+    if (
         !vme_read16(V775_BASE + V775_FIRMWARE_REVISION, tf, "V775 Firmware") ||
         !vme_read16(V775_BASE + V775_STATUS1, ts1, "V775 Status 1") ||
         !vme_read16(V775_BASE + V775_STATUS2, ts2, "V775 Status 2") ||
         !vme_read16(V775_BASE + V775_BIT_SET2, tb, "V775 Bit Set 2") ||
-        !vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR")) return false;
-    if (v792_ThresholdRead(gVme, V792_BASE, vth) != V792_MAX_CHANNELS ||
+        !vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR") ||
         v775_ThresholdRead(gVme, V775_BASE, tth) != V775_MAX_CHANNELS) return false;
+#endif
+    if (v792_ThresholdRead(gVme, V792_BASE, vth) != V792_MAX_CHANNELS) return false;
     printf("BOR configuration snapshot (%s):\n", phase);
     printf("  V792 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X Iped=0x%04X\n",
            vf, vs1, vs2, vb, iped);
@@ -947,12 +1025,21 @@ static bool log_current_configuration(const char *phase)
            c.max_hits & 0xF, c.header & 1, c.error_mask & 0x7FF, c.fifo_size & 0xF);
     printf("  V1190 channel mask:");
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i) printf(" %04X", c.channels[i]);
+#if ENABLE_V775
     printf("\n  V775 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X FSR=0x%04X\n",
            tf, ts1, ts2, tb, fsr);
+    printf("    VALID=0 datum write: %s (invalid datum %s buffer)\n",
+           tb & V775_BIT2_VALID_CONTROL ? "ENABLED" : "DISABLED",
+           tb & V775_BIT2_VALID_CONTROL ? "is written to" : "is not written to");
+#else
+    printf("\n  V775 : DISABLED (no access)\n");
+#endif
     printf("  V792 thresholds:");
     for (unsigned i = 0; i < V792_MAX_CHANNELS; ++i) printf(" %03X", vth[i]);
+#if ENABLE_V775
     printf("\n  V775 thresholds:");
     for (unsigned i = 0; i < V775_MAX_CHANNELS; ++i) printf(" %03X", tth[i]);
+#endif
     printf("\n");
     return true;
 }
@@ -991,6 +1078,7 @@ static bool configure_v1190_for_run()
     return vme_write16(V1190_BASE + V1190_CONTROL, control, "V1190 Control run settings");
 }
 
+#if ENABLE_V775
 static bool configure_v775_for_run()
 {
     return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, V775_RUN_FULL_SCALE,
@@ -999,6 +1087,30 @@ static bool configure_v775_for_run()
                        "V775 run bits set") &&
            vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_RUN_CLEAR_BITS,
                        "V775 run bits clear");
+}
+#endif
+
+static bool configure_v1720e_for_run()
+{
+    V1720E_BOARD_INFO before = {};
+    const int probe_status = v1720e_probe(gVme, V1720E_BASE, &before);
+    if (probe_status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E pre-configuration read failed: status %d",
+               probe_status);
+        return false;
+    }
+    printf("  V1720E Event Stored before BOR configuration: %u\n",
+           before.event_stored);
+    const int status = v1720e_configure(gVme, V1720E_BASE);
+    if (status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E configuration/readback failed: status %d", status);
+        return false;
+    }
+    printf("  V1720E: BufferOrg=0x0A CustomSize=0x40 PostTrigger=0x30 "
+           "TriggerSource=0xC0000000 ChannelMask=0xFF DCOffset=0x8000\n");
+    return true;
 }
 
 static bool verify_value(const char *module, const char *item,
@@ -1050,6 +1162,7 @@ static bool verify_v1190_configuration()
     return ok;
 }
 
+#if ENABLE_V775
 static bool verify_v775_configuration()
 {
     WORD fsr = 0, bits = 0;
@@ -1061,18 +1174,25 @@ static bool verify_v775_configuration()
     return verify_value("V775", "required clear bits", 0,
                         bits & V775_RUN_CLEAR_BITS) && ok;
 }
+#endif
 
 static bool clear_module_buffers()
 {
     if (!vme_write16(V792_BASE + V792_BIT_SET2_RW, 0x0004, "V792 Data Clear set") ||
         !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO, 0x0004, "V792 Data Clear clear") ||
-        !vme_write16(V1190_BASE + V1190_SOFT_CLEAR, 0, "V1190 Software Clear") ||
+        !vme_write16(V1190_BASE + V1190_SOFT_CLEAR, 0, "V1190 Software Clear")) return false;
+#if ENABLE_V775
+    if (
         !vme_write16(V775_BASE + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, "V775 Data Clear set") ||
         !vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, "V775 Data Clear clear")) return false;
+#endif
     WORD status = 0;
     if (!vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 Status after clear")) return false;
-    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY) ||
-        v775_DataReady(gVme, V775_BASE)) {
+    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY)
+#if ENABLE_V775
+        || v775_DataReady(gVme, V775_BASE)
+#endif
+        ) {
         cm_msg(MERROR, frontend_name, "Buffer clear verify failed: DataReady remains asserted");
         return false;
     }
@@ -1082,10 +1202,10 @@ static bool clear_module_buffers()
 static bool reset_module_event_counters()
 {
     /*
-     * No additional VME write is needed here. V792/V775 Data Clear resets
-     * their accepted-event counters because ALL TRG is configured to zero.
+     * No additional VME write is needed here. V792 (and enabled V775) Data
+     * Clear resets accepted-event counters because ALL TRG is configured zero.
      * V1190 Software Clear resets both its Output Buffer and Event Counter.
-     * verify_run_start_state() reads and logs all three counters.
+     * verify_run_start_state() reads and logs all enabled counters.
      */
     return true;
 }
@@ -1093,22 +1213,39 @@ static bool reset_module_event_counters()
 static bool verify_run_start_state()
 {
     WORD status = 0;
-    DWORD v792_counter = 0, v1190_counter = 0, v775_counter = 0;
+    DWORD v792_counter = 0, v1190_counter = 0;
     v792_EvtCntRead(gVme, V792_BASE, &v792_counter);
+#if ENABLE_V775
+    DWORD v775_counter = 0;
     v775_EvtCntRead(gVme, V775_BASE, &v775_counter);
+#endif
     if (!vme_read32(V1190_BASE + V1190_EVENT_COUNTER, v1190_counter,
                     "V1190 Event Counter") ||
         !vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 run-start Status")) return false;
-    printf("BOR event counters: V792=0x%06X V1190=0x%08X V775=0x%06X\n",
-           v792_counter & V7XX_EVENT_COUNTER_MASK, v1190_counter,
-           v775_counter & V7XX_EVENT_COUNTER_MASK);
-    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY) ||
-        v775_DataReady(gVme, V775_BASE)) {
+    printf("BOR event counters: V792=0x%06X V1190=0x%08X",
+           v792_counter & V7XX_EVENT_COUNTER_MASK, v1190_counter);
+#if ENABLE_V775
+    printf(" V775=0x%06X", v775_counter & V7XX_EVENT_COUNTER_MASK);
+#else
+    printf(" V775=DISABLED");
+#endif
+    printf("\n");
+    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY)
+#if ENABLE_V775
+        || v775_DataReady(gVme, V775_BASE)
+#endif
+        ) {
         cm_msg(MERROR, frontend_name, "BOR run-start verify failed: module buffer is not empty");
         return false;
     }
     printf("BOR configuration complete:\n  V792  : READY\n  V1190 : READY\n"
-           "  V775  : READY\n  Buffers empty\n  Event counters reset\n  Run may start\n");
+#if ENABLE_V775
+           "  V775  : READY\n"
+#else
+           "  V775  : DISABLED\n"
+#endif
+           "  V1720E: READY\n  Buffers empty\n"
+           "  Event counters reset\n  Run may start\n");
     return true;
 }
 
@@ -1116,13 +1253,43 @@ static bool prepare_modules_for_run()
 {
     if (!check_module_communication() ||
         !log_current_configuration("before configuration")) return false;
-    if (!configure_v792_for_run() || !configure_v1190_for_run() ||
-        !configure_v775_for_run()) return false;
-    if (!verify_v792_configuration() || !verify_v1190_configuration() ||
-        !verify_v775_configuration()) return false;
-    return log_current_configuration("after configuration") &&
-           clear_module_buffers() && reset_module_event_counters() &&
-           verify_run_start_state();
+    if (!configure_v792_for_run() || !configure_v1190_for_run()
+#if ENABLE_V775
+        || !configure_v775_for_run()
+#endif
+        || !configure_v1720e_for_run()) return false;
+    if (!verify_v792_configuration() || !verify_v1190_configuration()
+#if ENABLE_V775
+        || !verify_v775_configuration()
+#endif
+        ) return false;
+    if (!log_current_configuration("after configuration") ||
+        !clear_module_buffers() || !reset_module_event_counters() ||
+        !verify_run_start_state())
+        return false;
+    const int start_status = v1720e_start(gVme, V1720E_BASE);
+    if (start_status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E Acquisition Start failed: status %d", start_status);
+        return false;
+    }
+    gV1720Started = true;
+    DWORD v1720_events = 0;
+    int v1720_ready = 0;
+    const int ready_status = v1720e_data_ready(gVme, V1720E_BASE,
+                                               &v1720_ready, &v1720_events);
+    if (ready_status != MVME_SUCCESS || v1720_events > 1) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E post-start buffer verification failed: status %d "
+               "ready=%d Event Stored=%u",
+               ready_status, v1720_ready, v1720_events);
+        v1720e_stop(gVme, V1720E_BASE);
+        gV1720Started = false;
+        return false;
+    }
+    printf("  V1720E Acquisition STARTED; Event Stored after RUN memory reset=%u\n",
+           v1720_events);
+    return true;
 }
 
 #if ENABLE_V792_SW_TRIGGER_TEST
@@ -1151,9 +1318,8 @@ static void setup_v792_sw_trigger_test()
 static void reset_run_statistics()
 {
     gReadoutFailed = false;
-    gRunStatistics.counter_mismatch_count = 0;
-    gRunStatistics.first_mismatch_serial = 0;
-    gRunStatistics.last_mismatch_serial = 0;
+    gRunStatistics = {};
+    gRunStatistics.v1720_min_ttt_delta = 0x7FFFFFFFu;
 }
 
 static void log_run_statistics()
@@ -1163,6 +1329,24 @@ static void log_run_statistics()
     if (gRunStatistics.counter_mismatch_count != 0) {
         printf("First mismatch serial: %u\n", gRunStatistics.first_mismatch_serial);
         printf("Last mismatch serial : %u\n", gRunStatistics.last_mismatch_serial);
+    }
+    printf("V1720E integrity: malformed=%llu size-errors=%llu mask-errors=%llu "
+           "read-timeouts=%llu counter-discontinuities=%llu\n",
+           static_cast<unsigned long long>(gRunStatistics.v1720_malformed_count),
+           static_cast<unsigned long long>(gRunStatistics.v1720_size_error_count),
+           static_cast<unsigned long long>(gRunStatistics.v1720_mask_error_count),
+           static_cast<unsigned long long>(gRunStatistics.v1720_read_timeout_count),
+           static_cast<unsigned long long>(
+               gRunStatistics.v1720_counter_discontinuity_count));
+    if (gRunStatistics.v1720_have_previous) {
+        printf("V1720E counters: first=%u last=%u; TTT delta count=%llu",
+               gRunStatistics.v1720_first_counter,
+               gRunStatistics.v1720_last_counter,
+               static_cast<unsigned long long>(gRunStatistics.v1720_ttt_count));
+        if (gRunStatistics.v1720_ttt_count != 0)
+            printf(" min=%u max=%u", gRunStatistics.v1720_min_ttt_delta,
+                   gRunStatistics.v1720_max_ttt_delta);
+        printf("\n");
     }
 }
 
@@ -1207,11 +1391,18 @@ INT frontend_init()
 INT frontend_exit()
 {
     if (gVme) {
+        if (gV1720Started) {
+            const int status = v1720e_stop(gVme, V1720E_BASE);
+            if (status != MVME_SUCCESS)
+                cm_msg(MERROR, frontend_name,
+                       "V1720E stop failed during frontend exit: %d", status);
+            gV1720Started = false;
+        }
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
         if (!restore_v1190_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V1190 diagnostic restoration failed during frontend exit");
 #endif
-#if ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
         if (!restore_v775_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V775 diagnostic restoration failed during frontend exit");
 #endif
@@ -1245,14 +1436,22 @@ INT begin_of_run(INT run_number, char *error)
         !setup_v1190_soft_trigger_test()) {
         snprintf(error, 256, "V1190 soft-trigger diagnostic setup failed");
         restore_v1190_diagnostic_settings();
+        if (gV1720Started) {
+            v1720e_stop(gVme, V1720E_BASE);
+            gV1720Started = false;
+        }
         return FE_ERR_HW;
     }
 #endif
-#if ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
     if (!restore_v775_diagnostic_settings() ||
         !setup_v775_sw_trigger_test()) {
         snprintf(error, 256, "V775 SW trigger diagnostic setup failed");
         restore_v775_diagnostic_settings();
+        if (gV1720Started) {
+            v1720e_stop(gVme, V1720E_BASE);
+            gV1720Started = false;
+        }
         return FE_ERR_HW;
     }
 #endif
@@ -1264,13 +1463,23 @@ INT end_of_run(INT run_number, char *error)
 {
     bool restore_failed = false;
     printf("End run %d\n", run_number);
+    if (gV1720Started) {
+        const int status = v1720e_stop(gVme, V1720E_BASE);
+        if (status != MVME_SUCCESS) {
+            cm_msg(MERROR, frontend_name,
+                   "V1720E Acquisition Stop failed at EOR: status %d", status);
+            snprintf(error, 256, "V1720E Acquisition Stop failed");
+            return FE_ERR_HW;
+        }
+        gV1720Started = false;
+    }
     log_run_statistics();
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
     if (!restore_v1190_diagnostic_settings())
         restore_failed = true;
 #endif
-#if ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
     if (!restore_v775_diagnostic_settings())
         restore_failed = true;
 #endif
@@ -1306,7 +1515,7 @@ INT frontend_loop()
 /* Poll without consuming FIFO words; test mode performs timing iterations only. */
 INT poll_event(INT source, INT count, BOOL test)
 {
-    if (!gVme || gReadoutFailed)
+    if (!gVme || gReadoutFailed || !gV1720Started)
         return 0;
     for (INT i = 0; i < count; ++i) {
         if (v792_DataReady(gVme, V792_BASE) && !test)
@@ -1325,18 +1534,31 @@ INT interrupt_configure(INT cmd, INT source, PTYPE adr)
 /* Event synchronization layer. Readers expose native counters; pairing uses low 22 bits. */
 static bool check_event_counter_match(const V792EventInfo &v792,
                                       const V1190EventInfo &v1190,
-                                      const V775EventInfo &v775)
+#if ENABLE_V775
+                                      const V775EventInfo &v775,
+#endif
+                                      const V1720E_EVENT_INFO &v1720)
 {
     const DWORD v792_counter22 = v792.event_counter & V1190_EVENT_COUNTER_MASK;
     const DWORD v1190_counter22 = v1190.event_counter & V1190_EVENT_COUNTER_MASK;
+#if ENABLE_V775
     const DWORD v775_counter22 = v775.event_counter & V1190_EVENT_COUNTER_MASK;
+#endif
+    const DWORD v1720_counter22 =
+        v1720.event_counter & V1190_EVENT_COUNTER_MASK;
     return v792_counter22 == v1190_counter22 &&
-           v792_counter22 == v775_counter22;
+#if ENABLE_V775
+           v792_counter22 == v775_counter22 &&
+#endif
+           v792_counter22 == v1720_counter22;
 }
 
 static void log_event_counter_mismatch(const V792EventInfo &v792,
                                        const V1190EventInfo &v1190,
+#if ENABLE_V775
                                        const V775EventInfo &v775,
+#endif
+                                       const V1720E_EVENT_INFO &v1720,
                                        DWORD midas_serial)
 {
     if (gRunStatistics.counter_mismatch_count == 0)
@@ -1347,10 +1569,18 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
     const uint64_t count = gRunStatistics.counter_mismatch_count;
     if (count <= 10) {
         cm_msg(MINFO, frontend_name,
-               "WARNING: Event counter mismatch (accepted): MIDAS serial=%u V792=0x%06X V1190=0x%06X V775=0x%06X",
+               "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
+               "V792=0x%06X V1190=0x%06X "
+#if ENABLE_V775
+               "V775=0x%06X "
+#endif
+               "V1720=0x%06X",
                midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
                v1190.event_counter & V1190_EVENT_COUNTER_MASK,
-               v775.event_counter & V7XX_EVENT_COUNTER_MASK);
+#if ENABLE_V775
+               v775.event_counter & V7XX_EVENT_COUNTER_MASK,
+#endif
+               v1720.event_counter & V7XX_EVENT_COUNTER_MASK);
     } else if (count % 1000 == 0) {
         cm_msg(MINFO, frontend_name,
                "WARNING: Event counter mismatch summary: %llu mismatches through MIDAS serial %u",
@@ -1358,11 +1588,60 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
     }
 }
 
+static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
+                                    DWORD midas_serial)
+{
+    if (!event.size_valid) {
+        ++gRunStatistics.v1720_size_error_count;
+        cm_msg(MERROR, frontend_name,
+               "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
+               midas_serial, event.event_size, V1720E_EXPECTED_EVENT_WORDS);
+    }
+    if (!event.channel_mask_valid) {
+        ++gRunStatistics.v1720_mask_error_count;
+        cm_msg(MERROR, frontend_name,
+               "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0xFF",
+               midas_serial, event.channel_mask);
+    }
+    if (!gRunStatistics.v1720_have_previous) {
+        gRunStatistics.v1720_first_counter = event.event_counter;
+        gRunStatistics.v1720_have_previous = true;
+    } else {
+        const DWORD counter_delta =
+            (event.event_counter - gRunStatistics.v1720_previous_counter) &
+            V7XX_EVENT_COUNTER_MASK;
+        const DWORD ttt_delta =
+            (event.trigger_time_tag - gRunStatistics.v1720_previous_ttt) &
+            0x7FFFFFFFu;
+        if (counter_delta != 1) {
+            ++gRunStatistics.v1720_counter_discontinuity_count;
+            cm_msg(MERROR, frontend_name,
+                   "V1720E counter discontinuity at MIDAS serial %u: "
+                   "previous=%u current=%u delta=%u",
+                   midas_serial, gRunStatistics.v1720_previous_counter,
+                   event.event_counter, counter_delta);
+        }
+        if (gRunStatistics.v1720_ttt_count == 0 ||
+            ttt_delta < gRunStatistics.v1720_min_ttt_delta)
+            gRunStatistics.v1720_min_ttt_delta = ttt_delta;
+        if (ttt_delta > gRunStatistics.v1720_max_ttt_delta)
+            gRunStatistics.v1720_max_ttt_delta = ttt_delta;
+        ++gRunStatistics.v1720_ttt_count;
+    }
+    gRunStatistics.v1720_last_counter = event.event_counter;
+    gRunStatistics.v1720_previous_counter = event.event_counter;
+    gRunStatistics.v1720_previous_ttt = event.trigger_time_tag;
+}
+
 /* MIDAS publishing layer. Hardware access and counter pairing stay outside. */
 static INT build_midas_event(char *pevent,
                              const DWORD *v792_data, const V792EventInfo &v792,
                              const DWORD *v1190_data, const V1190EventInfo &v1190,
-                             const DWORD *v775_data, const V775EventInfo &v775)
+#if ENABLE_V775
+                             const DWORD *v775_data, const V775EventInfo &v775,
+#endif
+                             const DWORD *v1720_data,
+                             const V1720E_EVENT_INFO &v1720)
 {
     bk_init32(pevent);
     void *bank = NULL;
@@ -1375,10 +1654,17 @@ static INT build_midas_event(char *pevent,
     memcpy(bank, v1190_data, v1190.words * sizeof(DWORD));
     bk_close(pevent, static_cast<DWORD *>(bank) + v1190.words);
 
+#if ENABLE_V775
     bank = NULL;
     bk_create(pevent, "TDC1", TID_DWORD, &bank);
     memcpy(bank, v775_data, v775.words * sizeof(DWORD));
     bk_close(pevent, static_cast<DWORD *>(bank) + v775.words);
+#endif
+
+    bank = NULL;
+    bk_create(pevent, "FADC", TID_DWORD, &bank);
+    memcpy(bank, v1720_data, v1720.words * sizeof(DWORD));
+    bk_close(pevent, static_cast<DWORD *>(bank) + v1720.words);
     return bk_size(pevent);
 }
 
@@ -1389,13 +1675,25 @@ INT read_vme_event(char *pevent, INT off)
     if (!gVme || gReadoutFailed)
         return 0;
 
-    // V792 is the primary trigger. Do not consume it until both TDC FIFOs are ready.
-    if (!wait_for_v1190_data_ready() || !wait_for_v775_data_ready())
+    // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
+    if (!wait_for_v1190_data_ready()
+#if ENABLE_V775
+        || !wait_for_v775_data_ready()
+#endif
+        || !wait_for_v1720e_data_ready()) {
+        gReadoutFailed = true;
+        cm_msg(MERROR, frontend_name,
+               "Synchronized readout disabled after module-ready timeout; "
+               "no FIFO was consumed. Check hardware and restart the run.");
         return 0;
+    }
 
     DWORD v792_data[V792_MAX_EVENT_WORDS];
     DWORD v1190_data[V1190_MAX_EVENT_WORDS];
+#if ENABLE_V775
     DWORD v775_data[V775_MAX_EVENT_WORDS];
+#endif
+    DWORD v1720_data[V1720E_MAX_EVENT_WORDS];
     const V792EventInfo v792 = read_v792_single_event(v792_data);
     if (!v792.valid || v792.words == 0) {
         gReadoutFailed = true;
@@ -1412,6 +1710,7 @@ INT read_vme_event(char *pevent, INT off)
         return 0;
     }
 
+#if ENABLE_V775
     const V775EventInfo v775 = read_v775_single_event(v775_data);
     if (!v775.valid || v775.words == 0) {
         gReadoutFailed = true;
@@ -1419,14 +1718,48 @@ INT read_vme_event(char *pevent, INT off)
                "V775 readout disabled after error; V792/V1190 events were consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
         return 0;
     }
+#endif
 
-    if (!check_event_counter_match(v792, v1190, v775))
-        log_event_counter_mismatch(v792, v1190, v775, SERIAL_NUMBER(pevent));
+    V1720E_EVENT_INFO v1720 = {};
+    const int v1720_status =
+        v1720e_read_event(gVme, V1720E_BASE, v1720_data,
+                          V1720E_MAX_EVENT_WORDS, &v1720);
+    if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
+        v1720.words < 4) {
+        ++gRunStatistics.v1720_malformed_count;
+        gReadoutFailed = true;
+        cm_msg(MERROR, frontend_name,
+               "V1720E readout disabled after malformed/partial event: "
+               "status %d words=%zu header-valid=%d. V792/V1190"
+#if ENABLE_V775
+               "/V775"
+#endif
+               " events "
+               "were consumed but no partial MIDAS event was sent.",
+               v1720_status, v1720.words, v1720.header_valid);
+        return 0;
+    }
+
+    update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
+    if (!check_event_counter_match(v792, v1190,
+#if ENABLE_V775
+                                   v775,
+#endif
+                                   v1720))
+        log_event_counter_mismatch(v792, v1190,
+#if ENABLE_V775
+                                   v775,
+#endif
+                                   v1720,
+                                   SERIAL_NUMBER(pevent));
 
     return build_midas_event(pevent,
                              v792_data, v792,
                              v1190_data, v1190,
-                             v775_data, v775);
+#if ENABLE_V775
+                             v775_data, v775,
+#endif
+                             v1720_data, v1720);
 }
 
 

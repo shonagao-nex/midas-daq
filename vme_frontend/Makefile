@@ -11,11 +11,14 @@ CFLAGS   = -O2 -Wall -I$(MIDASSYS)/include -I$(MIDASSYS)/drivers
 ENABLE_V792_SW_TRIGGER_TEST ?= 0
 ENABLE_V1190_SOFT_TRIGGER_TEST ?= 0
 ENABLE_V775_SW_TRIGGER_TEST ?= 0
+ENABLE_V775 ?= 0
 NORMAL_DEFINES = \
+    -DENABLE_V775=$(ENABLE_V775) \
     -DENABLE_V792_SW_TRIGGER_TEST=0 \
     -DENABLE_V1190_SOFT_TRIGGER_TEST=0 \
     -DENABLE_V775_SW_TRIGGER_TEST=0
 DIAGNOSTIC_DEFINES = \
+    -DENABLE_V775=$(ENABLE_V775) \
     -DENABLE_V792_SW_TRIGGER_TEST=1 \
     -DENABLE_V1190_SOFT_TRIGGER_TEST=1 \
     -DENABLE_V775_SW_TRIGGER_TEST=1
@@ -33,7 +36,8 @@ DIAG_TARGET = fevme_test_diag.exe
 
 COMMON_OBJS = caenvme.o \
            v792.o \
-           v775.o
+           v775.o \
+           v1720e.o
 OBJS     = fevme_test.o $(COMMON_OBJS)
 DIAG_OBJS = fevme_test_diag.o $(COMMON_OBJS)
 
@@ -72,6 +76,9 @@ v792.o: $(MIDASSYS)/drivers/vme/v792.c
 
 # Compile the local CAEN V775 driver.
 v775.o: v775.c v775.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+v1720e.o: v1720e.c v1720e.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 
