@@ -16,9 +16,6 @@
 #define V775_BASE 0x00000000
 #define V1720E_BASE V1720E_BASE_ADDRESS
 
-#ifndef ENABLE_V775
-#define ENABLE_V775 1
-#endif
 #ifndef ENABLE_V792_SW_TRIGGER_TEST
 #define ENABLE_V792_SW_TRIGGER_TEST 0
 #endif
@@ -72,6 +69,8 @@ static const WORD V1190_CONTROL_EMPTY_EVENT = 0x0008;
 static const WORD V1190_CONTROL_EVENT_FIFO = 0x0100;
 static const WORD V1190_CONTROL_EXT_TRIGGER_TIME = 0x0200;
 static const WORD V1190_STATUS_DATA_READY = 0x0001;
+static const WORD V1190_STATUS_ALMOST_FULL = 0x0002;
+static const WORD V1190_STATUS_FULL = 0x0004;
 static const WORD V1190_STATUS_TRIGGER_MATCH = 0x0008;
 static const WORD V1190_MICRO_WRITE_OK = 0x0001;
 static const WORD V1190_MICRO_READ_OK = 0x0002;
@@ -85,6 +84,7 @@ static const WORD V1190_OPCODE_SET_WINDOW_OFFSET = 0x1100;
 static const WORD V1190_OPCODE_SET_EXTRA_MARGIN = 0x1200;
 static const WORD V1190_OPCODE_SET_REJECT_MARGIN = 0x1300;
 static const WORD V1190_OPCODE_DISABLE_TRIGGER_SUBTRACTION = 0x1500;
+static const WORD V1190_OPCODE_ENABLE_TRIGGER_SUBTRACTION = 0x1400;
 static const WORD V1190_OPCODE_READ_TRIGGER_CONFIG = 0x1600;
 static const WORD V1190_OPCODE_SET_EDGE_MODE = 0x2200;
 static const WORD V1190_OPCODE_READ_EDGE_MODE = 0x2300;
@@ -93,13 +93,16 @@ static const WORD V1190_OPCODE_READ_RESOLUTION = 0x2600;
 static const WORD V1190_OPCODE_SET_DEAD_TIME = 0x2800;
 static const WORD V1190_OPCODE_READ_DEAD_TIME = 0x2900;
 static const WORD V1190_OPCODE_ENABLE_TDC_HEADER = 0x3000;
+static const WORD V1190_OPCODE_DISABLE_TDC_HEADER = 0x3100;
 static const WORD V1190_OPCODE_READ_TDC_HEADER = 0x3200;
 static const WORD V1190_OPCODE_SET_MAX_HITS = 0x3300;
 static const WORD V1190_OPCODE_READ_MAX_HITS = 0x3400;
 static const WORD V1190_OPCODE_READ_ERROR_MASK = 0x3A00;
 static const WORD V1190_OPCODE_READ_FIFO_SIZE = 0x3C00;
 static const WORD V1190_OPCODE_ENABLE_ALL_CHANNELS = 0x4200;
+static const WORD V1190_OPCODE_WRITE_CHANNEL_MASK = 0x4400;
 static const WORD V1190_OPCODE_READ_CHANNEL_MASK = 0x4500;
+static const DWORD V1190_CONFIGURATION_ROM_VERSION = 0x4030;
 static const WORD V1190_RUN_WINDOW_WIDTH = 12;
 static const WORD V1190_RUN_WINDOW_OFFSET = 0xFFF4; // signed -12 counts
 static const WORD V1190_RUN_EXTRA_MARGIN = 8;
@@ -289,6 +292,377 @@ static bool get_absolute_odb_value(const char *path, void *value, INT size,
                path, status, actual_size, size);
         return false;
     }
+    return true;
+}
+
+static const char *V792_SETTINGS_PATH = "/Equipment/VME/Settings/V792";
+static const char *V792_INFO_PATH = "/Equipment/VME/Info/V792";
+static const char *V792_READBACK_PATH = "/Equipment/VME/Readback/V792";
+static const char *V792_VARIABLES_PATH = "/Equipment/VME/Variables/V792";
+static const char *V1190_SETTINGS_PATH = "/Equipment/VME/Settings/V1190";
+static const char *V1190_INFO_PATH = "/Equipment/VME/Info/V1190";
+static const char *V1190_READBACK_PATH = "/Equipment/VME/Readback/V1190";
+static const char *V1190_VARIABLES_PATH = "/Equipment/VME/Variables/V1190";
+static const char *V775_SETTINGS_PATH = "/Equipment/VME/Settings/V775";
+static const char *V775_INFO_PATH = "/Equipment/VME/Info/V775";
+static const char *V775_READBACK_PATH = "/Equipment/VME/Readback/V775";
+static const char *V775_VARIABLES_PATH = "/Equipment/VME/Variables/V775";
+static const DWORD MODULE_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
+static const DWORD MODULE_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
+
+struct V792Settings {
+    BOOL enabled;
+    WORD iped;
+    BOOL zero_suppression_enabled;
+    BOOL all_trigger_enabled;
+};
+
+struct V1190Settings {
+    BOOL enabled;
+    BOOL trigger_matching_enabled;
+    DWORD window_width;
+    INT window_offset;
+    DWORD extra_search_margin;
+    DWORD reject_margin;
+    BOOL trigger_subtraction_enabled;
+    DWORD edge_mode;
+    DWORD resolution_ps;
+    DWORD dead_time_ns;
+    INT max_hits_per_event; /* -1 means unlimited. */
+    BOOL tdc_header_enabled;
+    BOOL empty_event_enabled;
+    BOOL event_fifo_enabled;
+    BOOL extended_trigger_time_enabled;
+    BOOL channel_enabled[128];
+};
+
+struct V775Settings {
+    BOOL enabled;
+    WORD full_scale_range;
+    BOOL over_range_enabled;
+    BOOL low_threshold_enabled;
+    BOOL common_stop;
+    BOOL empty_program_enabled;
+    BOOL valid_control_enabled;
+    BOOL sliding_scale_enabled;
+    BOOL all_trigger_enabled;
+};
+
+struct V7xxRuntimeState {
+    BOOL communication_ok;
+    WORD status1;
+    WORD status2;
+    BOOL data_ready;
+    BOOL busy;
+    BOOL buffer_empty;
+    BOOL buffer_full;
+    DWORD event_counter;
+    bool dirty;
+};
+
+struct V1190RuntimeState {
+    BOOL communication_ok;
+    WORD status;
+    BOOL data_ready;
+    BOOL almost_full;
+    BOOL full;
+    BOOL trigger_matching;
+    DWORD event_stored;
+    DWORD event_counter;
+    bool dirty;
+};
+
+static V792Settings default_v792_settings()
+{
+    V792Settings s = {};
+    s.enabled = TRUE;
+    s.iped = V792_RUN_IPED;
+    s.zero_suppression_enabled = FALSE;
+    s.all_trigger_enabled = FALSE;
+    return s;
+}
+
+static V1190Settings default_v1190_settings()
+{
+    V1190Settings s = {};
+    s.enabled = TRUE;
+    s.trigger_matching_enabled = TRUE;
+    s.window_width = V1190_RUN_WINDOW_WIDTH;
+    s.window_offset = -12;
+    s.extra_search_margin = V1190_RUN_EXTRA_MARGIN;
+    s.reject_margin = V1190_RUN_REJECT_MARGIN;
+    s.trigger_subtraction_enabled = FALSE;
+    s.edge_mode = V1190_RUN_EDGE_MODE;
+    s.resolution_ps = 100;
+    s.dead_time_ns = 5;
+    s.max_hits_per_event = -1;
+    s.tdc_header_enabled = TRUE;
+    s.empty_event_enabled = TRUE;
+    s.event_fifo_enabled = FALSE;
+    s.extended_trigger_time_enabled = FALSE;
+    for (unsigned i = 0; i < 128; ++i)
+        s.channel_enabled[i] = TRUE;
+    return s;
+}
+
+static V775Settings default_v775_settings()
+{
+    V775Settings s = {};
+    s.enabled = FALSE;
+    s.full_scale_range = V775_RUN_FULL_SCALE;
+    s.over_range_enabled = TRUE;
+    s.low_threshold_enabled = TRUE;
+    s.common_stop = TRUE;
+    s.empty_program_enabled = TRUE;
+    s.valid_control_enabled = FALSE;
+    s.sliding_scale_enabled = FALSE;
+    s.all_trigger_enabled = FALSE;
+    return s;
+}
+
+static V792Settings gV792RunSettings = default_v792_settings();
+static V1190Settings gV1190RunSettings = default_v1190_settings();
+static V775Settings gV775RunSettings = default_v775_settings();
+static V7xxRuntimeState gV792Runtime = {};
+static V1190RuntimeState gV1190Runtime = {};
+static V7xxRuntimeState gV775Runtime = {};
+static DWORD gV792LastVariablesPublish = 0;
+static DWORD gV1190LastVariablesPublish = 0;
+static DWORD gV775LastVariablesPublish = 0;
+
+static bool set_module_output(const char *base, const char *name,
+                              const void *value, INT size, INT count,
+                              DWORD type)
+{
+    char path[256];
+    return make_odb_path(path, sizeof(path), base, name) &&
+           set_absolute_odb_value(path, value, size, count, type);
+}
+
+static bool publish_module_info(const char *path, DWORD base_address,
+                                const char *address_modifier,
+                                const char *register_width,
+                                const char *event_width)
+{
+    return set_module_output(path, "BaseAddress", &base_address,
+                             sizeof(base_address), 1, TID_DWORD) &&
+           set_module_output(path, "AddressModifier", address_modifier,
+                             strlen(address_modifier) + 1, 1, TID_STRING) &&
+           set_module_output(path, "RegisterDataWidth", register_width,
+                             strlen(register_width) + 1, 1, TID_STRING) &&
+           set_module_output(path, "EventDataWidth", event_width,
+                             strlen(event_width) + 1, 1, TID_STRING);
+}
+
+static bool ensure_v792_settings_schema()
+{
+    const V792Settings d = default_v792_settings();
+    char p[256];
+#define E792(n, m, t) do { if (!make_odb_path(p,sizeof(p),V792_SETTINGS_PATH,n) || !ensure_odb_value(p,&d.m,sizeof(d.m),1,t)) return false; } while (0)
+    E792("Enabled", enabled, TID_BOOL);
+    E792("Iped", iped, TID_WORD);
+    E792("ZeroSuppressionEnabled", zero_suppression_enabled, TID_BOOL);
+    E792("AllTriggerEnabled", all_trigger_enabled, TID_BOOL);
+#undef E792
+    return true;
+}
+
+static bool ensure_v1190_settings_schema()
+{
+    const V1190Settings d = default_v1190_settings();
+    char p[256];
+#define E1190(n, m, c, t) do { if (!make_odb_path(p,sizeof(p),V1190_SETTINGS_PATH,n) || !ensure_odb_value(p,&d.m,sizeof(d.m),c,t)) return false; } while (0)
+    E1190("Enabled", enabled, 1, TID_BOOL);
+    E1190("TriggerMatchingEnabled", trigger_matching_enabled, 1, TID_BOOL);
+    E1190("WindowWidth", window_width, 1, TID_DWORD);
+    E1190("WindowOffset", window_offset, 1, TID_INT);
+    E1190("ExtraSearchMargin", extra_search_margin, 1, TID_DWORD);
+    E1190("RejectMargin", reject_margin, 1, TID_DWORD);
+    E1190("TriggerSubtractionEnabled", trigger_subtraction_enabled, 1, TID_BOOL);
+    E1190("EdgeMode", edge_mode, 1, TID_DWORD);
+    E1190("ResolutionPs", resolution_ps, 1, TID_DWORD);
+    E1190("DeadTimeNs", dead_time_ns, 1, TID_DWORD);
+    E1190("MaxHitsPerEvent", max_hits_per_event, 1, TID_INT);
+    E1190("TdcHeaderEnabled", tdc_header_enabled, 1, TID_BOOL);
+    E1190("EmptyEventEnabled", empty_event_enabled, 1, TID_BOOL);
+    E1190("EventFifoEnabled", event_fifo_enabled, 1, TID_BOOL);
+    E1190("ExtendedTriggerTimeEnabled", extended_trigger_time_enabled, 1, TID_BOOL);
+    E1190("ChannelEnabled", channel_enabled, 128, TID_BOOL);
+#undef E1190
+    return true;
+}
+
+static bool ensure_v775_settings_schema()
+{
+    const V775Settings d = default_v775_settings();
+    char p[256];
+#define E775(n, m, t) do { if (!make_odb_path(p,sizeof(p),V775_SETTINGS_PATH,n) || !ensure_odb_value(p,&d.m,sizeof(d.m),1,t)) return false; } while (0)
+    E775("Enabled", enabled, TID_BOOL);
+    E775("FullScaleRange", full_scale_range, TID_WORD);
+    E775("OverRangeEnabled", over_range_enabled, TID_BOOL);
+    E775("LowThresholdEnabled", low_threshold_enabled, TID_BOOL);
+    E775("CommonStop", common_stop, TID_BOOL);
+    E775("EmptyProgramEnabled", empty_program_enabled, TID_BOOL);
+    E775("ValidControlEnabled", valid_control_enabled, TID_BOOL);
+    E775("SlidingScaleEnabled", sliding_scale_enabled, TID_BOOL);
+    E775("AllTriggerEnabled", all_trigger_enabled, TID_BOOL);
+#undef E775
+    return true;
+}
+
+static bool read_v792_settings(V792Settings &s)
+{
+    V792Settings n = {}; char p[256];
+#define R792(k,m,t) do { if (!make_odb_path(p,sizeof(p),V792_SETTINGS_PATH,k) || !get_absolute_odb_value(p,&n.m,sizeof(n.m),t)) return false; } while (0)
+    R792("Enabled",enabled,TID_BOOL); R792("Iped",iped,TID_WORD);
+    R792("ZeroSuppressionEnabled",zero_suppression_enabled,TID_BOOL);
+    R792("AllTriggerEnabled",all_trigger_enabled,TID_BOOL);
+#undef R792
+    s=n; return true;
+}
+
+static bool read_v1190_settings(V1190Settings &s)
+{
+    V1190Settings n = {}; char p[256];
+#define R1190(k,m,t) do { if (!make_odb_path(p,sizeof(p),V1190_SETTINGS_PATH,k) || !get_absolute_odb_value(p,&n.m,sizeof(n.m),t)) return false; } while (0)
+    R1190("Enabled",enabled,TID_BOOL); R1190("TriggerMatchingEnabled",trigger_matching_enabled,TID_BOOL);
+    R1190("WindowWidth",window_width,TID_DWORD); R1190("WindowOffset",window_offset,TID_INT);
+    R1190("ExtraSearchMargin",extra_search_margin,TID_DWORD); R1190("RejectMargin",reject_margin,TID_DWORD);
+    R1190("TriggerSubtractionEnabled",trigger_subtraction_enabled,TID_BOOL); R1190("EdgeMode",edge_mode,TID_DWORD);
+    R1190("ResolutionPs",resolution_ps,TID_DWORD); R1190("DeadTimeNs",dead_time_ns,TID_DWORD);
+    R1190("MaxHitsPerEvent",max_hits_per_event,TID_INT); R1190("TdcHeaderEnabled",tdc_header_enabled,TID_BOOL);
+    R1190("EmptyEventEnabled",empty_event_enabled,TID_BOOL); R1190("EventFifoEnabled",event_fifo_enabled,TID_BOOL);
+    R1190("ExtendedTriggerTimeEnabled",extended_trigger_time_enabled,TID_BOOL); R1190("ChannelEnabled",channel_enabled,TID_BOOL);
+#undef R1190
+    s=n; return true;
+}
+
+static bool read_v775_settings(V775Settings &s)
+{
+    V775Settings n = {}; char p[256];
+#define R775(k,m,t) do { if (!make_odb_path(p,sizeof(p),V775_SETTINGS_PATH,k) || !get_absolute_odb_value(p,&n.m,sizeof(n.m),t)) return false; } while (0)
+    R775("Enabled",enabled,TID_BOOL); R775("FullScaleRange",full_scale_range,TID_WORD);
+    R775("OverRangeEnabled",over_range_enabled,TID_BOOL); R775("LowThresholdEnabled",low_threshold_enabled,TID_BOOL);
+    R775("CommonStop",common_stop,TID_BOOL); R775("EmptyProgramEnabled",empty_program_enabled,TID_BOOL);
+    R775("ValidControlEnabled",valid_control_enabled,TID_BOOL); R775("SlidingScaleEnabled",sliding_scale_enabled,TID_BOOL);
+    R775("AllTriggerEnabled",all_trigger_enabled,TID_BOOL);
+#undef R775
+    s=n; return true;
+}
+
+static void decode_v7xx_runtime(V7xxRuntimeState &r, WORD s1, WORD s2,
+                                DWORD counter)
+{
+    r.status1=s1; r.status2=s2; r.data_ready=!!(s1&0x1);
+    r.busy=!!(s1&0x4); r.buffer_empty=!!(s2&0x2);
+    r.buffer_full=!!(s2&0x4); r.event_counter=counter; r.dirty=true;
+}
+
+static void decode_v1190_runtime(WORD status, DWORD stored, DWORD counter)
+{
+    gV1190Runtime.status=status;
+    gV1190Runtime.data_ready=!!(status&V1190_STATUS_DATA_READY);
+    gV1190Runtime.almost_full=!!(status&V1190_STATUS_ALMOST_FULL);
+    gV1190Runtime.full=!!(status&V1190_STATUS_FULL);
+    gV1190Runtime.trigger_matching=!!(status&V1190_STATUS_TRIGGER_MATCH);
+    gV1190Runtime.event_stored=stored;
+    gV1190Runtime.event_counter=counter;
+    gV1190Runtime.dirty=true;
+}
+
+static bool publish_v7xx_variables(const char *path, V7xxRuntimeState &r,
+                                   DWORD &last)
+{
+    bool ok=true;
+#define PV7(k,m,t) do { ok=set_module_output(path,k,&r.m,sizeof(r.m),1,t)&&ok; } while(0)
+    PV7("CommunicationOK",communication_ok,TID_BOOL); PV7("Status1",status1,TID_WORD);
+    PV7("Status2",status2,TID_WORD); PV7("DataReady",data_ready,TID_BOOL);
+    PV7("Busy",busy,TID_BOOL); PV7("BufferEmpty",buffer_empty,TID_BOOL);
+    PV7("BufferFull",buffer_full,TID_BOOL); PV7("EventCounter",event_counter,TID_DWORD);
+#undef PV7
+    r.dirty=!ok; last=ss_millitime(); return ok;
+}
+
+static bool publish_v1190_variables()
+{
+    bool ok=true;
+#define PV1190(k,m,t) do { ok=set_module_output(V1190_VARIABLES_PATH,k,&gV1190Runtime.m,sizeof(gV1190Runtime.m),1,t)&&ok; } while(0)
+    PV1190("CommunicationOK",communication_ok,TID_BOOL); PV1190("Status",status,TID_WORD);
+    PV1190("DataReady",data_ready,TID_BOOL); PV1190("AlmostFull",almost_full,TID_BOOL);
+    PV1190("Full",full,TID_BOOL); PV1190("TriggerMatching",trigger_matching,TID_BOOL);
+    PV1190("EventStored",event_stored,TID_DWORD); PV1190("EventCounter",event_counter,TID_DWORD);
+#undef PV1190
+    gV1190Runtime.dirty=!ok; gV1190LastVariablesPublish=ss_millitime(); return ok;
+}
+
+static void set_module_readback_valid(const char *path, bool valid)
+{
+    const BOOL v=valid?TRUE:FALSE;
+    set_module_output(path,"Valid",&v,sizeof(v),1,TID_BOOL);
+}
+
+static void initialize_module_output_schema()
+{
+    WORD zword=0, thresholds[32]={}; DWORD zdword=0; BOOL zbool=FALSE;
+    set_module_readback_valid(V792_READBACK_PATH,false);
+    set_module_output(V792_READBACK_PATH,"FirmwareRevision",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Iped",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zbool,sizeof(zbool),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"AllTriggerEnabled",&zbool,sizeof(zbool),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"BitSet2Raw",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
+
+    set_module_readback_valid(V1190_READBACK_PATH,false);
+    const char empty_board[]="Unknown";
+    set_module_output(V1190_READBACK_PATH,"FirmwareRevision",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V1190_READBACK_PATH,"ConfigurationRomVersion",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V1190_READBACK_PATH,"BoardType",empty_board,sizeof(empty_board),1,TID_STRING);
+    const V1190Settings d1190={};
+#define Z1190(k,m,c,t) set_module_output(V1190_READBACK_PATH,k,&d1190.m,sizeof(d1190.m),c,t)
+    Z1190("TriggerMatchingEnabled",trigger_matching_enabled,1,TID_BOOL);
+    Z1190("WindowWidth",window_width,1,TID_DWORD); Z1190("WindowOffset",window_offset,1,TID_INT);
+    Z1190("ExtraSearchMargin",extra_search_margin,1,TID_DWORD); Z1190("RejectMargin",reject_margin,1,TID_DWORD);
+    Z1190("TriggerSubtractionEnabled",trigger_subtraction_enabled,1,TID_BOOL); Z1190("EdgeMode",edge_mode,1,TID_DWORD);
+    Z1190("ResolutionPs",resolution_ps,1,TID_DWORD); Z1190("DeadTimeNs",dead_time_ns,1,TID_DWORD);
+    Z1190("MaxHitsPerEvent",max_hits_per_event,1,TID_INT); Z1190("TdcHeaderEnabled",tdc_header_enabled,1,TID_BOOL);
+    Z1190("EmptyEventEnabled",empty_event_enabled,1,TID_BOOL); Z1190("EventFifoEnabled",event_fifo_enabled,1,TID_BOOL);
+    Z1190("ExtendedTriggerTimeEnabled",extended_trigger_time_enabled,1,TID_BOOL); Z1190("ChannelEnabled",channel_enabled,128,TID_BOOL);
+#undef Z1190
+    set_module_output(V1190_READBACK_PATH,"ErrorMask",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V1190_READBACK_PATH,"EffectiveFifoSizeWords",&zdword,sizeof(zdword),1,TID_DWORD);
+    set_module_output(V1190_READBACK_PATH,"ControlRaw",&zword,sizeof(zword),1,TID_WORD);
+
+    set_module_readback_valid(V775_READBACK_PATH,false);
+    set_module_output(V775_READBACK_PATH,"FirmwareRevision",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"FullScaleRange",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"FastClearWindow",&zword,sizeof(zword),1,TID_WORD);
+    const V775Settings d775={};
+#define Z775(k,m,t) set_module_output(V775_READBACK_PATH,k,&d775.m,sizeof(d775.m),1,t)
+    Z775("OverRangeEnabled",over_range_enabled,TID_BOOL); Z775("LowThresholdEnabled",low_threshold_enabled,TID_BOOL);
+    Z775("CommonStop",common_stop,TID_BOOL); Z775("EmptyProgramEnabled",empty_program_enabled,TID_BOOL);
+    Z775("ValidControlEnabled",valid_control_enabled,TID_BOOL); Z775("SlidingScaleEnabled",sliding_scale_enabled,TID_BOOL);
+    Z775("AllTriggerEnabled",all_trigger_enabled,TID_BOOL);
+#undef Z775
+    set_module_output(V775_READBACK_PATH,"BitSet2Raw",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
+    gV792Runtime={}; gV1190Runtime={}; gV775Runtime={};
+    gV792Runtime.dirty=gV1190Runtime.dirty=gV775Runtime.dirty=true;
+    publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+    publish_v1190_variables();
+    publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+}
+
+static bool initialize_other_module_odb()
+{
+    if (!ensure_v792_settings_schema() || !ensure_v1190_settings_schema() ||
+        !ensure_v775_settings_schema()) return false;
+    if (!publish_module_info(V792_INFO_PATH,V792_BASE,"A24_ND","D16","D32") ||
+        !publish_module_info(V1190_INFO_PATH,V1190_BASE,"A24_ND","D16","D32") ||
+        !publish_module_info(V775_INFO_PATH,V775_BASE,"A24_ND","D16","D32")) return false;
+    initialize_module_output_schema();
+    V792Settings a={}; V1190Settings b={}; V775Settings c={};
+    if (!read_v792_settings(a)||!read_v1190_settings(b)||!read_v775_settings(c)) return false;
+    gV792RunSettings=a; gV1190RunSettings=b; gV775RunSettings=c;
     return true;
 }
 
@@ -491,7 +865,7 @@ static bool gV1190ModeMayHaveChanged = false;
 static bool gV1190EmptyEventMayHaveChanged = false;
 #endif
 
-#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775_SW_TRIGGER_TEST
 static WORD gV775SavedBitSet2 = 0;
 static bool gV775DiagnosticSaved = false;
 static bool gV775EmptyProgramMayHaveChanged = false;
@@ -777,6 +1151,8 @@ static V792EventInfo read_v792_single_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
                     event.event_counter = word & V7XX_EVENT_COUNTER_MASK;
                     event.measurements = measurements;
                     event.valid = true;
+                    gV792Runtime.event_counter=event.event_counter;
+                    gV792Runtime.dirty=true;
                     break;
                 }
                 if (measurements >= expected) {
@@ -845,6 +1221,8 @@ static V1190EventInfo read_v1190_single_event(DWORD (&data)[V1190_MAX_EVENT_WORD
                 event.trailer_word_count = trailer_words;
                 event.words = actual_words;
                 event.valid = true;
+                gV1190Runtime.event_counter=event.event_counter;
+                gV1190Runtime.dirty=true;
                 break; // Trailer consumed; never pre-read the next event.
             }
 
@@ -896,6 +1274,7 @@ static bool wait_for_v1190_data_ready()
     for (unsigned poll = 0; poll < V1190_READY_MAX_POLLS; ++poll) {
         if (!vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 Status"))
             return false;
+        decode_v1190_runtime(status,gV1190Runtime.event_stored,gV1190Runtime.event_counter);
         if (status & V1190_STATUS_DATA_READY)
             return true;
         if (poll + 1 < V1190_READY_MAX_POLLS)
@@ -908,7 +1287,6 @@ static bool wait_for_v1190_data_ready()
 }
 
 /* Read exactly one V775 event through its EOB using D32 single cycles. */
-#if ENABLE_V775
 static V775EventInfo read_v775_single_event(DWORD (&data)[V775_MAX_EVENT_WORDS])
 {
     V775EventInfo event = {};
@@ -972,6 +1350,8 @@ static V775EventInfo read_v775_single_event(DWORD (&data)[V775_MAX_EVENT_WORDS])
                 event.measurements = measurements;
                 event.words = i + 1;
                 event.valid = true;
+                gV775Runtime.event_counter=event.event_counter;
+                gV775Runtime.dirty=true;
                 break; // EOB consumed; never pre-read the next event.
             }
 
@@ -1026,8 +1406,6 @@ static bool wait_for_v775_data_ready()
            V775_READY_MAX_POLLS);
     return false;
 }
-#endif
-
 static bool wait_for_v1720e_data_ready()
 {
     DWORD event_stored = 0;
@@ -1183,7 +1561,7 @@ static bool setup_v1190_soft_trigger_test()
 }
 #endif
 
-#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
+#if ENABLE_V775_SW_TRIGGER_TEST
 static bool restore_v775_diagnostic_settings()
 {
     if (!gV775DiagnosticSaved)
@@ -1491,40 +1869,45 @@ static bool verify_v1720e_readback(const V1720E_CONFIG &expected,
 /* Frontend initialization checks. Keep the established read-only access order. */
 static bool check_module_communication(bool check_v1720e)
 {
-    printf("Checking V792 at 0x%08X...\n", V792_BASE);
-    if (!v792_isPresent(gVme, V792_BASE)) {
+    if (gV792RunSettings.enabled) {
+      printf("Checking V792 at 0x%08X...\n", V792_BASE);
+      if (!v792_isPresent(gVme, V792_BASE)) {
+        gV792Runtime.communication_ok=FALSE; publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
         cm_msg(MERROR, frontend_name,
                "V792 not found at 0x%08X", V792_BASE);
         return false;
-    }
-    printf("V792 detected.\n");
-    v792_Status(gVme, V792_BASE);
+      }
+      gV792Runtime.communication_ok=TRUE; gV792Runtime.dirty=true;
+      printf("V792 detected.\n");
+    } else { gV792Runtime={}; gV792Runtime.dirty=true; set_module_readback_valid(V792_READBACK_PATH,false); publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish); printf("V792 disabled in ODB; communication check skipped.\n"); }
 
     WORD v1190_status = 0;
     WORD v1190_events = 0;
-    printf("Checking V1190A at 0x%08X...\n", V1190_BASE);
-    if (!vme_read16(V1190_BASE + V1190_STATUS, v1190_status, "V1190 Status") ||
+    if (gV1190RunSettings.enabled) {
+      printf("Checking V1190A at 0x%08X...\n", V1190_BASE);
+      if (!vme_read16(V1190_BASE + V1190_STATUS, v1190_status, "V1190 Status") ||
         !vme_read16(V1190_BASE + V1190_EVENT_STORED, v1190_events,
                     "V1190 Event Stored")) {
+        gV1190Runtime.communication_ok=FALSE; publish_v1190_variables();
         cm_msg(MERROR, frontend_name,
                "V1190A communication check failed at 0x%08X", V1190_BASE);
         return false;
-    }
-    printf("V1190A detected: Status=0x%04X Event Stored=%u.\n",
+      }
+      gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(v1190_status,v1190_events,gV1190Runtime.event_counter);
+      printf("V1190A detected: Status=0x%04X Event Stored=%u.\n",
            v1190_status, v1190_events);
+    } else { gV1190Runtime={}; gV1190Runtime.dirty=true; set_module_readback_valid(V1190_READBACK_PATH,false); publish_v1190_variables(); printf("V1190 disabled in ODB; communication check skipped.\n"); }
 
-#if ENABLE_V775
-    printf("Checking V775 at 0x%08X...\n", V775_BASE);
-    if (!v775_isPresent(gVme, V775_BASE)) {
+    if (gV775RunSettings.enabled) {
+      printf("Checking V775 at 0x%08X...\n", V775_BASE);
+      if (!v775_isPresent(gVme, V775_BASE)) {
+        gV775Runtime.communication_ok=FALSE; publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
         cm_msg(MERROR, frontend_name,
                "V775 not found at 0x%08X", V775_BASE);
         return false;
-    }
-    printf("V775 detected.\n");
-    v775_Status(gVme, V775_BASE);
-#else
-    printf("V775 disabled by ENABLE_V775=0; communication check skipped.\n");
-#endif
+      }
+      gV775Runtime.communication_ok=TRUE; gV775Runtime.dirty=true; printf("V775 detected.\n");
+    } else { gV775Runtime={}; gV775Runtime.dirty=true; set_module_readback_valid(V775_READBACK_PATH,false); publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish); printf("V775 disabled in ODB; communication check skipped.\n"); }
 
     if (!check_v1720e) {
         set_v1720e_communication_ok(false);
@@ -1561,7 +1944,7 @@ static bool check_module_communication(bool check_v1720e)
 struct V1190Configuration {
     WORD mode, trigger[5], edge, resolution, dead_time, header, max_hits;
     WORD error_mask, fifo_size, channels[V1190_CHANNEL_MASK_WORDS];
-    WORD control, status, firmware;
+    WORD control, status, firmware, rom_version;
 };
 
 static bool read_v1190_configuration(V1190Configuration &c)
@@ -1580,16 +1963,66 @@ static bool read_v1190_configuration(V1190Configuration &c)
            vme_read16(V1190_BASE + V1190_CONTROL, c.control, "V1190 Control") &&
            vme_read16(V1190_BASE + V1190_STATUS, c.status, "V1190 Status") &&
            vme_read16(V1190_BASE + V1190_FIRMWARE_REVISION, c.firmware,
-                      "V1190 Firmware Revision");
+                      "V1190 Firmware Revision") &&
+           vme_read16(V1190_BASE + V1190_CONFIGURATION_ROM_VERSION,
+                      c.rom_version, "V1190 Configuration ROM Version");
 }
 
-static bool log_current_configuration(const char *phase)
+static int decode_signed_12(WORD value)
+{
+    int result=value&0x0FFF;
+    return (result&0x0800)?result-0x1000:result;
+}
+
+static bool encode_v1190_semantics(const V1190Settings &s, WORD &resolution,
+                                   WORD &dead_time, WORD &max_hits,
+                                   WORD (&channels)[V1190_CHANNEL_MASK_WORDS])
+{
+    if (s.window_width>0x0FFF || s.window_offset < -2048 || s.window_offset > 2047 ||
+        s.extra_search_margin>0x0FFF || s.reject_margin>0x0FFF || s.edge_mode<1 || s.edge_mode>3) {
+        cm_msg(MERROR,frontend_name,"Invalid V1190 trigger window or EdgeMode setting"); return false;
+    }
+    if (s.resolution_ps==800) resolution=0;
+    else if (s.resolution_ps==200) resolution=1;
+    else if (s.resolution_ps==100) resolution=2;
+    else { cm_msg(MERROR,frontend_name,"V1190 ResolutionPs must be 800, 200, or 100"); return false; }
+    if (s.dead_time_ns==5) dead_time=0;
+    else if (s.dead_time_ns==10) dead_time=1;
+    else if (s.dead_time_ns==30) dead_time=2;
+    else if (s.dead_time_ns==100) dead_time=3;
+    else { cm_msg(MERROR,frontend_name,"V1190 DeadTimeNs must be 5, 10, 30, or 100"); return false; }
+    if (s.max_hits_per_event==-1) max_hits=9;
+    else if (s.max_hits_per_event==0) max_hits=0;
+    else {
+        const int values[]={1,2,4,8,16,32,64,128}; max_hits=0xFFFF;
+        for (unsigned i=0;i<8;++i) if (s.max_hits_per_event==values[i]) max_hits=i+1;
+        if (max_hits==0xFFFF) { cm_msg(MERROR,frontend_name,"V1190 MaxHitsPerEvent must be -1, 0, or a power of two from 1 through 128"); return false; }
+    }
+    memset(channels,0,sizeof(channels));
+    for (unsigned i=0;i<128;++i) if (s.channel_enabled[i]) channels[i/16]|=WORD(1u<<(i%16));
+    return true;
+}
+
+static DWORD resolution_ps_from_code(WORD code) { const DWORD v[]={800,200,100,0}; return v[code&3]; }
+static DWORD dead_time_ns_from_code(WORD code) { const DWORD v[]={5,10,30,100}; return v[code&3]; }
+static INT max_hits_from_code(WORD code) { code&=0xF; if(code==9)return -1; if(code==0)return 0; return code<=8?INT(1u<<(code-1)):-2; }
+
+static bool validate_and_snapshot_module_settings()
+{
+    V792Settings a={}; V1190Settings b={}; V775Settings c={};
+    if(!read_v792_settings(a)||!read_v1190_settings(b)||!read_v775_settings(c)) return false;
+    if(a.enabled && a.iped>0xFF) { cm_msg(MERROR,frontend_name,"V792 Iped exceeds 8-bit range"); return false; }
+    WORD r=0,d=0,h=0,m[V1190_CHANNEL_MASK_WORDS]={};
+    if(b.enabled && !encode_v1190_semantics(b,r,d,h,m)) return false;
+    if(c.enabled && c.full_scale_range>0xFF) { cm_msg(MERROR,frontend_name,"V775 FullScaleRange exceeds 8-bit range"); return false; }
+    gV792RunSettings=a; gV1190RunSettings=b; gV775RunSettings=c; return true;
+}
+
+[[maybe_unused]] static bool log_current_configuration(const char *phase)
 {
     WORD vf = 0, vs1 = 0, vs2 = 0, vb = 0, iped = 0;
-#if ENABLE_V775
     WORD tf = 0, ts1 = 0, ts2 = 0, tb = 0, fsr = 0;
     WORD tth[V775_MAX_CHANNELS];
-#endif
     WORD vth[V792_MAX_CHANNELS];
     V1190Configuration c = {};
     if (!vme_read16(V792_BASE + V792_FIRM_REV, vf, "V792 Firmware") ||
@@ -1598,15 +2031,13 @@ static bool log_current_configuration(const char *phase)
         !vme_read16(V792_BASE + V792_BIT_SET2_RW, vb, "V792 Bit Set 2") ||
         !vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped") ||
         !read_v1190_configuration(c)) return false;
-#if ENABLE_V775
-    if (
-        !vme_read16(V775_BASE + V775_FIRMWARE_REVISION, tf, "V775 Firmware") ||
-        !vme_read16(V775_BASE + V775_STATUS1, ts1, "V775 Status 1") ||
-        !vme_read16(V775_BASE + V775_STATUS2, ts2, "V775 Status 2") ||
-        !vme_read16(V775_BASE + V775_BIT_SET2, tb, "V775 Bit Set 2") ||
-        !vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR") ||
-        v775_ThresholdRead(gVme, V775_BASE, tth) != V775_MAX_CHANNELS) return false;
-#endif
+    if (gV775RunSettings.enabled &&
+        (!vme_read16(V775_BASE + V775_FIRMWARE_REVISION, tf, "V775 Firmware") ||
+         !vme_read16(V775_BASE + V775_STATUS1, ts1, "V775 Status 1") ||
+         !vme_read16(V775_BASE + V775_STATUS2, ts2, "V775 Status 2") ||
+         !vme_read16(V775_BASE + V775_BIT_SET2, tb, "V775 Bit Set 2") ||
+         !vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR") ||
+         v775_ThresholdRead(gVme, V775_BASE, tth) != V775_MAX_CHANNELS)) return false;
     if (v792_ThresholdRead(gVme, V792_BASE, vth) != V792_MAX_CHANNELS) return false;
     printf("BOR configuration snapshot (%s):\n", phase);
     printf("  V792 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X Iped=0x%04X\n",
@@ -1618,71 +2049,84 @@ static bool log_current_configuration(const char *phase)
            c.max_hits & 0xF, c.header & 1, c.error_mask & 0x7FF, c.fifo_size & 0xF);
     printf("  V1190 channel mask:");
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i) printf(" %04X", c.channels[i]);
-#if ENABLE_V775
-    printf("\n  V775 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X FSR=0x%04X\n",
-           tf, ts1, ts2, tb, fsr);
-    printf("    VALID=0 datum write: %s (invalid datum %s buffer)\n",
-           tb & V775_BIT2_VALID_CONTROL ? "ENABLED" : "DISABLED",
-           tb & V775_BIT2_VALID_CONTROL ? "is written to" : "is not written to");
-#else
-    printf("\n  V775 : DISABLED (no access)\n");
-#endif
+    if (gV775RunSettings.enabled) {
+        printf("\n  V775 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X FSR=0x%04X\n",
+               tf, ts1, ts2, tb, fsr);
+        printf("    VALID=0 datum write: %s (invalid datum %s buffer)\n",
+               tb & V775_BIT2_VALID_CONTROL ? "ENABLED" : "DISABLED",
+               tb & V775_BIT2_VALID_CONTROL ? "is written to" : "is not written to");
+    } else {
+        printf("\n  V775 : DISABLED (no access)\n");
+    }
     printf("  V792 thresholds:");
     for (unsigned i = 0; i < V792_MAX_CHANNELS; ++i) printf(" %03X", vth[i]);
-#if ENABLE_V775
-    printf("\n  V775 thresholds:");
-    for (unsigned i = 0; i < V775_MAX_CHANNELS; ++i) printf(" %03X", tth[i]);
-#endif
+    if (gV775RunSettings.enabled) {
+        printf("\n  V775 thresholds:");
+        for (unsigned i = 0; i < V775_MAX_CHANNELS; ++i) printf(" %03X", tth[i]);
+    }
     printf("\n");
     return true;
 }
 
 static bool configure_v792_for_run()
 {
-    return vme_write16(V792_BASE + V792_IPED_RW, V792_RUN_IPED, "V792 Iped") &&
-           vme_write16(V792_BASE + V792_BIT_SET2_RW, V792_BIT2_LOW_THRESHOLD,
-                       "V792 zero suppression disable") &&
-           vme_write16(V792_BASE + V792_BIT_CLEAR2_WO, V792_BIT2_ALL_TRIGGER,
-                       "V792 ALL TRG clear");
+    if (!gV792RunSettings.enabled) return true;
+    const DWORD zsreg=gV792RunSettings.zero_suppression_enabled?V792_BIT_CLEAR2_WO:V792_BIT_SET2_RW;
+    const DWORD atreg=gV792RunSettings.all_trigger_enabled?V792_BIT_SET2_RW:V792_BIT_CLEAR2_WO;
+    return vme_write16(V792_BASE + V792_IPED_RW, gV792RunSettings.iped, "V792 Iped") &&
+           vme_write16(V792_BASE + zsreg,V792_BIT2_LOW_THRESHOLD,"V792 zero suppression") &&
+           vme_write16(V792_BASE + atreg,V792_BIT2_ALL_TRIGGER,"V792 ALL TRG");
 }
 
 static bool configure_v1190_for_run()
 {
-    const WORD width = V1190_RUN_WINDOW_WIDTH, offset = V1190_RUN_WINDOW_OFFSET;
-    const WORD extra = V1190_RUN_EXTRA_MARGIN, reject = V1190_RUN_REJECT_MARGIN;
-    const WORD edge = V1190_RUN_EDGE_MODE, resolution = V1190_RUN_RESOLUTION;
-    const WORD dead = V1190_RUN_DEAD_TIME, hits = V1190_RUN_MAX_HITS;
+    if (!gV1190RunSettings.enabled) return true;
+    const WORD width=gV1190RunSettings.window_width;
+    const WORD offset=WORD(gV1190RunSettings.window_offset)&0x0FFF;
+    const WORD extra=gV1190RunSettings.extra_search_margin, reject=gV1190RunSettings.reject_margin;
+    const WORD edge=gV1190RunSettings.edge_mode; WORD resolution=0,dead=0,hits=0;
+    WORD channels[V1190_CHANNEL_MASK_WORDS]={};
+    if(!encode_v1190_semantics(gV1190RunSettings,resolution,dead,hits,channels)) return false;
     WORD control = 0;
-    if (!v1190_micro_write_command(V1190_OPCODE_TRIGGER_MATCH, NULL, 0) ||
+    if (!v1190_micro_write_command(gV1190RunSettings.trigger_matching_enabled?V1190_OPCODE_TRIGGER_MATCH:V1190_OPCODE_CONTINUOUS,NULL,0) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_WINDOW_WIDTH, &width, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_WINDOW_OFFSET, &offset, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_EXTRA_MARGIN, &extra, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_REJECT_MARGIN, &reject, 1) ||
-        !v1190_micro_write_command(V1190_OPCODE_DISABLE_TRIGGER_SUBTRACTION, NULL, 0) ||
+        !v1190_micro_write_command(gV1190RunSettings.trigger_subtraction_enabled?V1190_OPCODE_ENABLE_TRIGGER_SUBTRACTION:V1190_OPCODE_DISABLE_TRIGGER_SUBTRACTION,NULL,0) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_EDGE_MODE, &edge, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_RESOLUTION, &resolution, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_DEAD_TIME, &dead, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_MAX_HITS, &hits, 1) ||
-        !v1190_micro_write_command(V1190_OPCODE_ENABLE_ALL_CHANNELS, NULL, 0) ||
-        !v1190_micro_write_command(V1190_OPCODE_ENABLE_TDC_HEADER, NULL, 0) ||
+        !v1190_micro_write_command(V1190_OPCODE_WRITE_CHANNEL_MASK,channels,V1190_CHANNEL_MASK_WORDS) ||
+        !v1190_micro_write_command(gV1190RunSettings.tdc_header_enabled?V1190_OPCODE_ENABLE_TDC_HEADER:V1190_OPCODE_DISABLE_TDC_HEADER,NULL,0) ||
         !vme_read16(V1190_BASE + V1190_CONTROL, control, "V1190 Control RMW read")) return false;
-    control = static_cast<WORD>((control | V1190_CONTROL_EMPTY_EVENT) &
-              ~(V1190_CONTROL_EVENT_FIFO | V1190_CONTROL_EXT_TRIGGER_TIME));
+    const WORD mask=V1190_CONTROL_EMPTY_EVENT|V1190_CONTROL_EVENT_FIFO|V1190_CONTROL_EXT_TRIGGER_TIME;
+    WORD requested=0;
+    if(gV1190RunSettings.empty_event_enabled) requested|=V1190_CONTROL_EMPTY_EVENT;
+    if(gV1190RunSettings.event_fifo_enabled) requested|=V1190_CONTROL_EVENT_FIFO;
+    if(gV1190RunSettings.extended_trigger_time_enabled) requested|=V1190_CONTROL_EXT_TRIGGER_TIME;
+    control=WORD((control&~mask)|requested);
     return vme_write16(V1190_BASE + V1190_CONTROL, control, "V1190 Control run settings");
 }
 
-#if ENABLE_V775
 static bool configure_v775_for_run()
 {
-    return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, V775_RUN_FULL_SCALE,
+    if (!gV775RunSettings.enabled) return true;
+    WORD set=0,clear=0;
+#define V775BIT(flag,bit) do { if(flag) set|=bit; else clear|=bit; } while(0)
+    V775BIT(gV775RunSettings.over_range_enabled,V775_BIT2_OVER_RANGE); V775BIT(gV775RunSettings.low_threshold_enabled,V775_BIT2_LOW_THRESHOLD);
+    V775BIT(gV775RunSettings.common_stop,V775_BIT2_COMMON_STOP); V775BIT(gV775RunSettings.empty_program_enabled,V775_BIT2_EMPTY_PROGRAM);
+    V775BIT(gV775RunSettings.valid_control_enabled,V775_BIT2_VALID_CONTROL); V775BIT(gV775RunSettings.sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE);
+    V775BIT(gV775RunSettings.all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
+#undef V775BIT
+    return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, gV775RunSettings.full_scale_range,
                        "V775 Full Scale Range") &&
-           vme_write16(V775_BASE + V775_BIT_SET2, V775_RUN_SET_BITS,
+           vme_write16(V775_BASE + V775_BIT_SET2, set,
                        "V775 run bits set") &&
-           vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_RUN_CLEAR_BITS,
+           vme_write16(V775_BASE + V775_BIT_CLEAR2, clear,
                        "V775 run bits clear");
 }
-#endif
-
 static bool configure_v1720e_for_run()
 {
     if (!gV1720RunSettings.enabled) {
@@ -1749,75 +2193,95 @@ static bool verify_value(const char *module, const char *item,
 
 static bool verify_v792_configuration()
 {
-    WORD iped = 0, bits = 0;
+    if(!gV792RunSettings.enabled) { set_module_readback_valid(V792_READBACK_PATH,false); return true; }
+    WORD iped=0,bits=0,firmware=0,thresholds[32]={};
     if (!vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped verify") ||
-        !vme_read16(V792_BASE + V792_BIT_SET2_RW, bits, "V792 Bit Set 2 verify")) return false;
-    bool ok = verify_value("V792", "Iped", V792_RUN_IPED, iped & 0xFF);
-    ok = verify_value("V792", "zero suppression disabled", 1,
-                      !!(bits & V792_BIT2_LOW_THRESHOLD)) && ok;
-    return verify_value("V792", "ALL TRG", 0, !!(bits & V792_BIT2_ALL_TRIGGER)) && ok;
+        !vme_read16(V792_BASE + V792_BIT_SET2_RW,bits,"V792 Bit Set 2 verify") ||
+        !vme_read16(V792_BASE + V792_FIRM_REV,firmware,"V792 Firmware verify") ||
+        v792_ThresholdRead(gVme,V792_BASE,thresholds)!=V792_MAX_CHANNELS) return false;
+    const BOOL zs=!(bits&V792_BIT2_LOW_THRESHOLD), all=!!(bits&V792_BIT2_ALL_TRIGGER);
+    bool ok=verify_value("V792","Iped",gV792RunSettings.iped,iped&0xFF);
+    ok=verify_value("V792","ZeroSuppression",gV792RunSettings.zero_suppression_enabled,zs)&&ok;
+    ok=verify_value("V792","AllTrigger",gV792RunSettings.all_trigger_enabled,all)&&ok;
+    set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zs,sizeof(zs),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"AllTriggerEnabled",&all,sizeof(all),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
+    set_module_readback_valid(V792_READBACK_PATH,ok); return ok;
 }
 
 static bool verify_v1190_configuration()
 {
+    if(!gV1190RunSettings.enabled) { set_module_readback_valid(V1190_READBACK_PATH,false); return true; }
     V1190Configuration c = {};
     if (!read_v1190_configuration(c)) return false;
+    WORD er=0,ed=0,eh=0,channels[V1190_CHANNEL_MASK_WORDS]={};
+    if(!encode_v1190_semantics(gV1190RunSettings,er,ed,eh,channels)) return false;
     bool ok = true;
 #define V1190_VERIFY(item, expected, actual) \
     do { ok = verify_value("V1190", item, expected, actual) && ok; } while (0)
-    V1190_VERIFY("Acquisition mode", 1, c.mode & 1);
-    V1190_VERIFY("Window width", V1190_RUN_WINDOW_WIDTH, c.trigger[0] & 0xFFF);
-    V1190_VERIFY("Window offset", V1190_RUN_WINDOW_OFFSET & 0xFFF, c.trigger[1] & 0xFFF);
-    V1190_VERIFY("Extra search margin", V1190_RUN_EXTRA_MARGIN, c.trigger[2] & 0xFFF);
-    V1190_VERIFY("Reject margin", V1190_RUN_REJECT_MARGIN, c.trigger[3] & 0xFFF);
-    V1190_VERIFY("Trigger subtraction", 0, c.trigger[4] & 1);
-    V1190_VERIFY("Edge mode", V1190_RUN_EDGE_MODE, c.edge & 3);
-    V1190_VERIFY("Resolution", V1190_RUN_RESOLUTION, c.resolution & 3);
-    V1190_VERIFY("Dead time", V1190_RUN_DEAD_TIME, c.dead_time & 3);
-    V1190_VERIFY("Maximum hits", V1190_RUN_MAX_HITS, c.max_hits & 0xF);
-    V1190_VERIFY("TDC Header/Trailer", 1, c.header & 1);
+    V1190_VERIFY("Acquisition mode",gV1190RunSettings.trigger_matching_enabled,c.mode&1);
+    V1190_VERIFY("Window width",gV1190RunSettings.window_width,c.trigger[0]&0xFFF);
+    V1190_VERIFY("Window offset",WORD(gV1190RunSettings.window_offset)&0xFFF,c.trigger[1]&0xFFF);
+    V1190_VERIFY("Extra search margin",gV1190RunSettings.extra_search_margin,c.trigger[2]&0xFFF);
+    V1190_VERIFY("Reject margin",gV1190RunSettings.reject_margin,c.trigger[3]&0xFFF);
+    V1190_VERIFY("Trigger subtraction",gV1190RunSettings.trigger_subtraction_enabled,c.trigger[4]&1);
+    V1190_VERIFY("Edge mode",gV1190RunSettings.edge_mode,c.edge&3);
+    V1190_VERIFY("Resolution",er,c.resolution&3); V1190_VERIFY("Dead time",ed,c.dead_time&3);
+    V1190_VERIFY("Maximum hits",eh,c.max_hits&0xF); V1190_VERIFY("TDC Header/Trailer",gV1190RunSettings.tdc_header_enabled,c.header&1);
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i)
-        V1190_VERIFY("Channel mask word", 0xFFFF, c.channels[i]);
-    V1190_VERIFY("Empty Event", 1, !!(c.control & V1190_CONTROL_EMPTY_EVENT));
-    V1190_VERIFY("Event FIFO", 0, !!(c.control & V1190_CONTROL_EVENT_FIFO));
-    V1190_VERIFY("Extended Trigger Time Tag", 0,
+        V1190_VERIFY("Channel mask word",channels[i],c.channels[i]);
+    V1190_VERIFY("Empty Event",gV1190RunSettings.empty_event_enabled,!!(c.control&V1190_CONTROL_EMPTY_EVENT));
+    V1190_VERIFY("Event FIFO",gV1190RunSettings.event_fifo_enabled,!!(c.control&V1190_CONTROL_EVENT_FIFO));
+    V1190_VERIFY("Extended Trigger Time Tag",gV1190RunSettings.extended_trigger_time_enabled,
                  !!(c.control & V1190_CONTROL_EXT_TRIGGER_TIME));
 #undef V1190_VERIFY
+    V1190Settings rb={}; rb.trigger_matching_enabled=!!(c.mode&1); rb.window_width=c.trigger[0]&0xFFF;
+    rb.window_offset=decode_signed_12(c.trigger[1]); rb.extra_search_margin=c.trigger[2]&0xFFF; rb.reject_margin=c.trigger[3]&0xFFF;
+    rb.trigger_subtraction_enabled=!!(c.trigger[4]&1); rb.edge_mode=c.edge&3; rb.resolution_ps=resolution_ps_from_code(c.resolution);
+    rb.dead_time_ns=dead_time_ns_from_code(c.dead_time); rb.max_hits_per_event=max_hits_from_code(c.max_hits); rb.tdc_header_enabled=!!(c.header&1);
+    rb.empty_event_enabled=!!(c.control&V1190_CONTROL_EMPTY_EVENT); rb.event_fifo_enabled=!!(c.control&V1190_CONTROL_EVENT_FIFO); rb.extended_trigger_time_enabled=!!(c.control&V1190_CONTROL_EXT_TRIGGER_TIME);
+    for(unsigned i=0;i<128;++i) rb.channel_enabled[i]=!!(c.channels[i/16]&(1u<<(i%16)));
+    const char *board=(c.rom_version&0xFF)==0?"V1190A":((c.rom_version&0xFF)==1?"V1190B":"Unknown");
+#define P1190(k,m,cnt,t) set_module_output(V1190_READBACK_PATH,k,&rb.m,sizeof(rb.m),cnt,t)
+    set_module_output(V1190_READBACK_PATH,"FirmwareRevision",&c.firmware,sizeof(c.firmware),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"ConfigurationRomVersion",&c.rom_version,sizeof(c.rom_version),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"BoardType",board,strlen(board)+1,1,TID_STRING);
+    P1190("TriggerMatchingEnabled",trigger_matching_enabled,1,TID_BOOL); P1190("WindowWidth",window_width,1,TID_DWORD); P1190("WindowOffset",window_offset,1,TID_INT); P1190("ExtraSearchMargin",extra_search_margin,1,TID_DWORD); P1190("RejectMargin",reject_margin,1,TID_DWORD); P1190("TriggerSubtractionEnabled",trigger_subtraction_enabled,1,TID_BOOL); P1190("EdgeMode",edge_mode,1,TID_DWORD); P1190("ResolutionPs",resolution_ps,1,TID_DWORD); P1190("DeadTimeNs",dead_time_ns,1,TID_DWORD); P1190("MaxHitsPerEvent",max_hits_per_event,1,TID_INT); P1190("TdcHeaderEnabled",tdc_header_enabled,1,TID_BOOL); P1190("EmptyEventEnabled",empty_event_enabled,1,TID_BOOL); P1190("EventFifoEnabled",event_fifo_enabled,1,TID_BOOL); P1190("ExtendedTriggerTimeEnabled",extended_trigger_time_enabled,1,TID_BOOL); P1190("ChannelEnabled",channel_enabled,128,TID_BOOL);
+#undef P1190
+    WORD error=c.error_mask&0x7FF; DWORD fifo=(c.fifo_size&0xF)<=7?(1u<<((c.fifo_size&0xF)+1)):0;
+    set_module_output(V1190_READBACK_PATH,"ErrorMask",&error,sizeof(error),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"EffectiveFifoSizeWords",&fifo,sizeof(fifo),1,TID_DWORD); set_module_output(V1190_READBACK_PATH,"ControlRaw",&c.control,sizeof(c.control),1,TID_WORD); set_module_readback_valid(V1190_READBACK_PATH,ok);
     return ok;
 }
 
-#if ENABLE_V775
 static bool verify_v775_configuration()
 {
-    WORD fsr = 0, bits = 0;
+    if(!gV775RunSettings.enabled) { set_module_readback_valid(V775_READBACK_PATH,false); return true; }
+    WORD fsr=0,bits=0,firmware=0,fclr=0,thresholds[32]={};
     if (!vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR verify") ||
-        !vme_read16(V775_BASE + V775_BIT_SET2, bits, "V775 Bit Set 2 verify")) return false;
-    bool ok = verify_value("V775", "Full Scale Range", V775_RUN_FULL_SCALE, fsr & 0xFF);
-    ok = verify_value("V775", "required set bits", V775_RUN_SET_BITS,
-                      bits & V775_RUN_SET_BITS) && ok;
-    ok = verify_value("V775", "VALID=0 datum write disabled", 0,
-                      !!(bits & V775_BIT2_VALID_CONTROL)) && ok;
-    return verify_value("V775", "required clear bits", 0,
-                        bits & V775_RUN_CLEAR_BITS) && ok;
+        !vme_read16(V775_BASE+V775_BIT_SET2,bits,"V775 Bit Set 2 verify") || !vme_read16(V775_BASE+V775_FIRMWARE_REVISION,firmware,"V775 Firmware") || !vme_read16(V775_BASE+V775_FCLR_WINDOW,fclr,"V775 Fast Clear") || v775_ThresholdRead(gVme,V775_BASE,thresholds)!=V775_MAX_CHANNELS) return false;
+    bool ok=verify_value("V775","Full Scale Range",gV775RunSettings.full_scale_range,fsr&0xFF);
+#define VV775(name,member,bit) ok=verify_value("V775",name,gV775RunSettings.member,!!(bits&bit))&&ok
+    VV775("OverRange",over_range_enabled,V775_BIT2_OVER_RANGE); VV775("LowThreshold",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); VV775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); VV775("EmptyProgram",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); VV775("ValidControl",valid_control_enabled,V775_BIT2_VALID_CONTROL); VV775("SlidingScale",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); VV775("AllTrigger",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
+#undef VV775
+    set_module_output(V775_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FullScaleRange",&fsr,sizeof(fsr),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FastClearWindow",&fclr,sizeof(fclr),1,TID_WORD);
+#define RB775(k,m,b) { const BOOL v=!!(bits&b); set_module_output(V775_READBACK_PATH,k,&v,sizeof(v),1,TID_BOOL); }
+    RB775("OverRangeEnabled",over_range_enabled,V775_BIT2_OVER_RANGE); RB775("LowThresholdEnabled",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); RB775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); RB775("EmptyProgramEnabled",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); RB775("ValidControlEnabled",valid_control_enabled,V775_BIT2_VALID_CONTROL); RB775("SlidingScaleEnabled",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); RB775("AllTriggerEnabled",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
+#undef RB775
+    set_module_output(V775_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD); set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD); set_module_readback_valid(V775_READBACK_PATH,ok); return ok;
 }
-#endif
-
 static bool clear_module_buffers()
 {
-    if (!vme_write16(V792_BASE + V792_BIT_SET2_RW, 0x0004, "V792 Data Clear set") ||
-        !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO, 0x0004, "V792 Data Clear clear") ||
-        !vme_write16(V1190_BASE + V1190_SOFT_CLEAR, 0, "V1190 Software Clear")) return false;
-#if ENABLE_V775
-    if (
-        !vme_write16(V775_BASE + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, "V775 Data Clear set") ||
-        !vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, "V775 Data Clear clear")) return false;
-#endif
+    if (gV792RunSettings.enabled &&
+        (!vme_write16(V792_BASE + V792_BIT_SET2_RW,0x0004,"V792 Data Clear set") || !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO,0x0004,"V792 Data Clear clear"))) return false;
+    if (gV1190RunSettings.enabled && !vme_write16(V1190_BASE+V1190_SOFT_CLEAR,0,"V1190 Software Clear")) return false;
+    if (gV775RunSettings.enabled &&
+        (!vme_write16(V775_BASE + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, "V775 Data Clear set") ||
+         !vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, "V775 Data Clear clear"))) return false;
     WORD status = 0;
-    if (!vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 Status after clear")) return false;
-    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY)
-#if ENABLE_V775
-        || v775_DataReady(gVme, V775_BASE)
-#endif
+    if (gV1190RunSettings.enabled && !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 Status after clear")) return false;
+    if ((gV792RunSettings.enabled && v792_DataReady(gVme,V792_BASE)) || (gV1190RunSettings.enabled && (status&V1190_STATUS_DATA_READY))
+        || (gV775RunSettings.enabled && v775_DataReady(gVme,V775_BASE))
         ) {
         cm_msg(MERROR, frontend_name, "Buffer clear verify failed: DataReady remains asserted");
         return false;
@@ -1840,58 +2304,39 @@ static bool verify_run_start_state()
 {
     WORD status = 0;
     DWORD v792_counter = 0, v1190_counter = 0;
-    v792_EvtCntRead(gVme, V792_BASE, &v792_counter);
-#if ENABLE_V775
+    if(gV792RunSettings.enabled) v792_EvtCntRead(gVme,V792_BASE,&v792_counter);
     DWORD v775_counter = 0;
-    v775_EvtCntRead(gVme, V775_BASE, &v775_counter);
-#endif
-    if (!vme_read32(V1190_BASE + V1190_EVENT_COUNTER, v1190_counter,
-                    "V1190 Event Counter") ||
-        !vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 run-start Status")) return false;
-    printf("BOR event counters: V792=0x%06X V1190=0x%08X",
-           v792_counter & V7XX_EVENT_COUNTER_MASK, v1190_counter);
-#if ENABLE_V775
-    printf(" V775=0x%06X", v775_counter & V7XX_EVENT_COUNTER_MASK);
-#else
-    printf(" V775=DISABLED");
-#endif
+    if(gV775RunSettings.enabled) v775_EvtCntRead(gVme,V775_BASE,&v775_counter);
+    if(gV1190RunSettings.enabled && (!vme_read32(V1190_BASE+V1190_EVENT_COUNTER,v1190_counter,"V1190 Event Counter") || !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 run-start Status"))) return false;
+    printf("BOR event counters: V792=%s0x%06X V1190=%s0x%08X",gV792RunSettings.enabled?"":"DISABLED/",v792_counter&V7XX_EVENT_COUNTER_MASK,gV1190RunSettings.enabled?"":"DISABLED/",v1190_counter);
+    printf(" V775=%s0x%06X",gV775RunSettings.enabled?"":"DISABLED/",v775_counter&V7XX_EVENT_COUNTER_MASK);
     printf("\n");
-    if (v792_DataReady(gVme, V792_BASE) || (status & V1190_STATUS_DATA_READY)
-#if ENABLE_V775
-        || v775_DataReady(gVme, V775_BASE)
-#endif
+    if ((gV792RunSettings.enabled&&v792_DataReady(gVme,V792_BASE)) || (gV1190RunSettings.enabled&&(status&V1190_STATUS_DATA_READY))
+        || (gV775RunSettings.enabled&&v775_DataReady(gVme,V775_BASE))
         ) {
         cm_msg(MERROR, frontend_name, "BOR run-start verify failed: module buffer is not empty");
         return false;
     }
-    printf("BOR configuration complete:\n  V792  : READY\n  V1190 : READY\n"
-#if ENABLE_V775
-           "  V775  : READY\n"
-#else
-           "  V775  : DISABLED\n"
-#endif
+    printf("BOR configuration complete:\n  V792  : %s\n  V1190 : %s\n"
+           "  V775  : %s\n"
            "  V1720E: %s\n  Buffers empty\n"
            "  Event counters reset\n  Run may start\n",
+           gV792RunSettings.enabled?"READY":"DISABLED",gV1190RunSettings.enabled?"READY":"DISABLED",
+           gV775RunSettings.enabled?"READY":"DISABLED",
            gV1720RunSettings.enabled ? "READY" : "DISABLED");
     return true;
 }
 
 static bool prepare_modules_for_run()
 {
-    if (!check_module_communication(gV1720RunSettings.enabled != FALSE) ||
-        !log_current_configuration("before configuration")) return false;
+    if (!check_module_communication(gV1720RunSettings.enabled != FALSE)) return false;
     if (!configure_v792_for_run() || !configure_v1190_for_run()
-#if ENABLE_V775
         || !configure_v775_for_run()
-#endif
         || !configure_v1720e_for_run()) return false;
     if (!verify_v792_configuration() || !verify_v1190_configuration()
-#if ENABLE_V775
         || !verify_v775_configuration()
-#endif
         ) return false;
-    if (!log_current_configuration("after configuration") ||
-        !clear_module_buffers() || !reset_module_event_counters() ||
+    if (!clear_module_buffers() || !reset_module_event_counters() ||
         !verify_run_start_state())
         return false;
     if (!gV1720RunSettings.enabled) {
@@ -1988,6 +2433,25 @@ static void log_run_statistics()
     }
 }
 
+static void refresh_enabled_module_variables()
+{
+    if(gV792RunSettings.enabled) {
+        WORD s1=0,s2=0; DWORD counter=gV792Runtime.event_counter;
+        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 final Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 final Status2")) { v792_EvtCntRead(gVme,V792_BASE,&counter); gV792Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV792Runtime,s1,s2,counter); } else gV792Runtime.communication_ok=FALSE;
+        publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+    }
+    if(gV1190RunSettings.enabled) {
+        WORD status=0,stored=0; DWORD counter=gV1190Runtime.event_counter;
+        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 final Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 final Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 final Event Counter")) { gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter); } else gV1190Runtime.communication_ok=FALSE;
+        publish_v1190_variables();
+    }
+    if(gV775RunSettings.enabled) {
+        WORD s1=0,s2=0; DWORD counter=gV775Runtime.event_counter;
+        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 final Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 final Status2")) { v775_EvtCntRead(gVme,V775_BASE,&counter); gV775Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV775Runtime,s1,s2,counter); } else gV775Runtime.communication_ok=FALSE;
+        publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+    }
+}
+
 
 /* Open VME and verify both modules without changing their configuration. */
 INT frontend_init()
@@ -2003,9 +2467,9 @@ INT frontend_init()
     printf("Software-trigger diagnostics: disabled\n");
 #endif
 
-    if (!initialize_v1720e_odb()) {
+    if (!initialize_other_module_odb() || !initialize_v1720e_odb()) {
         cm_msg(MERROR, frontend_name,
-               "Cannot initialize V1720E ODB schema/settings");
+               "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;
     }
 
@@ -2037,12 +2501,13 @@ INT frontend_exit()
 {
     if (gVme) {
         stop_v1720e_and_publish_state("frontend exit");
+        refresh_enabled_module_variables();
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-        if (!restore_v1190_diagnostic_settings())
+        if (gV1190RunSettings.enabled && !restore_v1190_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V1190 diagnostic restoration failed during frontend exit");
 #endif
-#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
-        if (!restore_v775_diagnostic_settings())
+#if ENABLE_V775_SW_TRIGGER_TEST
+        if (gV775RunSettings.enabled && !restore_v775_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V775 diagnostic restoration failed during frontend exit");
 #endif
         mvme_close(gVme);
@@ -2060,12 +2525,15 @@ INT begin_of_run(INT run_number, char *error)
     printf("Begin run %d\n", run_number);
     reset_run_statistics();
 
-    if (!snapshot_v1720e_settings_for_run()) {
+    if (!validate_and_snapshot_module_settings() || !snapshot_v1720e_settings_for_run()) {
         cm_msg(MERROR, frontend_name,
-               "Cannot snapshot/validate V1720E Settings at BOR");
-        snprintf(error, 256, "Invalid V1720E ODB Settings");
+               "Cannot snapshot/validate VME module Settings at BOR");
+        snprintf(error, 256, "Invalid VME module ODB Settings");
         return FE_ERR_ODB;
     }
+    set_module_readback_valid(V792_READBACK_PATH,false);
+    set_module_readback_valid(V1190_READBACK_PATH,false);
+    set_module_readback_valid(V775_READBACK_PATH,false);
     set_v1720e_readback_valid(false);
 
     if (!prepare_modules_for_run()) {
@@ -2076,11 +2544,11 @@ INT begin_of_run(INT run_number, char *error)
     }
 
 #if ENABLE_V792_SW_TRIGGER_TEST
-    setup_v792_sw_trigger_test();
+    if(gV792RunSettings.enabled) setup_v792_sw_trigger_test();
 #endif
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-    if (!restore_v1190_diagnostic_settings() ||
-        !setup_v1190_soft_trigger_test()) {
+    if (gV1190RunSettings.enabled && (!restore_v1190_diagnostic_settings() ||
+        !setup_v1190_soft_trigger_test())) {
         snprintf(error, 256, "V1190 soft-trigger diagnostic setup failed");
         restore_v1190_diagnostic_settings();
         if (gV1720Started) {
@@ -2090,9 +2558,9 @@ INT begin_of_run(INT run_number, char *error)
         return FE_ERR_HW;
     }
 #endif
-#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
-    if (!restore_v775_diagnostic_settings() ||
-        !setup_v775_sw_trigger_test()) {
+#if ENABLE_V775_SW_TRIGGER_TEST
+    if (gV775RunSettings.enabled && (!restore_v775_diagnostic_settings() ||
+        !setup_v775_sw_trigger_test())) {
         snprintf(error, 256, "V775 SW trigger diagnostic setup failed");
         restore_v775_diagnostic_settings();
         if (gV1720Started) {
@@ -2115,13 +2583,14 @@ INT end_of_run(INT run_number, char *error)
         return FE_ERR_HW;
     }
     log_run_statistics();
+    refresh_enabled_module_variables();
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-    if (!restore_v1190_diagnostic_settings())
+    if (gV1190RunSettings.enabled && !restore_v1190_diagnostic_settings())
         restore_failed = true;
 #endif
-#if ENABLE_V775 && ENABLE_V775_SW_TRIGGER_TEST
-    if (!restore_v775_diagnostic_settings())
+#if ENABLE_V775_SW_TRIGGER_TEST
+    if (gV775RunSettings.enabled && !restore_v775_diagnostic_settings())
         restore_failed = true;
 #endif
     if (restore_failed) {
@@ -2151,6 +2620,31 @@ INT frontend_loop()
 {
     publish_rpv130_status(false);
     const DWORD now = ss_millitime();
+    const auto due=[](DWORD now,DWORD last,bool dirty) {
+        const DWORD elapsed=static_cast<DWORD>(now-last);
+        return (dirty&&elapsed>=MODULE_VARIABLES_MIN_PUBLISH_INTERVAL_MS)||elapsed>=MODULE_VARIABLES_HEARTBEAT_INTERVAL_MS;
+    };
+    if(gV792RunSettings.enabled && due(now,gV792LastVariablesPublish,gV792Runtime.dirty)) {
+        WORD s1=0,s2=0; DWORD counter=gV792Runtime.event_counter;
+        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 runtime Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 runtime Status2")) {
+            v792_EvtCntRead(gVme,V792_BASE,&counter); gV792Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV792Runtime,s1,s2,counter);
+        } else gV792Runtime.communication_ok=FALSE;
+        publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+    }
+    if(gV1190RunSettings.enabled && due(now,gV1190LastVariablesPublish,gV1190Runtime.dirty)) {
+        WORD status=0,stored=0; DWORD counter=gV1190Runtime.event_counter;
+        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 runtime Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 runtime Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 runtime Event Counter")) {
+            gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter);
+        } else gV1190Runtime.communication_ok=FALSE;
+        publish_v1190_variables();
+    }
+    if(gV775RunSettings.enabled && due(now,gV775LastVariablesPublish,gV775Runtime.dirty)) {
+        WORD s1=0,s2=0; DWORD counter=gV775Runtime.event_counter;
+        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 runtime Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 runtime Status2")) {
+            v775_EvtCntRead(gVme,V775_BASE,&counter); gV775Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV775Runtime,s1,s2,counter);
+        } else gV775Runtime.communication_ok=FALSE;
+        publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+    }
     const DWORD elapsed =
         static_cast<DWORD>(now - gV1720LastVariablesPublish);
     if (gV1720VariablesEnabled &&
@@ -2166,6 +2660,7 @@ INT frontend_loop()
 INT poll_event(INT source, INT count, BOOL test)
 {
     if (!gVme || gReadoutFailed ||
+        !gV792RunSettings.enabled ||
         (gV1720RunSettings.enabled && !gV1720Started))
         return 0;
     for (INT i = 0; i < count; ++i) {
@@ -2185,29 +2680,21 @@ INT interrupt_configure(INT cmd, INT source, PTYPE adr)
 /* Event synchronization layer. Readers expose native counters; pairing uses low 22 bits. */
 static bool check_event_counter_match(const V792EventInfo &v792,
                                       const V1190EventInfo &v1190,
-#if ENABLE_V775
                                       const V775EventInfo &v775,
-#endif
                                       const V1720E_EVENT_INFO *v1720)
 {
-    const DWORD v792_counter22 = v792.event_counter & V1190_EVENT_COUNTER_MASK;
-    const DWORD v1190_counter22 = v1190.event_counter & V1190_EVENT_COUNTER_MASK;
-#if ENABLE_V775
-    const DWORD v775_counter22 = v775.event_counter & V1190_EVENT_COUNTER_MASK;
-#endif
-    return v792_counter22 == v1190_counter22 &&
-#if ENABLE_V775
-           v792_counter22 == v775_counter22 &&
-#endif
-           (!v1720 || v792_counter22 ==
-               (v1720->event_counter & V1190_EVENT_COUNTER_MASK));
+    bool have=false; DWORD reference=0;
+#define CMP(enabled,value) do { if(enabled) { DWORD n=(value)&V1190_EVENT_COUNTER_MASK; if(have&&n!=reference)return false; reference=n; have=true; } } while(0)
+    CMP(gV792RunSettings.enabled,v792.event_counter); CMP(gV1190RunSettings.enabled,v1190.event_counter);
+    CMP(gV775RunSettings.enabled,v775.event_counter);
+    CMP(v1720!=NULL,v1720?v1720->event_counter:0);
+#undef CMP
+    return true;
 }
 
 static void log_event_counter_mismatch(const V792EventInfo &v792,
                                        const V1190EventInfo &v1190,
-#if ENABLE_V775
                                        const V775EventInfo &v775,
-#endif
                                        const V1720E_EVENT_INFO *v1720,
                                        DWORD midas_serial)
 {
@@ -2222,29 +2709,21 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
             cm_msg(MINFO, frontend_name,
                    "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
                    "V792=0x%06X V1190=0x%06X "
-#if ENABLE_V775
                    "V775=0x%06X "
-#endif
                    "V1720=0x%06X",
                    midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
                    v1190.event_counter & V1190_EVENT_COUNTER_MASK,
-#if ENABLE_V775
                    v775.event_counter & V7XX_EVENT_COUNTER_MASK,
-#endif
                    v1720->event_counter & V7XX_EVENT_COUNTER_MASK);
         } else {
             cm_msg(MINFO, frontend_name,
                    "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
                    "V792=0x%06X V1190=0x%06X"
-#if ENABLE_V775
                    " V775=0x%06X"
-#endif
                    " (V1720 disabled)",
                    midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
                    v1190.event_counter & V1190_EVENT_COUNTER_MASK
-#if ENABLE_V775
                    , v775.event_counter & V7XX_EVENT_COUNTER_MASK
-#endif
                    );
         }
     } else if (count % 1000 == 0) {
@@ -2303,29 +2782,17 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
 static INT build_midas_event(char *pevent,
                              const DWORD *v792_data, const V792EventInfo &v792,
                              const DWORD *v1190_data, const V1190EventInfo &v1190,
-#if ENABLE_V775
                              const DWORD *v775_data, const V775EventInfo &v775,
-#endif
                              const DWORD *v1720_data,
                              const V1720E_EVENT_INFO *v1720)
 {
     bk_init32(pevent);
     void *bank = NULL;
-    bk_create(pevent, "ADC0", TID_DWORD, &bank);
-    memcpy(bank, v792_data, v792.words * sizeof(DWORD));
-    bk_close(pevent, static_cast<DWORD *>(bank) + v792.words);
+    if(gV792RunSettings.enabled) { bk_create(pevent,"ADC0",TID_DWORD,&bank); memcpy(bank,v792_data,v792.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v792.words); }
 
-    bank = NULL;
-    bk_create(pevent, "TDC0", TID_DWORD, &bank);
-    memcpy(bank, v1190_data, v1190.words * sizeof(DWORD));
-    bk_close(pevent, static_cast<DWORD *>(bank) + v1190.words);
+    if(gV1190RunSettings.enabled) { bank=NULL; bk_create(pevent,"TDC0",TID_DWORD,&bank); memcpy(bank,v1190_data,v1190.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v1190.words); }
 
-#if ENABLE_V775
-    bank = NULL;
-    bk_create(pevent, "TDC1", TID_DWORD, &bank);
-    memcpy(bank, v775_data, v775.words * sizeof(DWORD));
-    bk_close(pevent, static_cast<DWORD *>(bank) + v775.words);
-#endif
+    if(gV775RunSettings.enabled) { bank=NULL; bk_create(pevent,"TDC1",TID_DWORD,&bank); memcpy(bank,v775_data,v775.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v775.words); }
 
     if (v1720) {
         bank = NULL;
@@ -2344,10 +2811,8 @@ INT read_vme_event(char *pevent, INT off)
         return 0;
 
     // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
-    if (!wait_for_v1190_data_ready()
-#if ENABLE_V775
-        || !wait_for_v775_data_ready()
-#endif
+    if ((gV1190RunSettings.enabled && !wait_for_v1190_data_ready())
+        || (gV775RunSettings.enabled && !wait_for_v775_data_ready())
         || (gV1720RunSettings.enabled && !wait_for_v1720e_data_ready())) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
@@ -2358,35 +2823,34 @@ INT read_vme_event(char *pevent, INT off)
 
     DWORD v792_data[V792_MAX_EVENT_WORDS];
     DWORD v1190_data[V1190_MAX_EVENT_WORDS];
-#if ENABLE_V775
     DWORD v775_data[V775_MAX_EVENT_WORDS];
-#endif
     DWORD v1720_data[V1720E_MAX_EVENT_WORDS];
-    const V792EventInfo v792 = read_v792_single_event(v792_data);
-    if (!v792.valid || v792.words == 0) {
+    V792EventInfo v792 = {};
+    if(gV792RunSettings.enabled) v792=read_v792_single_event(v792_data);
+    if (gV792RunSettings.enabled && (!v792.valid || v792.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "V792 readout disabled after error; no partial bank sent. Check hardware and restart the run to reset readout.");
         return 0;
     }
 
-    const V1190EventInfo v1190 = read_v1190_single_event(v1190_data);
-    if (!v1190.valid || v1190.words == 0) {
+    V1190EventInfo v1190 = {};
+    if(gV1190RunSettings.enabled) v1190=read_v1190_single_event(v1190_data);
+    if (gV1190RunSettings.enabled && (!v1190.valid || v1190.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "V1190 readout disabled after error; V792 event was consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
         return 0;
     }
 
-#if ENABLE_V775
-    const V775EventInfo v775 = read_v775_single_event(v775_data);
-    if (!v775.valid || v775.words == 0) {
+    V775EventInfo v775 = {};
+    if(gV775RunSettings.enabled) v775=read_v775_single_event(v775_data);
+    if (gV775RunSettings.enabled && (!v775.valid || v775.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "V775 readout disabled after error; V792/V1190 events were consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
         return 0;
     }
-#endif
 
     V1720E_EVENT_INFO v1720 = {};
     V1720E_EVENT_INFO *v1720_event = NULL;
@@ -2406,9 +2870,7 @@ INT read_vme_event(char *pevent, INT off)
             cm_msg(MERROR, frontend_name,
                    "V1720E readout disabled after malformed/partial event: "
                    "status %d words=%zu header-valid=%d. V792/V1190"
-#if ENABLE_V775
                    "/V775"
-#endif
                    " events "
                    "were consumed but no partial MIDAS event was sent.",
                    v1720_status, v1720.words, v1720.header_valid);
@@ -2421,24 +2883,14 @@ INT read_vme_event(char *pevent, INT off)
         gV1720Runtime.dirty = true;
     }
 
-    if (!check_event_counter_match(v792, v1190,
-#if ENABLE_V775
-                                   v775,
-#endif
-                                   v1720_event))
-        log_event_counter_mismatch(v792, v1190,
-#if ENABLE_V775
-                                   v775,
-#endif
-                                   v1720_event,
+    if (!check_event_counter_match(v792, v1190, v775, v1720_event))
+        log_event_counter_mismatch(v792, v1190, v775, v1720_event,
                                    SERIAL_NUMBER(pevent));
 
     return build_midas_event(pevent,
                              v792_data, v792,
                              v1190_data, v1190,
-#if ENABLE_V775
                              v775_data, v775,
-#endif
                              v1720_data, v1720_event);
 }
 
