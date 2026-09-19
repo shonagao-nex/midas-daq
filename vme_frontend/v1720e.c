@@ -23,13 +23,6 @@
 #define CHANNEL_CONFIG_ZS_MASK   0x000F0000u
 #define CHANNEL_CONFIG_PACK25    0x00000800u
 
-#define CONFIG_BUFFER_ORG        0x0000000Au
-#define CONFIG_CUSTOM_SIZE       0x00000040u
-#define CONFIG_TRIGGER_SOURCE    0xC0000000u
-#define CONFIG_POST_TRIGGER      0x00000030u
-#define CONFIG_CHANNEL_ENABLE    0x000000FFu
-#define CONFIG_DC_OFFSET         0x00008000u
-
 static int access_begin(MVME_INTERFACE *vme, int *saved_am, int *saved_mode)
 {
     int status;
@@ -115,12 +108,13 @@ int v1720e_probe(MVME_INTERFACE *vme, DWORD base, V1720E_BOARD_INFO *info)
     return MVME_SUCCESS;
 }
 
-int v1720e_configure(MVME_INTERFACE *vme, DWORD base)
+int v1720e_configure(MVME_INTERFACE *vme, DWORD base,
+                     const V1720E_CONFIG *config)
 {
     DWORD control = 0, status_reg = 0, channel_config = 0;
     unsigned channel;
     int status;
-    if (!vme)
+    if (!vme || !config)
         return MVME_INVALID_PARAM;
     status = read32(vme, base, REG_ACQUISITION_CONTROL, &control);
     if (status != MVME_SUCCESS)
@@ -148,34 +142,66 @@ int v1720e_configure(MVME_INTERFACE *vme, DWORD base)
      * reset avoids adding a separate Software Clear.
      */
     status = write_verify(vme, base, REG_BUFFER_ORGANIZATION,
-                          CONFIG_BUFFER_ORG);
+                          config->buffer_organization);
     if (status != MVME_SUCCESS)
         return status;
-    status = write_verify(vme, base, REG_CUSTOM_SIZE, CONFIG_CUSTOM_SIZE);
+    status = write_verify(vme, base, REG_CUSTOM_SIZE, config->custom_size);
     if (status != MVME_SUCCESS)
         return status;
     status = write_verify(vme, base, REG_TRIGGER_SOURCE,
-                          CONFIG_TRIGGER_SOURCE);
+                          config->trigger_source);
     if (status != MVME_SUCCESS)
         return status;
-    status = write_verify(vme, base, REG_POST_TRIGGER, CONFIG_POST_TRIGGER);
+    status = write_verify(vme, base, REG_POST_TRIGGER, config->post_trigger);
     if (status != MVME_SUCCESS)
         return status;
     status = write_verify(vme, base, REG_CHANNEL_ENABLE,
-                          CONFIG_CHANNEL_ENABLE);
+                          config->channel_enable);
     if (status != MVME_SUCCESS)
         return status;
-    for (channel = 0; channel < 8; ++channel) {
+    for (channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
         status = write_verify(vme, base, REG_DC_OFFSET(channel),
-                              CONFIG_DC_OFFSET);
+                              config->dc_offset[channel]);
         if (status != MVME_SUCCESS)
             return status;
     }
     return MVME_SUCCESS;
 }
 
+int v1720e_read_configuration(MVME_INTERFACE *vme, DWORD base,
+                              V1720E_CONFIG_READBACK *readback)
+{
+    DWORD dc_offset;
+    unsigned channel;
+    int status;
+    if (!vme || !readback)
+        return MVME_INVALID_PARAM;
+    memset(readback, 0, sizeof(*readback));
+#define READ_CONFIG(member, reg) \
+    do { \
+        status = read32(vme, base, reg, &readback->member); \
+        if (status != MVME_SUCCESS) return status; \
+    } while (0)
+    READ_CONFIG(board_info, REG_BOARD_INFO);
+    READ_CONFIG(roc_firmware, REG_ROC_FIRMWARE);
+    READ_CONFIG(buffer_organization, REG_BUFFER_ORGANIZATION);
+    READ_CONFIG(custom_size, REG_CUSTOM_SIZE);
+    READ_CONFIG(post_trigger, REG_POST_TRIGGER);
+    READ_CONFIG(trigger_source, REG_TRIGGER_SOURCE);
+    READ_CONFIG(channel_enable, REG_CHANNEL_ENABLE);
+    READ_CONFIG(channel_config, REG_CHANNEL_CONFIG);
+#undef READ_CONFIG
+    for (channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        status = read32(vme, base, REG_DC_OFFSET(channel), &dc_offset);
+        if (status != MVME_SUCCESS)
+            return status;
+        readback->dc_offset[channel] = (WORD)(dc_offset & 0xFFFFu);
+    }
+    return MVME_SUCCESS;
+}
+
 int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
-                      DWORD *event_stored)
+                      DWORD *event_stored, DWORD *acquisition_status)
 {
     DWORD status_reg = 0, stored = 0;
     int status;
@@ -190,11 +216,14 @@ int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
     *ready = !!(status_reg & STATUS_EVENT_READY) && stored != 0;
     if (event_stored)
         *event_stored = stored;
+    if (acquisition_status)
+        *acquisition_status = status_reg;
     return MVME_SUCCESS;
 }
 
 int v1720e_read_event(MVME_INTERFACE *vme, DWORD base, DWORD *data,
-                      size_t capacity, V1720E_EVENT_INFO *info)
+                      size_t capacity, DWORD expected_event_words,
+                      DWORD expected_channel_mask, V1720E_EVENT_INFO *info)
 {
     DWORD size;
     size_t i;
@@ -216,8 +245,9 @@ int v1720e_read_event(MVME_INTERFACE *vme, DWORD base, DWORD *data,
     info->event_counter = data[2] & 0x00FFFFFFu;
     info->trigger_time_tag = data[3] & 0x7FFFFFFFu;
     info->header_valid = (data[0] >> 28) == 0xAu;
-    info->size_valid = size == V1720E_EXPECTED_EVENT_WORDS;
-    info->channel_mask_valid = info->channel_mask == 0xFFu;
+    info->size_valid = size == expected_event_words;
+    info->channel_mask_valid =
+        info->channel_mask == (expected_channel_mask & 0xFFu);
     if (!info->header_valid || size < 4 || size > capacity) {
         info->words = 4;
         return access_end(vme, saved_am, saved_mode, MVME_ACCESS_ERROR);

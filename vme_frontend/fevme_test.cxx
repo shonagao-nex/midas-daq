@@ -167,6 +167,302 @@ static void publish_rpv130_status(bool force)
                   sizeof(communication_ok), TID_BOOL);
 }
 
+static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
+static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
+static const char *V1720E_READBACK_PATH = "/Equipment/VME/Readback/V1720E";
+static const char *V1720E_VARIABLES_PATH = "/Equipment/VME/Variables/V1720E";
+
+static const DWORD V1720E_TRIGGER_SOFTWARE = 0x80000000u;
+static const DWORD V1720E_TRIGGER_EXTERNAL = 0x40000000u;
+static const DWORD V1720E_TRIGGER_CHANNEL_MASK = 0x000000FFu;
+static const DWORD V1720E_CHANNEL_CONFIG_ZS_MASK = 0x000F0000u;
+static const DWORD V1720E_CHANNEL_CONFIG_PACK25 = 0x00000800u;
+static const DWORD V1720E_ACQ_RUN = 0x00000004u;
+static const DWORD V1720E_STATUS_EVENT_READY = 0x00000008u;
+static const DWORD V1720E_STATUS_EXTERNAL_CLOCK = 0x00000020u;
+static const DWORD V1720E_STATUS_PLL_OK = 0x00000080u;
+static const DWORD V1720E_STATUS_BOARD_READY = 0x00000100u;
+
+struct V1720ESettings {
+    BOOL enabled;
+    DWORD buffer_organization;
+    DWORD record_length_samples;
+    DWORD post_trigger;
+    BOOL software_trigger_enabled;
+    BOOL external_trigger_enabled;
+    BOOL channel_self_trigger_enabled[V1720E_CHANNEL_COUNT];
+    BOOL channel_enabled[V1720E_CHANNEL_COUNT];
+    WORD dc_offset[V1720E_CHANNEL_COUNT];
+};
+
+static V1720ESettings default_v1720e_settings()
+{
+    V1720ESettings settings = {};
+    settings.enabled = TRUE;
+    settings.buffer_organization = 0x0Au;
+    settings.record_length_samples = V1720E_DEFAULT_RECORD_SAMPLES;
+    settings.post_trigger = 0x30u;
+    settings.software_trigger_enabled = TRUE;
+    settings.external_trigger_enabled = TRUE;
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        settings.channel_self_trigger_enabled[channel] = FALSE;
+        settings.channel_enabled[channel] = TRUE;
+        settings.dc_offset[channel] = 0x8000u;
+    }
+    return settings;
+}
+
+static V1720ESettings gV1720RunSettings = default_v1720e_settings();
+static V1720E_CONFIG gV1720RunConfig = {};
+static bool gV1720StartupEnabled = true;
+static bool gV1720VariablesEnabled = true;
+static DWORD gV1720ExpectedEventWords = V1720E_DEFAULT_EVENT_WORDS;
+static DWORD gV1720ExpectedChannelMask = V1720E_DEFAULT_CHANNEL_MASK;
+static const DWORD V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
+static const DWORD V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
+
+struct V1720ERuntimeState {
+    BOOL communication_ok;
+    DWORD acquisition_control;
+    DWORD acquisition_status;
+    BOOL running;
+    BOOL event_ready;
+    BOOL external_clock;
+    BOOL pll_locked;
+    BOOL board_ready;
+    DWORD event_stored;
+    DWORD event_counter;
+    DWORD trigger_time_tag;
+    bool dirty;
+};
+
+static V1720ERuntimeState gV1720Runtime = {};
+static DWORD gV1720LastVariablesPublish = 0;
+
+static bool make_odb_path(char *path, size_t capacity, const char *base,
+                          const char *name)
+{
+    const int length = snprintf(path, capacity, "%s/%s", base, name);
+    return length >= 0 && static_cast<size_t>(length) < capacity;
+}
+
+static bool set_absolute_odb_value(const char *path, const void *value,
+                                   INT size, INT count, DWORD type)
+{
+    HNDLE hDB = 0;
+    cm_get_experiment_database(&hDB, NULL);
+    const INT status = db_set_value(hDB, 0, path, value, size, count, type);
+    if (status != DB_SUCCESS)
+        cm_msg(MERROR, frontend_name, "Cannot update ODB %s: status %d",
+               path, status);
+    return status == DB_SUCCESS;
+}
+
+static bool ensure_odb_value(const char *path, const void *default_value,
+                             INT size, INT count, DWORD type)
+{
+    HNDLE hDB = 0;
+    HNDLE hKey = 0;
+    cm_get_experiment_database(&hDB, NULL);
+    const INT find_status = db_find_key(hDB, 0, path, &hKey);
+    if (find_status == DB_SUCCESS)
+        return true;
+    if (find_status != DB_NO_KEY) {
+        cm_msg(MERROR, frontend_name, "Cannot inspect ODB %s: status %d",
+               path, find_status);
+        return false;
+    }
+    return set_absolute_odb_value(path, default_value, size, count, type);
+}
+
+static bool get_absolute_odb_value(const char *path, void *value, INT size,
+                                   DWORD type)
+{
+    HNDLE hDB = 0;
+    cm_get_experiment_database(&hDB, NULL);
+    INT actual_size = size;
+    const INT status = db_get_value(hDB, 0, path, value, &actual_size,
+                                    type, FALSE);
+    if (status != DB_SUCCESS || actual_size != size) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot read ODB %s: status %d size %d expected %d",
+               path, status, actual_size, size);
+        return false;
+    }
+    return true;
+}
+
+static bool ensure_v1720e_settings_schema()
+{
+    const V1720ESettings defaults = default_v1720e_settings();
+    char path[256];
+#define ENSURE_SETTING(name, member, count, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), V1720E_SETTINGS_PATH, name) || \
+            !ensure_odb_value(path, &defaults.member, sizeof(defaults.member), \
+                              count, type)) return false; \
+    } while (0)
+    ENSURE_SETTING("Enabled", enabled, 1, TID_BOOL);
+    ENSURE_SETTING("BufferOrganization", buffer_organization, 1, TID_DWORD);
+    ENSURE_SETTING("RecordLengthSamples", record_length_samples, 1, TID_DWORD);
+    ENSURE_SETTING("PostTrigger", post_trigger, 1, TID_DWORD);
+    ENSURE_SETTING("SoftwareTriggerEnabled", software_trigger_enabled, 1, TID_BOOL);
+    ENSURE_SETTING("ExternalTriggerEnabled", external_trigger_enabled, 1, TID_BOOL);
+    ENSURE_SETTING("ChannelSelfTriggerEnabled", channel_self_trigger_enabled,
+                   V1720E_CHANNEL_COUNT, TID_BOOL);
+    ENSURE_SETTING("ChannelEnabled", channel_enabled,
+                   V1720E_CHANNEL_COUNT, TID_BOOL);
+    ENSURE_SETTING("DCOffset", dc_offset, V1720E_CHANNEL_COUNT, TID_WORD);
+#undef ENSURE_SETTING
+    return true;
+}
+
+static bool read_v1720e_settings(V1720ESettings &settings)
+{
+    V1720ESettings next = {};
+    char path[256];
+#define READ_SETTING(name, member, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), V1720E_SETTINGS_PATH, name) || \
+            !get_absolute_odb_value(path, &next.member, sizeof(next.member), \
+                                    type)) return false; \
+    } while (0)
+    READ_SETTING("Enabled", enabled, TID_BOOL);
+    READ_SETTING("BufferOrganization", buffer_organization, TID_DWORD);
+    READ_SETTING("RecordLengthSamples", record_length_samples, TID_DWORD);
+    READ_SETTING("PostTrigger", post_trigger, TID_DWORD);
+    READ_SETTING("SoftwareTriggerEnabled", software_trigger_enabled, TID_BOOL);
+    READ_SETTING("ExternalTriggerEnabled", external_trigger_enabled, TID_BOOL);
+    READ_SETTING("ChannelSelfTriggerEnabled", channel_self_trigger_enabled, TID_BOOL);
+    READ_SETTING("ChannelEnabled", channel_enabled, TID_BOOL);
+    READ_SETTING("DCOffset", dc_offset, TID_WORD);
+#undef READ_SETTING
+    settings = next;
+    return true;
+}
+
+static bool publish_v1720e_info()
+{
+    const DWORD base_address = V1720E_BASE_ADDRESS;
+    const char address_modifier[] = "A32_ND";
+    const char register_width[] = "D32";
+    const char event_width[] = "D32";
+    char path[256];
+#define SET_INFO(name, value, size, count, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), V1720E_INFO_PATH, name) || \
+            !set_absolute_odb_value(path, value, size, count, type)) \
+            return false; \
+    } while (0)
+    SET_INFO("BaseAddress", &base_address, sizeof(base_address), 1, TID_DWORD);
+    SET_INFO("AddressModifier", address_modifier, sizeof(address_modifier), 1, TID_STRING);
+    SET_INFO("RegisterDataWidth", register_width, sizeof(register_width), 1, TID_STRING);
+    SET_INFO("EventDataWidth", event_width, sizeof(event_width), 1, TID_STRING);
+#undef SET_INFO
+    return true;
+}
+
+static bool set_v1720e_output(const char *base, const char *name,
+                              const void *value, INT size, INT count,
+                              DWORD type)
+{
+    char path[256];
+    return make_odb_path(path, sizeof(path), base, name) &&
+           set_absolute_odb_value(path, value, size, count, type);
+}
+
+static void set_v1720e_readback_valid(bool valid)
+{
+    const BOOL value = valid ? TRUE : FALSE;
+    set_v1720e_output(V1720E_READBACK_PATH, "Valid", &value, sizeof(value),
+                      1, TID_BOOL);
+}
+
+static void update_v1720e_acquisition_status(DWORD status)
+{
+    gV1720Runtime.acquisition_status = status;
+    gV1720Runtime.running = (status & V1720E_ACQ_RUN) != 0;
+    gV1720Runtime.event_ready =
+        (status & V1720E_STATUS_EVENT_READY) != 0;
+    gV1720Runtime.external_clock =
+        (status & V1720E_STATUS_EXTERNAL_CLOCK) != 0;
+    gV1720Runtime.pll_locked = (status & V1720E_STATUS_PLL_OK) != 0;
+    gV1720Runtime.board_ready = (status & V1720E_STATUS_BOARD_READY) != 0;
+    gV1720Runtime.dirty = true;
+}
+
+static void update_v1720e_board_state(const V1720E_BOARD_INFO &info)
+{
+    gV1720Runtime.acquisition_control = info.acquisition_control;
+    update_v1720e_acquisition_status(info.acquisition_status);
+    gV1720Runtime.event_stored = info.event_stored;
+    gV1720Runtime.dirty = true;
+}
+
+static bool publish_v1720e_variables()
+{
+    bool ok = true;
+#define PUBLISH_VARIABLE(name, member, type) \
+    do { \
+        ok = set_v1720e_output(V1720E_VARIABLES_PATH, name, \
+                               &gV1720Runtime.member, \
+                               sizeof(gV1720Runtime.member), 1, type) && ok; \
+    } while (0)
+    PUBLISH_VARIABLE("CommunicationOK", communication_ok, TID_BOOL);
+    PUBLISH_VARIABLE("AcquisitionControl", acquisition_control, TID_DWORD);
+    PUBLISH_VARIABLE("AcquisitionStatus", acquisition_status, TID_DWORD);
+    PUBLISH_VARIABLE("Running", running, TID_BOOL);
+    PUBLISH_VARIABLE("EventReady", event_ready, TID_BOOL);
+    PUBLISH_VARIABLE("ExternalClock", external_clock, TID_BOOL);
+    PUBLISH_VARIABLE("PllLocked", pll_locked, TID_BOOL);
+    PUBLISH_VARIABLE("BoardReady", board_ready, TID_BOOL);
+    PUBLISH_VARIABLE("EventStored", event_stored, TID_DWORD);
+    PUBLISH_VARIABLE("EventCounter", event_counter, TID_DWORD);
+    PUBLISH_VARIABLE("TriggerTimeTag", trigger_time_tag, TID_DWORD);
+#undef PUBLISH_VARIABLE
+    gV1720Runtime.dirty = !ok;
+    gV1720LastVariablesPublish = ss_millitime();
+    return ok;
+}
+
+static void set_v1720e_communication_ok(bool ok)
+{
+    gV1720Runtime.communication_ok = ok ? TRUE : FALSE;
+    gV1720Runtime.dirty = true;
+    publish_v1720e_variables();
+}
+
+static void publish_v1720e_board_state(const V1720E_BOARD_INFO &info)
+{
+    update_v1720e_board_state(info);
+    publish_v1720e_variables();
+}
+
+static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
+                                    bool valid);
+
+static void initialize_v1720e_output_schema()
+{
+    const V1720E_CONFIG_READBACK empty_readback = {};
+    publish_v1720e_readback(empty_readback, false);
+    gV1720Runtime = {};
+    gV1720Runtime.dirty = true;
+    publish_v1720e_variables();
+}
+
+static bool initialize_v1720e_odb()
+{
+    if (!ensure_v1720e_settings_schema() || !publish_v1720e_info())
+        return false;
+    initialize_v1720e_output_schema();
+    V1720ESettings startup_settings = {};
+    if (!read_v1720e_settings(startup_settings))
+        return false;
+    gV1720StartupEnabled = startup_settings.enabled != FALSE;
+    gV1720VariablesEnabled = gV1720StartupEnabled;
+    return true;
+}
+
 struct RunStatistics {
     uint64_t counter_mismatch_count;
     uint32_t first_mismatch_serial;
@@ -227,6 +523,63 @@ struct V775EventInfo {
 };
 
 static bool gV1720Started = false;
+
+static void invalidate_v1720e_current_state()
+{
+    gV1720Runtime.communication_ok = FALSE;
+    gV1720Runtime.acquisition_control = 0;
+    gV1720Runtime.acquisition_status = 0;
+    gV1720Runtime.running = FALSE;
+    gV1720Runtime.event_ready = FALSE;
+    gV1720Runtime.external_clock = FALSE;
+    gV1720Runtime.pll_locked = FALSE;
+    gV1720Runtime.board_ready = FALSE;
+    gV1720Runtime.event_stored = 0;
+    gV1720Runtime.dirty = true;
+}
+
+static bool stop_v1720e_and_publish_state(const char *context)
+{
+    if (!gV1720Started)
+        return true;
+
+    const int stop_status = v1720e_stop(gVme, V1720E_BASE);
+    if (stop_status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E Acquisition Stop failed during %s: status %d",
+               context, stop_status);
+        invalidate_v1720e_current_state();
+        publish_v1720e_variables();
+        return false;
+    }
+    gV1720Started = false;
+
+    if (!gV1720RunSettings.enabled || !gV1720Runtime.communication_ok) {
+        invalidate_v1720e_current_state();
+        publish_v1720e_variables();
+        return true;
+    }
+
+    V1720E_BOARD_INFO state = {};
+    const int read_status = v1720e_probe(gVme, V1720E_BASE, &state);
+    if (read_status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E post-stop status read failed during %s: status %d; "
+               "current-state Variables invalidated",
+               context, read_status);
+        invalidate_v1720e_current_state();
+        publish_v1720e_variables();
+        return true;
+    }
+
+    update_v1720e_board_state(state);
+    publish_v1720e_variables();
+    printf("  V1720E post-stop state (%s): AcqControl=0x%08X "
+           "AcqStatus=0x%08X EventStored=%u\n",
+           context, state.acquisition_control, state.acquisition_status,
+           state.event_stored);
+    return true;
+}
 
 /* Low-level VME access helpers. */
 static bool vme_read16(DWORD address, WORD &value, const char *description)
@@ -678,16 +1031,22 @@ static bool wait_for_v775_data_ready()
 static bool wait_for_v1720e_data_ready()
 {
     DWORD event_stored = 0;
+    DWORD acquisition_status = 0;
     for (unsigned poll = 0; poll < V1720E_READY_MAX_POLLS; ++poll) {
         int ready = 0;
         const int status = v1720e_data_ready(gVme, V1720E_BASE, &ready,
-                                            &event_stored);
+                                            &event_stored,
+                                            &acquisition_status);
         if (status != MVME_SUCCESS) {
+            gV1720Runtime.communication_ok = FALSE;
+            gV1720Runtime.dirty = true;
             ++gRunStatistics.v1720_read_timeout_count;
             cm_msg(MERROR, frontend_name,
                    "V1720E ready read failed: status %d", status);
             return false;
         }
+        update_v1720e_acquisition_status(acquisition_status);
+        gV1720Runtime.event_stored = event_stored;
         if (ready)
             return true;
         if (poll + 1 < V1720E_READY_MAX_POLLS)
@@ -951,8 +1310,186 @@ static bool setup_v775_sw_trigger_test()
 }
 #endif
 
+static bool make_v1720e_run_configuration(const V1720ESettings &settings,
+                                          V1720E_CONFIG &config,
+                                          DWORD &expected_event_words,
+                                          DWORD &expected_channel_mask)
+{
+    if (settings.buffer_organization > 0x0Au) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E BufferOrganization %u is outside supported range 0..10",
+               settings.buffer_organization);
+        return false;
+    }
+    if (settings.post_trigger > 0xFFu) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E PostTrigger %u is outside the 8-bit register range",
+               settings.post_trigger);
+        return false;
+    }
+    /*
+     * The installed waveform-recording firmware 4.5 was verified with
+     * Custom Size 0x40 producing 256 samples/channel.  The older CAEN
+     * register description warns that its generic NLOC conversion may not
+     * apply above ROC firmware 3.8, so the first ODB version deliberately
+     * accepts only this verified pair.
+     */
+    if (settings.record_length_samples != V1720E_DEFAULT_RECORD_SAMPLES) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E RecordLengthSamples %u is unsupported; first ODB version accepts only %u",
+               settings.record_length_samples,
+               V1720E_DEFAULT_RECORD_SAMPLES);
+        return false;
+    }
+
+    config = {};
+    config.buffer_organization = settings.buffer_organization;
+    config.custom_size = V1720E_DEFAULT_CUSTOM_SIZE;
+    config.post_trigger = settings.post_trigger;
+    if (settings.software_trigger_enabled)
+        config.trigger_source |= V1720E_TRIGGER_SOFTWARE;
+    if (settings.external_trigger_enabled)
+        config.trigger_source |= V1720E_TRIGGER_EXTERNAL;
+
+    unsigned enabled_channels = 0;
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        if (settings.channel_self_trigger_enabled[channel])
+            config.trigger_source |= (1u << channel);
+        if (settings.channel_enabled[channel]) {
+            config.channel_enable |= (1u << channel);
+            ++enabled_channels;
+        }
+        config.dc_offset[channel] = settings.dc_offset[channel];
+    }
+    if (enabled_channels == 0) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E configuration has no enabled channels");
+        return false;
+    }
+
+    expected_channel_mask = config.channel_enable & 0xFFu;
+    expected_event_words = 4u + enabled_channels *
+        (settings.record_length_samples / 2u);
+    if (expected_event_words > V1720E_MAX_EVENT_WORDS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E expected event size %u exceeds safety limit %u",
+               expected_event_words, V1720E_MAX_EVENT_WORDS);
+        return false;
+    }
+    return true;
+}
+
+static bool snapshot_v1720e_settings_for_run()
+{
+    V1720ESettings settings = {};
+    V1720E_CONFIG config = {};
+    DWORD expected_event_words = 0;
+    DWORD expected_channel_mask = 0;
+    if (!read_v1720e_settings(settings))
+        return false;
+    if (settings.enabled &&
+        !make_v1720e_run_configuration(settings, config,
+                                       expected_event_words,
+                                       expected_channel_mask))
+        return false;
+    gV1720RunSettings = settings;
+    gV1720VariablesEnabled = settings.enabled != FALSE;
+    gV1720RunConfig = config;
+    gV1720ExpectedEventWords = expected_event_words;
+    gV1720ExpectedChannelMask = expected_channel_mask;
+    return true;
+}
+
+static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
+                                    bool valid)
+{
+    const DWORD record_length =
+        readback.custom_size == V1720E_DEFAULT_CUSTOM_SIZE
+            ? V1720E_DEFAULT_RECORD_SAMPLES : 0u;
+    const BOOL software_trigger =
+        (readback.trigger_source & V1720E_TRIGGER_SOFTWARE) != 0;
+    const BOOL external_trigger =
+        (readback.trigger_source & V1720E_TRIGGER_EXTERNAL) != 0;
+    const BOOL zero_suppression =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK) != 0;
+    const BOOL pack25 =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_PACK25) != 0;
+    BOOL self_trigger[V1720E_CHANNEL_COUNT] = {};
+    BOOL channel_enabled[V1720E_CHANNEL_COUNT] = {};
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        self_trigger[channel] =
+            (readback.trigger_source & (1u << channel)) != 0;
+        channel_enabled[channel] =
+            (readback.channel_enable & (1u << channel)) != 0;
+    }
+
+#define SET_READBACK(name, value, count, type) \
+    set_v1720e_output(V1720E_READBACK_PATH, name, &(value), sizeof(value), \
+                      count, type)
+    SET_READBACK("BoardInfo", readback.board_info, 1, TID_DWORD);
+    SET_READBACK("RocFirmwareRevision", readback.roc_firmware, 1, TID_DWORD);
+    SET_READBACK("BufferOrganization", readback.buffer_organization, 1, TID_DWORD);
+    SET_READBACK("CustomSizeRaw", readback.custom_size, 1, TID_DWORD);
+    SET_READBACK("RecordLengthSamples", record_length, 1, TID_DWORD);
+    SET_READBACK("PostTrigger", readback.post_trigger, 1, TID_DWORD);
+    SET_READBACK("SoftwareTriggerEnabled", software_trigger, 1, TID_BOOL);
+    SET_READBACK("ExternalTriggerEnabled", external_trigger, 1, TID_BOOL);
+    SET_READBACK("ChannelSelfTriggerEnabled", self_trigger,
+                 V1720E_CHANNEL_COUNT, TID_BOOL);
+    SET_READBACK("ChannelEnabled", channel_enabled,
+                 V1720E_CHANNEL_COUNT, TID_BOOL);
+    SET_READBACK("DCOffset", readback.dc_offset,
+                 V1720E_CHANNEL_COUNT, TID_WORD);
+    SET_READBACK("ZeroSuppressionEnabled", zero_suppression, 1, TID_BOOL);
+    SET_READBACK("Pack25Enabled", pack25, 1, TID_BOOL);
+    SET_READBACK("TriggerSourceRaw", readback.trigger_source, 1, TID_DWORD);
+    SET_READBACK("ChannelEnableRaw", readback.channel_enable, 1, TID_DWORD);
+    SET_READBACK("ChannelConfigRaw", readback.channel_config, 1, TID_DWORD);
+#undef SET_READBACK
+    set_v1720e_readback_valid(valid);
+}
+
+static bool verify_v1720e_readback(const V1720E_CONFIG &expected,
+                                   const V1720E_CONFIG_READBACK &actual)
+{
+    bool ok = true;
+#define VERIFY_V1720(name, expected_value, actual_value) \
+    do { \
+        if ((expected_value) != (actual_value)) { \
+            cm_msg(MERROR, frontend_name, \
+                   "V1720E readback mismatch: %s expected 0x%X, got 0x%X", \
+                   name, static_cast<unsigned>(expected_value), \
+                   static_cast<unsigned>(actual_value)); \
+            ok = false; \
+        } \
+    } while (0)
+    VERIFY_V1720("BufferOrganization", expected.buffer_organization,
+                 actual.buffer_organization);
+    VERIFY_V1720("CustomSizeRaw", expected.custom_size, actual.custom_size);
+    VERIFY_V1720("PostTrigger", expected.post_trigger, actual.post_trigger);
+    VERIFY_V1720("TriggerSourceRaw", expected.trigger_source,
+                 actual.trigger_source);
+    VERIFY_V1720("ChannelEnableRaw", expected.channel_enable,
+                 actual.channel_enable);
+    VERIFY_V1720("ZeroSuppression", 0u,
+                 actual.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK);
+    VERIFY_V1720("Pack25", 0u,
+                 actual.channel_config & V1720E_CHANNEL_CONFIG_PACK25);
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        if (expected.dc_offset[channel] != actual.dc_offset[channel]) {
+            cm_msg(MERROR, frontend_name,
+                   "V1720E readback mismatch: DCOffset[%u] expected 0x%04X, got 0x%04X",
+                   channel, expected.dc_offset[channel],
+                   actual.dc_offset[channel]);
+            ok = false;
+        }
+    }
+#undef VERIFY_V1720
+    return ok;
+}
+
 /* Frontend initialization checks. Keep the established read-only access order. */
-static bool check_module_communication()
+static bool check_module_communication(bool check_v1720e)
 {
     printf("Checking V792 at 0x%08X...\n", V792_BASE);
     if (!v792_isPresent(gVme, V792_BASE)) {
@@ -989,6 +1526,13 @@ static bool check_module_communication()
     printf("V775 disabled by ENABLE_V775=0; communication check skipped.\n");
 #endif
 
+    if (!check_v1720e) {
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
+        printf("V1720E disabled in ODB; communication check skipped.\n");
+        return true;
+    }
+
     V1720E_BOARD_INFO v1720 = {};
     printf("Checking V1720E at 0x%08X...\n", V1720E_BASE);
     const int v1720_status = v1720e_probe(gVme, V1720E_BASE, &v1720);
@@ -1000,6 +1544,8 @@ static bool check_module_communication()
                "V1720E identification failed at 0x%08X: status %d "
                "BoardInfo 0x%08X",
                V1720E_BASE, v1720_status, v1720.board_info);
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
         return false;
     }
     printf("V1720E detected: BoardInfo=0x%08X ROC-FW=0x%08X "
@@ -1007,6 +1553,8 @@ static bool check_module_communication()
            v1720.board_info, v1720.roc_firmware,
            v1720.acquisition_control, v1720.acquisition_status,
            v1720.event_stored);
+    set_v1720e_communication_ok(true);
+    publish_v1720e_board_state(v1720);
     return true;
 }
 
@@ -1137,24 +1685,55 @@ static bool configure_v775_for_run()
 
 static bool configure_v1720e_for_run()
 {
+    if (!gV1720RunSettings.enabled) {
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
+        printf("  V1720E: DISABLED by BOR Settings snapshot; configuration skipped.\n");
+        return true;
+    }
     V1720E_BOARD_INFO before = {};
     const int probe_status = v1720e_probe(gVme, V1720E_BASE, &before);
     if (probe_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
                "V1720E pre-configuration read failed: status %d",
                probe_status);
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
         return false;
     }
     printf("  V1720E Event Stored before BOR configuration: %u\n",
            before.event_stored);
-    const int status = v1720e_configure(gVme, V1720E_BASE);
+    const int status = v1720e_configure(gVme, V1720E_BASE,
+                                        &gV1720RunConfig);
     if (status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
                "V1720E configuration/readback failed: status %d", status);
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
         return false;
     }
-    printf("  V1720E: BufferOrg=0x0A CustomSize=0x40 PostTrigger=0x30 "
-           "TriggerSource=0xC0000000 ChannelMask=0xFF DCOffset=0x8000\n");
+    V1720E_CONFIG_READBACK readback = {};
+    const int readback_status =
+        v1720e_read_configuration(gVme, V1720E_BASE, &readback);
+    if (readback_status != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E configuration readback failed: status %d",
+               readback_status);
+        set_v1720e_communication_ok(false);
+        set_v1720e_readback_valid(false);
+        return false;
+    }
+    const bool verified = verify_v1720e_readback(gV1720RunConfig, readback);
+    publish_v1720e_readback(readback, verified);
+    if (!verified) {
+        set_v1720e_communication_ok(false);
+        return false;
+    }
+    printf("  V1720E: BufferOrg=0x%X CustomSize=0x%X PostTrigger=0x%X "
+           "TriggerSource=0x%08X ChannelMask=0x%02X\n",
+           gV1720RunConfig.buffer_organization,
+           gV1720RunConfig.custom_size, gV1720RunConfig.post_trigger,
+           gV1720RunConfig.trigger_source, gV1720RunConfig.channel_enable);
     return true;
 }
 
@@ -1291,14 +1870,15 @@ static bool verify_run_start_state()
 #else
            "  V775  : DISABLED\n"
 #endif
-           "  V1720E: READY\n  Buffers empty\n"
-           "  Event counters reset\n  Run may start\n");
+           "  V1720E: %s\n  Buffers empty\n"
+           "  Event counters reset\n  Run may start\n",
+           gV1720RunSettings.enabled ? "READY" : "DISABLED");
     return true;
 }
 
 static bool prepare_modules_for_run()
 {
-    if (!check_module_communication() ||
+    if (!check_module_communication(gV1720RunSettings.enabled != FALSE) ||
         !log_current_configuration("before configuration")) return false;
     if (!configure_v792_for_run() || !configure_v1190_for_run()
 #if ENABLE_V775
@@ -1314,6 +1894,10 @@ static bool prepare_modules_for_run()
         !clear_module_buffers() || !reset_module_event_counters() ||
         !verify_run_start_state())
         return false;
+    if (!gV1720RunSettings.enabled) {
+        gV1720Started = false;
+        return true;
+    }
     const int start_status = v1720e_start(gVme, V1720E_BASE);
     if (start_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
@@ -1323,8 +1907,10 @@ static bool prepare_modules_for_run()
     gV1720Started = true;
     DWORD v1720_events = 0;
     int v1720_ready = 0;
+    DWORD v1720_acquisition_status = 0;
     const int ready_status = v1720e_data_ready(gVme, V1720E_BASE,
-                                               &v1720_ready, &v1720_events);
+                                               &v1720_ready, &v1720_events,
+                                               &v1720_acquisition_status);
     if (ready_status != MVME_SUCCESS || v1720_events > 1) {
         cm_msg(MERROR, frontend_name,
                "V1720E post-start buffer verification failed: status %d "
@@ -1336,6 +1922,11 @@ static bool prepare_modules_for_run()
     }
     printf("  V1720E Acquisition STARTED; Event Stored after RUN memory reset=%u\n",
            v1720_events);
+    V1720E_BOARD_INFO state = {};
+    state.acquisition_status = v1720_acquisition_status;
+    state.event_stored = v1720_events;
+    if (v1720e_probe(gVme, V1720E_BASE, &state) == MVME_SUCCESS)
+        publish_v1720e_board_state(state);
     return true;
 }
 
@@ -1412,6 +2003,12 @@ INT frontend_init()
     printf("Software-trigger diagnostics: disabled\n");
 #endif
 
+    if (!initialize_v1720e_odb()) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot initialize V1720E ODB schema/settings");
+        return FE_ERR_ODB;
+    }
+
     printf("Opening VME interface...\n");
 
     INT status = mvme_open(&gVme, 0);
@@ -1426,7 +2023,7 @@ INT frontend_init()
 
     printf("VME interface opened.\n");
     publish_rpv130_status(true);
-    if (!check_module_communication()) {
+    if (!check_module_communication(gV1720StartupEnabled)) {
         mvme_close(gVme);
         gVme = NULL;
         return FE_ERR_HW;
@@ -1439,13 +2036,7 @@ INT frontend_init()
 INT frontend_exit()
 {
     if (gVme) {
-        if (gV1720Started) {
-            const int status = v1720e_stop(gVme, V1720E_BASE);
-            if (status != MVME_SUCCESS)
-                cm_msg(MERROR, frontend_name,
-                       "V1720E stop failed during frontend exit: %d", status);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("frontend exit");
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
         if (!restore_v1190_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V1190 diagnostic restoration failed during frontend exit");
@@ -1468,6 +2059,14 @@ INT begin_of_run(INT run_number, char *error)
 {
     printf("Begin run %d\n", run_number);
     reset_run_statistics();
+
+    if (!snapshot_v1720e_settings_for_run()) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot snapshot/validate V1720E Settings at BOR");
+        snprintf(error, 256, "Invalid V1720E ODB Settings");
+        return FE_ERR_ODB;
+    }
+    set_v1720e_readback_valid(false);
 
     if (!prepare_modules_for_run()) {
         cm_msg(MERROR, frontend_name,
@@ -1511,15 +2110,9 @@ INT end_of_run(INT run_number, char *error)
 {
     bool restore_failed = false;
     printf("End run %d\n", run_number);
-    if (gV1720Started) {
-        const int status = v1720e_stop(gVme, V1720E_BASE);
-        if (status != MVME_SUCCESS) {
-            cm_msg(MERROR, frontend_name,
-                   "V1720E Acquisition Stop failed at EOR: status %d", status);
-            snprintf(error, 256, "V1720E Acquisition Stop failed");
-            return FE_ERR_HW;
-        }
-        gV1720Started = false;
+    if (!stop_v1720e_and_publish_state("EOR")) {
+        snprintf(error, 256, "V1720E Acquisition Stop failed");
+        return FE_ERR_HW;
     }
     log_run_statistics();
 
@@ -1557,6 +2150,14 @@ INT resume_run(INT run_number, char *error)
 INT frontend_loop()
 {
     publish_rpv130_status(false);
+    const DWORD now = ss_millitime();
+    const DWORD elapsed =
+        static_cast<DWORD>(now - gV1720LastVariablesPublish);
+    if (gV1720VariablesEnabled &&
+        ((gV1720Runtime.dirty &&
+          elapsed >= V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS) ||
+         elapsed >= V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS))
+        publish_v1720e_variables();
     return SUCCESS;
 }
 
@@ -1564,7 +2165,8 @@ INT frontend_loop()
 /* Poll without consuming FIFO words; test mode performs timing iterations only. */
 INT poll_event(INT source, INT count, BOOL test)
 {
-    if (!gVme || gReadoutFailed || !gV1720Started)
+    if (!gVme || gReadoutFailed ||
+        (gV1720RunSettings.enabled && !gV1720Started))
         return 0;
     for (INT i = 0; i < count; ++i) {
         if (v792_DataReady(gVme, V792_BASE) && !test)
@@ -1586,20 +2188,19 @@ static bool check_event_counter_match(const V792EventInfo &v792,
 #if ENABLE_V775
                                       const V775EventInfo &v775,
 #endif
-                                      const V1720E_EVENT_INFO &v1720)
+                                      const V1720E_EVENT_INFO *v1720)
 {
     const DWORD v792_counter22 = v792.event_counter & V1190_EVENT_COUNTER_MASK;
     const DWORD v1190_counter22 = v1190.event_counter & V1190_EVENT_COUNTER_MASK;
 #if ENABLE_V775
     const DWORD v775_counter22 = v775.event_counter & V1190_EVENT_COUNTER_MASK;
 #endif
-    const DWORD v1720_counter22 =
-        v1720.event_counter & V1190_EVENT_COUNTER_MASK;
     return v792_counter22 == v1190_counter22 &&
 #if ENABLE_V775
            v792_counter22 == v775_counter22 &&
 #endif
-           v792_counter22 == v1720_counter22;
+           (!v1720 || v792_counter22 ==
+               (v1720->event_counter & V1190_EVENT_COUNTER_MASK));
 }
 
 static void log_event_counter_mismatch(const V792EventInfo &v792,
@@ -1607,7 +2208,7 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
 #if ENABLE_V775
                                        const V775EventInfo &v775,
 #endif
-                                       const V1720E_EVENT_INFO &v1720,
+                                       const V1720E_EVENT_INFO *v1720,
                                        DWORD midas_serial)
 {
     if (gRunStatistics.counter_mismatch_count == 0)
@@ -1617,19 +2218,35 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
 
     const uint64_t count = gRunStatistics.counter_mismatch_count;
     if (count <= 10) {
-        cm_msg(MINFO, frontend_name,
-               "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
-               "V792=0x%06X V1190=0x%06X "
+        if (v1720) {
+            cm_msg(MINFO, frontend_name,
+                   "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
+                   "V792=0x%06X V1190=0x%06X "
 #if ENABLE_V775
-               "V775=0x%06X "
+                   "V775=0x%06X "
 #endif
-               "V1720=0x%06X",
-               midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
-               v1190.event_counter & V1190_EVENT_COUNTER_MASK,
+                   "V1720=0x%06X",
+                   midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
+                   v1190.event_counter & V1190_EVENT_COUNTER_MASK,
 #if ENABLE_V775
-               v775.event_counter & V7XX_EVENT_COUNTER_MASK,
+                   v775.event_counter & V7XX_EVENT_COUNTER_MASK,
 #endif
-               v1720.event_counter & V7XX_EVENT_COUNTER_MASK);
+                   v1720->event_counter & V7XX_EVENT_COUNTER_MASK);
+        } else {
+            cm_msg(MINFO, frontend_name,
+                   "WARNING: Event counter mismatch (accepted): MIDAS serial=%u "
+                   "V792=0x%06X V1190=0x%06X"
+#if ENABLE_V775
+                   " V775=0x%06X"
+#endif
+                   " (V1720 disabled)",
+                   midas_serial, v792.event_counter & V7XX_EVENT_COUNTER_MASK,
+                   v1190.event_counter & V1190_EVENT_COUNTER_MASK
+#if ENABLE_V775
+                   , v775.event_counter & V7XX_EVENT_COUNTER_MASK
+#endif
+                   );
+        }
     } else if (count % 1000 == 0) {
         cm_msg(MINFO, frontend_name,
                "WARNING: Event counter mismatch summary: %llu mismatches through MIDAS serial %u",
@@ -1644,13 +2261,13 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
         ++gRunStatistics.v1720_size_error_count;
         cm_msg(MERROR, frontend_name,
                "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
-               midas_serial, event.event_size, V1720E_EXPECTED_EVENT_WORDS);
+               midas_serial, event.event_size, gV1720ExpectedEventWords);
     }
     if (!event.channel_mask_valid) {
         ++gRunStatistics.v1720_mask_error_count;
         cm_msg(MERROR, frontend_name,
-               "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0xFF",
-               midas_serial, event.channel_mask);
+               "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0x%02X",
+               midas_serial, event.channel_mask, gV1720ExpectedChannelMask);
     }
     if (!gRunStatistics.v1720_have_previous) {
         gRunStatistics.v1720_first_counter = event.event_counter;
@@ -1690,7 +2307,7 @@ static INT build_midas_event(char *pevent,
                              const DWORD *v775_data, const V775EventInfo &v775,
 #endif
                              const DWORD *v1720_data,
-                             const V1720E_EVENT_INFO &v1720)
+                             const V1720E_EVENT_INFO *v1720)
 {
     bk_init32(pevent);
     void *bank = NULL;
@@ -1710,10 +2327,12 @@ static INT build_midas_event(char *pevent,
     bk_close(pevent, static_cast<DWORD *>(bank) + v775.words);
 #endif
 
-    bank = NULL;
-    bk_create(pevent, "FADC", TID_DWORD, &bank);
-    memcpy(bank, v1720_data, v1720.words * sizeof(DWORD));
-    bk_close(pevent, static_cast<DWORD *>(bank) + v1720.words);
+    if (v1720) {
+        bank = NULL;
+        bk_create(pevent, "FADC", TID_DWORD, &bank);
+        memcpy(bank, v1720_data, v1720->words * sizeof(DWORD));
+        bk_close(pevent, static_cast<DWORD *>(bank) + v1720->words);
+    }
     return bk_size(pevent);
 }
 
@@ -1729,7 +2348,7 @@ INT read_vme_event(char *pevent, INT off)
 #if ENABLE_V775
         || !wait_for_v775_data_ready()
 #endif
-        || !wait_for_v1720e_data_ready()) {
+        || (gV1720RunSettings.enabled && !wait_for_v1720e_data_ready())) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "Synchronized readout disabled after module-ready timeout; "
@@ -1770,36 +2389,48 @@ INT read_vme_event(char *pevent, INT off)
 #endif
 
     V1720E_EVENT_INFO v1720 = {};
-    const int v1720_status =
-        v1720e_read_event(gVme, V1720E_BASE, v1720_data,
-                          V1720E_MAX_EVENT_WORDS, &v1720);
-    if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
-        v1720.words < 4) {
-        ++gRunStatistics.v1720_malformed_count;
-        gReadoutFailed = true;
-        cm_msg(MERROR, frontend_name,
-               "V1720E readout disabled after malformed/partial event: "
-               "status %d words=%zu header-valid=%d. V792/V1190"
+    V1720E_EVENT_INFO *v1720_event = NULL;
+    if (gV1720RunSettings.enabled) {
+        const int v1720_status =
+            v1720e_read_event(gVme, V1720E_BASE, v1720_data,
+                              V1720E_MAX_EVENT_WORDS,
+                              gV1720ExpectedEventWords,
+                              gV1720ExpectedChannelMask, &v1720);
+        if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
+            v1720.words < 4) {
+            if (v1720_status != MVME_SUCCESS)
+                gV1720Runtime.communication_ok = FALSE;
+            gV1720Runtime.dirty = true;
+            ++gRunStatistics.v1720_malformed_count;
+            gReadoutFailed = true;
+            cm_msg(MERROR, frontend_name,
+                   "V1720E readout disabled after malformed/partial event: "
+                   "status %d words=%zu header-valid=%d. V792/V1190"
 #if ENABLE_V775
-               "/V775"
+                   "/V775"
 #endif
-               " events "
-               "were consumed but no partial MIDAS event was sent.",
-               v1720_status, v1720.words, v1720.header_valid);
-        return 0;
+                   " events "
+                   "were consumed but no partial MIDAS event was sent.",
+                   v1720_status, v1720.words, v1720.header_valid);
+            return 0;
+        }
+        v1720_event = &v1720;
+        update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
+        gV1720Runtime.event_counter = v1720.event_counter;
+        gV1720Runtime.trigger_time_tag = v1720.trigger_time_tag;
+        gV1720Runtime.dirty = true;
     }
 
-    update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
     if (!check_event_counter_match(v792, v1190,
 #if ENABLE_V775
                                    v775,
 #endif
-                                   v1720))
+                                   v1720_event))
         log_event_counter_mismatch(v792, v1190,
 #if ENABLE_V775
                                    v775,
 #endif
-                                   v1720,
+                                   v1720_event,
                                    SERIAL_NUMBER(pevent));
 
     return build_midas_event(pevent,
@@ -1808,7 +2439,7 @@ INT read_vme_event(char *pevent, INT off)
 #if ENABLE_V775
                              v775_data, v775,
 #endif
-                             v1720_data, v1720);
+                             v1720_data, v1720_event);
 }
 
 
