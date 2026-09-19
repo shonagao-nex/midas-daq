@@ -10,8 +10,10 @@
 #include "tcp_probe.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -24,32 +26,48 @@
 
 namespace {
 
-constexpr char kSettingsPath[] = "/Equipment/NIM-EASIROC/Settings";
-constexpr char kVariablesPath[] = "/Equipment/NIM-EASIROC/Variables";
-constexpr std::uint16_t kTcpPort = 24;
-constexpr int kConnectTimeoutMs = 1000;
+constexpr char kSettingsPath[] = "/Equipment/EASIROC/Settings";
+constexpr char kInfoPath[] = "/Equipment/EASIROC/Info";
+constexpr char kReadbackPath[] = "/Equipment/EASIROC/Readback";
+constexpr char kVariablesPath[] = "/Equipment/EASIROC/Variables";
 constexpr int kReceiveTimeoutMs = 100;
 constexpr int kDrainQuietMs = 100;
 constexpr int kDrainMaximumMs = 1000;
 constexpr std::size_t kReceiveChunkBytes = 4096;
 constexpr bool kWriteLowGainBank = false;
-
-constexpr char kSettingsRecord[] =
-    "[.]\n"
-    "IPAddress = STRING : [64] 192.168.10.26\n"
-    "ADCEnabled = BOOL : y\n"
-    "TDCEnabled = BOOL : y\n"
-    "ScalerEnabled = BOOL : n\n";
-
-constexpr char kVariablesRecord[] =
-    "[.]\n"
-    "FirmwareVersion = STRING : [64] Not read\n"
-    "Connected = BOOL : n\n"
-    "LastError = STRING : [256] \n";
+constexpr char kDefaultIpAddress[] = "192.168.10.26";
+constexpr char kHardwareModel[] = "NIM-EASIROC";
+constexpr DWORD kAsicCount = 2;
+constexpr DWORD kChannelsPerAsic = 32;
+static_assert(kAsicCount * kChannelsPerAsic == easiroc::kAdcChannelCount,
+              "EASIROC hardware channel information is inconsistent");
 
 struct FrontendSettings {
-  std::string ip_address = "192.168.10.26";
+  std::string ip_address = kDefaultIpAddress;
   easiroc::DaqEnables enables;
+};
+
+struct RuntimeStatistics {
+  std::uint64_t received_bytes = 0;
+  std::uint64_t receive_chunks = 0;
+  std::uint64_t tcp_error_count = 0;
+  std::uint64_t receive_timeout_count = 0;
+  std::uint64_t decode_error_count = 0;
+  std::uint64_t event_content_error_count = 0;
+  std::uint64_t adc_overflow_count = 0;
+  std::uint64_t last_drain_bytes = 0;
+  std::uint64_t total_drain_bytes = 0;
+};
+
+struct RuntimeState {
+  bool rbcp_communication_ok = false;
+  bool tcp_reachable = false;
+  bool tcp_connected = false;
+  bool acquisition_running = false;
+  bool acquisition_fault = false;
+  std::string last_error;
+  std::uint64_t event_counter = 0;
+  RuntimeStatistics statistics;
 };
 
 // This state is passive: construction and destruction perform no hardware
@@ -63,8 +81,7 @@ struct FrontendState {
   std::unique_ptr<easiroc::EventStreamParser> parser;
   std::deque<easiroc::DecodedEvent> pending_events;
   bool daq_start_attempted = false;
-  bool acquisition_active = false;
-  bool acquisition_fault = false;
+  RuntimeState runtime;
 
   // Connection points for the existing Slow Control policy. They are not
   // encoded or applied by this frontend.
@@ -75,8 +92,9 @@ struct FrontendState {
 FrontendState g_state;
 
 struct DiagnosticResult {
-  bool connected = false;
-  std::optional<std::string> firmware_version;
+  bool rbcp_communication_ok = false;
+  bool tcp_reachable = false;
+  std::optional<easiroc::FirmwareVersion> firmware;
   std::string error;
 };
 
@@ -89,21 +107,143 @@ struct DiagnosticWorker {
 
 DiagnosticWorker g_diagnostic;
 
-INT create_odb_records() {
-  INT status = db_create_record(hDB, 0, kSettingsPath, kSettingsRecord);
-  if (status != DB_SUCCESS) {
-    cm_msg(MERROR, "frontend_init", "Cannot create/check %s (status %d)",
-           kSettingsPath, status);
-    return FE_ERR_ODB;
-  }
+std::string odb_path(const char* base, const char* name) {
+  return std::string(base) + "/" + name;
+}
 
-  status = db_create_record(hDB, 0, kVariablesPath, kVariablesRecord);
-  if (status != DB_SUCCESS) {
-    cm_msg(MERROR, "frontend_init", "Cannot create/check %s (status %d)",
-           kVariablesPath, status);
-    return FE_ERR_ODB;
+bool set_odb_value(const std::string& path, const void* value, INT size,
+                   INT count, DWORD type) {
+  const INT status =
+      db_set_value(hDB, 0, path.c_str(), value, size, count, type);
+  if (status != DB_SUCCESS)
+    cm_msg(MERROR, "update_odb", "Cannot write %s (status %d)", path.c_str(),
+           status);
+  return status == DB_SUCCESS;
+}
+
+bool ensure_odb_value(const std::string& path, const void* default_value,
+                      INT size, INT count, DWORD type) {
+  HNDLE key = 0;
+  const INT status = db_find_key(hDB, 0, path.c_str(), &key);
+  if (status == DB_SUCCESS) return true;
+  if (status != DB_NO_KEY) {
+    cm_msg(MERROR, "initialize_odb", "Cannot inspect %s (status %d)",
+           path.c_str(), status);
+    return false;
   }
-  return SUCCESS;
+  return set_odb_value(path, default_value, size, count, type);
+}
+
+bool set_odb_string(const std::string& path, const std::string& value,
+                    std::size_t capacity) {
+  std::string bounded = value.substr(0, capacity - 1);
+  std::vector<char> buffer(capacity, '\0');
+  std::copy(bounded.begin(), bounded.end(), buffer.begin());
+  return set_odb_value(path, buffer.data(), buffer.size(), 1, TID_STRING);
+}
+
+bool publish_runtime_variables() {
+  const BOOL rbcp_ok = g_state.runtime.rbcp_communication_ok ? TRUE : FALSE;
+  const BOOL tcp_reachable = g_state.runtime.tcp_reachable ? TRUE : FALSE;
+  const BOOL tcp_connected = g_state.runtime.tcp_connected ? TRUE : FALSE;
+  const BOOL running = g_state.runtime.acquisition_running ? TRUE : FALSE;
+  const BOOL fault = g_state.runtime.acquisition_fault ? TRUE : FALSE;
+  const std::uint64_t pending = g_state.pending_events.size();
+  const std::uint64_t buffered =
+      g_state.parser ? g_state.parser->bufferedBytes() : 0;
+  bool ok = true;
+#define PUBLISH_BOOL(name, value) \
+  ok = set_odb_value(odb_path(kVariablesPath, name), &(value), \
+                     sizeof(value), 1, TID_BOOL) && ok
+#define PUBLISH_QWORD(base, name, value) \
+  ok = set_odb_value(odb_path(base, name), &(value), sizeof(value), 1, \
+                     TID_QWORD) && ok
+  PUBLISH_BOOL("RBCPCommunicationOK", rbcp_ok);
+  PUBLISH_BOOL("TCPReachable", tcp_reachable);
+  PUBLISH_BOOL("TCPConnected", tcp_connected);
+  PUBLISH_BOOL("AcquisitionRunning", running);
+  PUBLISH_BOOL("AcquisitionFault", fault);
+  ok = set_odb_string(odb_path(kVariablesPath, "LastError"),
+                      g_state.runtime.last_error, 256) && ok;
+  PUBLISH_QWORD(kVariablesPath, "EventCounter", g_state.runtime.event_counter);
+  const std::string readout = odb_path(kVariablesPath, "Readout");
+  PUBLISH_QWORD(readout.c_str(), "PendingEventCount", pending);
+  PUBLISH_QWORD(readout.c_str(), "ParserBufferedBytes", buffered);
+  const std::string statistics = odb_path(kVariablesPath, "Statistics");
+  PUBLISH_QWORD(statistics.c_str(), "ReceivedBytes",
+                g_state.runtime.statistics.received_bytes);
+  PUBLISH_QWORD(statistics.c_str(), "ReceiveChunks",
+                g_state.runtime.statistics.receive_chunks);
+  PUBLISH_QWORD(statistics.c_str(), "TCPErrorCount",
+                g_state.runtime.statistics.tcp_error_count);
+  PUBLISH_QWORD(statistics.c_str(), "ReceiveTimeoutCount",
+                g_state.runtime.statistics.receive_timeout_count);
+  PUBLISH_QWORD(statistics.c_str(), "DecodeErrorCount",
+                g_state.runtime.statistics.decode_error_count);
+  PUBLISH_QWORD(statistics.c_str(), "EventContentErrorCount",
+                g_state.runtime.statistics.event_content_error_count);
+  PUBLISH_QWORD(statistics.c_str(), "ADCOverflowCount",
+                g_state.runtime.statistics.adc_overflow_count);
+  PUBLISH_QWORD(statistics.c_str(), "LastDrainBytes",
+                g_state.runtime.statistics.last_drain_bytes);
+  PUBLISH_QWORD(statistics.c_str(), "TotalDrainBytes",
+                g_state.runtime.statistics.total_drain_bytes);
+#undef PUBLISH_QWORD
+#undef PUBLISH_BOOL
+  return ok;
+}
+
+bool initialize_odb() {
+  char default_ip[64] = {};
+  std::snprintf(default_ip, sizeof(default_ip), "%s", kDefaultIpAddress);
+  const BOOL yes = TRUE;
+  const BOOL no = FALSE;
+  if (!ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
+                        default_ip, sizeof(default_ip), 1, TID_STRING) ||
+      !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ADCEnabled"),
+                        &yes, sizeof(yes), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/TDCEnabled"),
+                        &yes, sizeof(yes), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ScalerEnabled"),
+                        &no, sizeof(no), 1, TID_BOOL))
+    return false;
+
+  const DWORD channel_count = easiroc::kAdcChannelCount;
+  const DWORD tcp_port = easiroc::kTcpDataPort;
+  const DWORD rbcp_port = kRbcpPort;
+  if (!set_odb_string(odb_path(kInfoPath, "Hardware/Model"), kHardwareModel,
+                      32) ||
+      !set_odb_value(odb_path(kInfoPath, "Hardware/ASICCount"), &kAsicCount,
+                     sizeof(kAsicCount), 1, TID_DWORD) ||
+      !set_odb_value(odb_path(kInfoPath, "Hardware/ChannelsPerASIC"),
+                     &kChannelsPerAsic, sizeof(kChannelsPerAsic), 1,
+                     TID_DWORD) ||
+      !set_odb_value(odb_path(kInfoPath, "Hardware/ChannelCount"),
+                     &channel_count, sizeof(channel_count), 1, TID_DWORD) ||
+      !set_odb_value(odb_path(kInfoPath, "Network/TCPDataPort"), &tcp_port,
+                     sizeof(tcp_port), 1, TID_DWORD) ||
+      !set_odb_value(odb_path(kInfoPath, "Network/RBCPPort"), &rbcp_port,
+                     sizeof(rbcp_port), 1, TID_DWORD) ||
+      !set_odb_value(
+          odb_path(kInfoPath, "Capabilities/ConfigurationReadbackSupported"),
+          &no, sizeof(no), 1, TID_BOOL) ||
+      !set_odb_value(odb_path(kInfoPath,
+                             "Capabilities/ScalerReadoutSupported"),
+                     &no, sizeof(no), 1, TID_BOOL) ||
+      !set_odb_value(odb_path(kInfoPath, "Capabilities/LowGainDecoded"),
+                     &yes, sizeof(yes), 1, TID_BOOL))
+    return false;
+
+  const std::array<std::uint8_t, easiroc::kFirmwareVersionLength> empty_raw{};
+  if (!set_odb_value(odb_path(kReadbackPath, "Firmware/Valid"), &no,
+                     sizeof(no), 1, TID_BOOL) ||
+      !set_odb_string(odb_path(kReadbackPath, "Firmware/Version"), "", 64) ||
+      !set_odb_string(odb_path(kReadbackPath, "Firmware/SynthesisDate"), "",
+                      64) ||
+      !set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"), empty_raw.data(),
+                     empty_raw.size(), empty_raw.size(), TID_BYTE))
+    return false;
+  return publish_runtime_variables();
 }
 
 INT read_bool_setting(const char* name, bool* value) {
@@ -123,7 +263,7 @@ INT read_bool_setting(const char* name, bool* value) {
 INT read_settings(FrontendSettings* settings) {
   char ip_address[64] = {};
   INT size = sizeof(ip_address);
-  std::string path = std::string(kSettingsPath) + "/IPAddress";
+  std::string path = odb_path(kSettingsPath, "Network/IPAddress");
   INT status = db_get_value(hDB, 0, path.c_str(), ip_address, &size,
                             TID_STRING, FALSE);
   if (status != DB_SUCCESS) {
@@ -135,15 +275,15 @@ INT read_settings(FrontendSettings* settings) {
   FrontendSettings next;
   next.ip_address = ip_address;
 
-  path = std::string(kSettingsPath) + "/ADCEnabled";
+  path = odb_path(kSettingsPath, "Acquisition/ADCEnabled");
   status = read_bool_setting(path.c_str(), &next.enables.adc);
   if (status != SUCCESS) return status;
 
-  path = std::string(kSettingsPath) + "/TDCEnabled";
+  path = odb_path(kSettingsPath, "Acquisition/TDCEnabled");
   status = read_bool_setting(path.c_str(), &next.enables.tdc);
   if (status != SUCCESS) return status;
 
-  path = std::string(kSettingsPath) + "/ScalerEnabled";
+  path = odb_path(kSettingsPath, "Acquisition/ScalerEnabled");
   status = read_bool_setting(path.c_str(), &next.enables.scaler);
   if (status != SUCCESS) return status;
 
@@ -151,41 +291,25 @@ INT read_settings(FrontendSettings* settings) {
   return SUCCESS;
 }
 
-INT set_odb_string(const char* path, const std::string& value,
-                   std::size_t capacity) {
-  std::string bounded = value.substr(0, capacity - 1);
-  std::vector<char> buffer(capacity, '\0');
-  std::copy(bounded.begin(), bounded.end(), buffer.begin());
-  const INT status = db_set_value(hDB, 0, path, buffer.data(), buffer.size(), 1,
-                                  TID_STRING);
-  if (status != DB_SUCCESS)
-    cm_msg(MERROR, "update_status", "Cannot write %s to ODB (status %d)",
-           path, status);
-  return status;
-}
-
 void run_diagnostic(std::string host) {
   DiagnosticResult result;
-  bool firmware_ok = false;
-  bool tcp_ok = false;
 
   try {
     const auto firmware = easiroc::readFirmwareVersion(host);
-    result.firmware_version = firmware.versionString();
-    firmware_ok = true;
+    result.firmware = firmware;
+    result.rbcp_communication_ok = true;
   } catch (const std::exception& error) {
     result.error = std::string("RBCP firmware read: ") + error.what();
   }
 
   try {
     easiroc::probeDataConnection(host);
-    tcp_ok = true;
+    result.tcp_reachable = true;
   } catch (const std::exception& error) {
     if (!result.error.empty()) result.error += "; ";
     result.error += std::string("TCP port 24 probe: ") + error.what();
   }
 
-  result.connected = firmware_ok && tcp_ok;
   {
     std::lock_guard<std::mutex> lock(g_diagnostic.result_mutex);
     g_diagnostic.result = std::move(result);
@@ -212,25 +336,32 @@ void publish_completed_diagnostic() {
   }
   if (!result) return;
 
-  const BOOL connected = result->connected ? TRUE : FALSE;
-  const std::string connected_path =
-      std::string(kVariablesPath) + "/Connected";
-  const INT status =
-      db_set_value(hDB, 0, connected_path.c_str(), &connected,
-                   sizeof(connected), 1, TID_BOOL);
-  if (status != DB_SUCCESS)
-    cm_msg(MERROR, "update_status", "Cannot write %s to ODB (status %d)",
-           connected_path.c_str(), status);
+  g_state.runtime.rbcp_communication_ok = result->rbcp_communication_ok;
+  g_state.runtime.tcp_reachable = result->tcp_reachable;
+  g_state.runtime.last_error = result->error;
 
-  if (result->firmware_version) {
-    const std::string path = std::string(kVariablesPath) + "/FirmwareVersion";
-    set_odb_string(path.c_str(), *result->firmware_version, 64);
+  const BOOL invalid = FALSE;
+  const std::string valid_path = odb_path(kReadbackPath, "Firmware/Valid");
+  set_odb_value(valid_path, &invalid, sizeof(invalid), 1, TID_BOOL);
+  if (result->firmware) {
+    const auto& firmware = *result->firmware;
+    bool readback_ok =
+        set_odb_string(odb_path(kReadbackPath, "Firmware/Version"),
+                       firmware.versionString(), 64);
+    readback_ok =
+        set_odb_string(odb_path(kReadbackPath, "Firmware/SynthesisDate"),
+                       firmware.synthesisDateString(), 64) && readback_ok;
+    readback_ok =
+        set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"),
+                      firmware.raw.data(), firmware.raw.size(),
+                      firmware.raw.size(), TID_BYTE) && readback_ok;
+    if (readback_ok) {
+      const BOOL valid = TRUE;
+      set_odb_value(valid_path, &valid, sizeof(valid), 1, TID_BOOL);
+    }
   }
 
-  const std::string error_path = std::string(kVariablesPath) + "/LastError";
-  set_odb_string(error_path.c_str(), result->error, 256);
-
-  if (result->connected) {
+  if (result->rbcp_communication_ok && result->tcp_reachable) {
     cm_msg(MINFO, "update_status",
            "Read-only status OK: RBCP firmware read and TCP port 24 probe "
            "succeeded");
@@ -238,21 +369,6 @@ void publish_completed_diagnostic() {
     cm_msg(MERROR, "update_status", "Read-only status failed: %s",
            result->error.c_str());
   }
-}
-
-void set_connected(bool connected) {
-  const BOOL value = connected ? TRUE : FALSE;
-  const std::string path = std::string(kVariablesPath) + "/Connected";
-  const INT status = db_set_value(hDB, 0, path.c_str(), &value, sizeof(value),
-                                  1, TID_BOOL);
-  if (status != DB_SUCCESS)
-    cm_msg(MERROR, "set_connected", "Cannot write %s (status %d)",
-           path.c_str(), status);
-}
-
-void set_last_error(const std::string& error) {
-  const std::string path = std::string(kVariablesPath) + "/LastError";
-  set_odb_string(path.c_str(), error, 256);
 }
 
 struct CleanupResult {
@@ -273,6 +389,7 @@ CleanupResult stop_acquisition(const char* caller, bool drain_after_stop) {
       g_state.daq_start_attempted = false;
     } catch (const std::exception& exception) {
       result.daq_off_succeeded = false;
+      g_state.runtime.rbcp_communication_ok = false;
       result.error = std::string("DAQ OFF failed; hardware state unknown: ") +
                      exception.what();
       cm_msg(MERROR, caller, "%s", result.error.c_str());
@@ -283,6 +400,8 @@ CleanupResult stop_acquisition(const char* caller, bool drain_after_stop) {
     try {
       const std::size_t drained =
           g_state.tcp->drain(kDrainQuietMs, kDrainMaximumMs);
+      g_state.runtime.statistics.last_drain_bytes = drained;
+      g_state.runtime.statistics.total_drain_bytes += drained;
       cm_msg(MINFO, caller, "Post-acquisition drain discarded %zu byte(s)",
              drained);
     } catch (const std::exception& exception) {
@@ -294,23 +413,24 @@ CleanupResult stop_acquisition(const char* caller, bool drain_after_stop) {
     }
   }
 
-  g_state.acquisition_active = false;
+  g_state.runtime.acquisition_running = false;
+  g_state.runtime.tcp_connected = false;
   g_state.tcp.reset();
   g_state.parser.reset();
   g_state.pending_events.clear();
   if (!g_state.daq_start_attempted) g_state.rbcp.reset();
-  set_connected(false);
   return result;
 }
 
 void handle_acquisition_error(const std::string& message) {
-  if (g_state.acquisition_fault) return;
-  g_state.acquisition_fault = true;
+  if (g_state.runtime.acquisition_fault) return;
+  g_state.runtime.acquisition_fault = true;
   cm_msg(MERROR, "poll_event", "Acquisition failed: %s", message.c_str());
   const CleanupResult cleanup = stop_acquisition("poll_event", false);
   std::string full_error = message;
   if (!cleanup.error.empty()) full_error += "; " + cleanup.error;
-  set_last_error(full_error);
+  g_state.runtime.last_error = full_error;
+  publish_runtime_variables();
 
   char transition_error[256] = {};
   const INT status = cm_transition(TR_STOP, 0, transition_error,
@@ -357,8 +477,7 @@ EQUIPMENT equipment[] = {
 #endif
 
 INT frontend_init() {
-  const INT status = create_odb_records();
-  if (status != SUCCESS) return status;
+  if (!initialize_odb()) return FE_ERR_ODB;
 
   const INT settings_status = read_settings(&g_state.settings);
   if (settings_status != SUCCESS) return settings_status;
@@ -373,6 +492,10 @@ INT frontend_init() {
 INT frontend_exit() {
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
   const CleanupResult cleanup = stop_acquisition("frontend_exit", true);
+  if (!cleanup.error.empty()) g_state.runtime.last_error = cleanup.error;
+  g_state.runtime.acquisition_fault = !cleanup.daq_off_succeeded ||
+                                      !cleanup.drain_succeeded;
+  publish_runtime_variables();
   if (!cleanup.daq_off_succeeded) return FE_ERR_HW;
   return cleanup.drain_succeeded ? SUCCESS : FE_ERR_HW;
 }
@@ -385,45 +508,60 @@ INT begin_of_run(INT run_number, char* error) {
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
   publish_completed_diagnostic();
 
-  const CleanupResult previous = stop_acquisition("begin_of_run", false);
-  if (!previous.daq_off_succeeded) {
-    if (error != nullptr)
-      std::snprintf(error, 256, "%s", previous.error.c_str());
-    return FE_ERR_HW;
-  }
-
-  const INT status = read_settings(&g_state.settings);
+  FrontendSettings run_settings;
+  const INT status = read_settings(&run_settings);
   if (status != SUCCESS) {
     if (error != nullptr)
       std::snprintf(error, 256, "Cannot read NIM-EASIROC settings from ODB");
     return status;
   }
 
-  if (!g_state.settings.enables.adc || !g_state.settings.enables.tdc ||
-      g_state.settings.enables.scaler) {
+  if (!run_settings.enables.adc || !run_settings.enables.tdc ||
+      run_settings.enables.scaler) {
     const char* message =
-        "Physics readout requires ADCEnabled=y, TDCEnabled=y, "
+        "Physics readout supports only ADCEnabled=y, TDCEnabled=y, "
         "ScalerEnabled=n";
     cm_msg(MERROR, "begin_of_run", "%s", message);
     if (error != nullptr) std::snprintf(error, 256, "%s", message);
-    set_last_error(message);
+    g_state.runtime.last_error = message;
+    publish_runtime_variables();
     return FE_ERR_ODB;
   }
 
+  const CleanupResult previous = stop_acquisition("begin_of_run", false);
+  if (!previous.daq_off_succeeded) {
+    g_state.runtime.acquisition_fault = true;
+    g_state.runtime.last_error = previous.error;
+    publish_runtime_variables();
+    if (error != nullptr)
+      std::snprintf(error, 256, "%s", previous.error.c_str());
+    return FE_ERR_HW;
+  }
+
+  g_state.settings = run_settings;
+  g_state.runtime.event_counter = 0;
+  g_state.runtime.statistics = {};
+  g_state.runtime.acquisition_fault = false;
   g_state.daq_control.setEnables(g_state.settings.enables);
   const auto start = g_state.daq_control.startValue();
   try {
-    g_state.rbcp =
-        std::make_unique<RbcpClient>(g_state.settings.ip_address);
+    g_state.runtime.tcp_reachable = false;
+    g_state.rbcp = std::make_unique<RbcpClient>(g_state.settings.ip_address,
+                                                kRbcpPort);
     g_state.tcp = std::make_unique<TcpConnection>(
-        g_state.settings.ip_address, kTcpPort, kConnectTimeoutMs);
+        g_state.settings.ip_address, easiroc::kTcpDataPort,
+        easiroc::kTcpConnectTimeoutMilliseconds);
+    g_state.runtime.tcp_reachable = true;
+    g_state.runtime.tcp_connected = true;
     const std::size_t drained =
         g_state.tcp->drain(kDrainQuietMs, kDrainMaximumMs);
+    g_state.runtime.statistics.last_drain_bytes = drained;
+    g_state.runtime.statistics.total_drain_bytes += drained;
     cm_msg(MINFO, "begin_of_run",
            "Run %d connected to %s:%u; pre-acquisition drain discarded "
            "%zu byte(s)",
            run_number, g_state.settings.ip_address.c_str(),
-           static_cast<unsigned>(kTcpPort), drained);
+           static_cast<unsigned>(easiroc::kTcpDataPort), drained);
 
     g_state.parser = std::make_unique<easiroc::EventStreamParser>();
     g_state.pending_events.clear();
@@ -433,10 +571,11 @@ INT begin_of_run(INT run_number, char* error) {
            static_cast<unsigned>(start.address),
            static_cast<unsigned>(start.value));
     g_state.rbcp->write(start.address, start.value);
-    g_state.acquisition_active = true;
-    g_state.acquisition_fault = false;
-    set_connected(true);
-    set_last_error("");
+    g_state.runtime.rbcp_communication_ok = true;
+    g_state.runtime.acquisition_running = true;
+    g_state.runtime.acquisition_fault = false;
+    g_state.runtime.last_error.clear();
+    publish_runtime_variables();
     return SUCCESS;
   } catch (const std::exception& exception) {
     const std::string start_error =
@@ -445,7 +584,9 @@ INT begin_of_run(INT run_number, char* error) {
     std::string message = start_error;
     if (!cleanup.error.empty()) message += "; " + cleanup.error;
     cm_msg(MERROR, "begin_of_run", "%s", message.c_str());
-    set_last_error(message);
+    g_state.runtime.acquisition_fault = true;
+    g_state.runtime.last_error = message;
+    publish_runtime_variables();
     if (error != nullptr) std::snprintf(error, 256, "%s", message.c_str());
     return FE_ERR_HW;
   }
@@ -456,11 +597,13 @@ INT end_of_run(INT run_number, char* error) {
   cm_msg(MINFO, "end_of_run", "Stopping acquisition for run %d", run_number);
   const CleanupResult cleanup = stop_acquisition("end_of_run", true);
   if (!cleanup.error.empty()) {
-    set_last_error(cleanup.error);
+    g_state.runtime.last_error = cleanup.error;
     if (error != nullptr)
       std::snprintf(error, 256, "%s", cleanup.error.c_str());
   }
-  g_state.acquisition_fault = false;
+  g_state.runtime.acquisition_fault =
+      !cleanup.daq_off_succeeded || !cleanup.drain_succeeded;
+  publish_runtime_variables();
   if (!cleanup.daq_off_succeeded || !cleanup.drain_succeeded)
     return FE_ERR_HW;
   return SUCCESS;
@@ -479,23 +622,52 @@ INT resume_run(INT, char* error) {
 INT frontend_loop() { return SUCCESS; }
 
 INT poll_event(INT, INT, BOOL test) {
-  if (test || !g_state.acquisition_active || !g_state.tcp ||
+  if (test || !g_state.runtime.acquisition_running || !g_state.tcp ||
       !g_state.parser)
     return FALSE;
   if (!g_state.pending_events.empty()) return TRUE;
 
+  std::vector<std::uint8_t> chunk;
   try {
     if (!g_state.tcp->dataAvailable(0)) return FALSE;
-    const auto chunk =
-        g_state.tcp->receive(kReceiveChunkBytes, kReceiveTimeoutMs);
-    auto events = g_state.parser->push(chunk);
-    for (const auto& event : events)
-      g_state.pending_events.push_back(easiroc::organizeEvent(event));
-    return g_state.pending_events.empty() ? FALSE : TRUE;
+    chunk = g_state.tcp->receive(kReceiveChunkBytes, kReceiveTimeoutMs);
   } catch (const std::exception& exception) {
+    const std::string message = exception.what();
+    if (message.find("timeout") != std::string::npos)
+      ++g_state.runtime.statistics.receive_timeout_count;
+    else
+      ++g_state.runtime.statistics.tcp_error_count;
+    handle_acquisition_error(message);
+    return FALSE;
+  }
+
+  g_state.runtime.statistics.received_bytes += chunk.size();
+  ++g_state.runtime.statistics.receive_chunks;
+  std::vector<easiroc::Event> events;
+  try {
+    events = g_state.parser->push(chunk);
+  } catch (const std::exception& exception) {
+    ++g_state.runtime.statistics.decode_error_count;
     handle_acquisition_error(exception.what());
     return FALSE;
   }
+
+  for (const auto& event : events) {
+    for (const auto& word : event.data) {
+      if ((word.type == easiroc::DataType::kAdcHighGain ||
+           word.type == easiroc::DataType::kAdcLowGain) &&
+          word.overflow)
+        ++g_state.runtime.statistics.adc_overflow_count;
+    }
+    try {
+      g_state.pending_events.push_back(easiroc::organizeEvent(event));
+    } catch (const std::exception& exception) {
+      ++g_state.runtime.statistics.event_content_error_count;
+      handle_acquisition_error(exception.what());
+      return FALSE;
+    }
+  }
+  return g_state.pending_events.empty() ? FALSE : TRUE;
 }
 
 INT interrupt_configure(INT, INT, PTYPE) { return SUCCESS; }
@@ -533,17 +705,19 @@ INT read_physics_event(char* pevent, INT) {
   for (const auto value : payloads.trailing) *data++ = value;
   bk_close(pevent, data);
 
+  ++g_state.runtime.event_counter;
   return bk_size(pevent);
 }
 
 INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
+  publish_runtime_variables();
 
-  if (g_state.acquisition_active || g_state.daq_start_attempted) return 0;
+  if (g_state.runtime.acquisition_running || g_state.daq_start_attempted)
+    return 0;
 
   FrontendSettings settings;
   if (read_settings(&settings) == SUCCESS) {
-    g_state.settings = settings;
     start_diagnostic(settings.ip_address);
   }
 

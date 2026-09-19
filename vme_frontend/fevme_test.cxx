@@ -127,48 +127,8 @@ static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static DWORD gRpv130LastPoll = 0;
-static const char *RPV130_ODB_PATH = "/Equipment/VME/Variables/RPV130";
-
-static bool set_odb_value(const char *name, const void *value, INT size, DWORD type)
-{
-    HNDLE hDB = 0;
-    cm_get_experiment_database(&hDB, NULL);
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s", RPV130_ODB_PATH, name);
-    const INT result = db_set_value(hDB, 0, path, value, size, 1, type);
-    if (result != DB_SUCCESS)
-        cm_msg(MERROR, frontend_name, "Cannot update ODB %s: status %d", path, result);
-    return result == DB_SUCCESS;
-}
-
-static void publish_rpv130_status(bool force)
-{
-    if (!gVme)
-        return;
-    const DWORD now = ss_millitime();
-    if (!force && static_cast<DWORD>(now - gRpv130LastPoll) < RPV130_POLL_PERIOD_MS)
-        return;
-    gRpv130LastPoll = now;
-
-    RPV130_STATUS status = {};
-    const INT read_result = rpv130_read_status(gVme, RPV130_BASE_ADDRESS, &status);
-    const BOOL communication_ok = read_result == MVME_SUCCESS;
-    const DWORD base_address = RPV130_BASE_ADDRESS;
-    set_odb_value("Base Address", &base_address, sizeof(base_address), TID_DWORD);
-    set_odb_value("Latch1", &status.latch1, sizeof(status.latch1), TID_BYTE);
-    set_odb_value("Latch2", &status.latch2, sizeof(status.latch2), TID_BYTE);
-    set_odb_value("RSFF", &status.rsff, sizeof(status.rsff), TID_BYTE);
-    set_odb_value("Through", &status.through, sizeof(status.through), TID_BYTE);
-    set_odb_value("CSR1", &status.csr1, sizeof(status.csr1), TID_BYTE);
-    set_odb_value("CSR2", &status.csr2, sizeof(status.csr2), TID_BYTE);
-    if (!communication_ok) {
-        cm_msg(MERROR, frontend_name,
-               "RPV130 read-only status poll failed at base 0x%04X: status %d",
-               RPV130_BASE_ADDRESS, read_result);
-    }
-    set_odb_value("Communication OK", &communication_ok,
-                  sizeof(communication_ok), TID_BOOL);
-}
+static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
+static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
 
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
 static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
@@ -437,6 +397,90 @@ static bool set_module_output(const char *base, const char *name,
     char path[256];
     return make_odb_path(path, sizeof(path), base, name) &&
            set_absolute_odb_value(path, value, size, count, type);
+}
+
+static bool initialize_rpv130_odb()
+{
+    const DWORD base_address = RPV130_BASE_ADDRESS;
+    const char address_modifier[] = "A16_ND";
+    const char register_width[] = "D16";
+    const BOOL default_communication_ok = FALSE;
+    const BYTE default_status = 0;
+    char path[256];
+
+#define SET_RPV130_INFO(name, value, size, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), RPV130_INFO_PATH, name) || \
+            !set_absolute_odb_value(path, value, size, 1, type)) \
+            return false; \
+    } while (0)
+    SET_RPV130_INFO("BaseAddress", &base_address, sizeof(base_address), TID_DWORD);
+    SET_RPV130_INFO("AddressModifier", address_modifier,
+                    sizeof(address_modifier), TID_STRING);
+    SET_RPV130_INFO("RegisterDataWidth", register_width,
+                    sizeof(register_width), TID_STRING);
+#undef SET_RPV130_INFO
+
+#define SET_RPV130_VARIABLE_DEFAULT(name, value, size, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), RPV130_VARIABLES_PATH, name) || \
+            !set_absolute_odb_value(path, value, size, 1, type)) \
+            return false; \
+    } while (0)
+    SET_RPV130_VARIABLE_DEFAULT("CommunicationOK", &default_communication_ok,
+                                sizeof(default_communication_ok), TID_BOOL);
+    SET_RPV130_VARIABLE_DEFAULT("Latch1", &default_status,
+                                sizeof(default_status), TID_BYTE);
+    SET_RPV130_VARIABLE_DEFAULT("Latch2", &default_status,
+                                sizeof(default_status), TID_BYTE);
+    SET_RPV130_VARIABLE_DEFAULT("RSFF", &default_status,
+                                sizeof(default_status), TID_BYTE);
+    SET_RPV130_VARIABLE_DEFAULT("Through", &default_status,
+                                sizeof(default_status), TID_BYTE);
+    SET_RPV130_VARIABLE_DEFAULT("CSR1", &default_status,
+                                sizeof(default_status), TID_BYTE);
+    SET_RPV130_VARIABLE_DEFAULT("CSR2", &default_status,
+                                sizeof(default_status), TID_BYTE);
+#undef SET_RPV130_VARIABLE_DEFAULT
+    return true;
+}
+
+static void publish_rpv130_status(bool force)
+{
+    if (!gVme)
+        return;
+    const DWORD now = ss_millitime();
+    if (!force &&
+        static_cast<DWORD>(now - gRpv130LastPoll) < RPV130_POLL_PERIOD_MS)
+        return;
+    gRpv130LastPoll = now;
+
+    RPV130_STATUS status = {};
+    const INT read_result =
+        rpv130_read_status(gVme, RPV130_BASE_ADDRESS, &status);
+    const BOOL communication_ok = read_result == MVME_SUCCESS;
+    if (!communication_ok) {
+        status = {};
+        cm_msg(MERROR, frontend_name,
+               "RPV130 read-only status poll failed at base 0x%04X: status %d",
+               RPV130_BASE_ADDRESS, read_result);
+    }
+
+    set_module_output(RPV130_VARIABLES_PATH, "Latch1", &status.latch1,
+                      sizeof(status.latch1), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch2", &status.latch2,
+                      sizeof(status.latch2), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "RSFF", &status.rsff,
+                      sizeof(status.rsff), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Through", &status.through,
+                      sizeof(status.through), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR1", &status.csr1,
+                      sizeof(status.csr1), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR2", &status.csr2,
+                      sizeof(status.csr2), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK",
+                      &communication_ok, sizeof(communication_ok), 1,
+                      TID_BOOL);
 }
 
 static bool publish_module_info(const char *path, DWORD base_address,
@@ -2467,7 +2511,8 @@ INT frontend_init()
     printf("Software-trigger diagnostics: disabled\n");
 #endif
 
-    if (!initialize_other_module_odb() || !initialize_v1720e_odb()) {
+    if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
+        !initialize_v1720e_odb()) {
         cm_msg(MERROR, frontend_name,
                "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;

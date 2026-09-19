@@ -6,9 +6,11 @@
 #include <string>
 #include <vector>
 
+constexpr std::uint16_t kRbcpPort = 4660;
+
 class RbcpClient {
  public:
-  explicit RbcpClient(std::string host, std::uint16_t port = 4660);
+  explicit RbcpClient(std::string host, std::uint16_t port = kRbcpPort);
   std::vector<std::uint8_t> read(std::uint32_t address, std::size_t length);
   void write(std::uint32_t address, const std::vector<std::uint8_t>& data);
   void write(std::uint32_t address, std::uint8_t value);
