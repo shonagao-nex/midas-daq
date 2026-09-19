@@ -127,8 +127,10 @@ static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static DWORD gRpv130LastPoll = 0;
+static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
+static bool gRpv130EnabledForRun = true;
 
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
 static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
@@ -185,6 +187,7 @@ static const DWORD V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
 static const DWORD V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
 
 struct V1720ERuntimeState {
+    BOOL enabled_for_run;
     BOOL communication_ok;
     DWORD acquisition_control;
     DWORD acquisition_status;
@@ -309,6 +312,7 @@ struct V775Settings {
 };
 
 struct V7xxRuntimeState {
+    BOOL enabled_for_run;
     BOOL communication_ok;
     WORD status1;
     WORD status2;
@@ -321,6 +325,7 @@ struct V7xxRuntimeState {
 };
 
 struct V1190RuntimeState {
+    BOOL enabled_for_run;
     BOOL communication_ok;
     WORD status;
     BOOL data_ready;
@@ -401,12 +406,23 @@ static bool set_module_output(const char *base, const char *name,
 
 static bool initialize_rpv130_odb()
 {
+    const BOOL default_enabled = TRUE;
     const DWORD base_address = RPV130_BASE_ADDRESS;
     const char address_modifier[] = "A16_ND";
     const char register_width[] = "D16";
     const BOOL default_communication_ok = FALSE;
     const BYTE default_status = 0;
     char path[256];
+
+    if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH, "Enabled") ||
+        !ensure_odb_value(path, &default_enabled, sizeof(default_enabled), 1,
+                          TID_BOOL))
+        return false;
+    BOOL startup_enabled = FALSE;
+    if (!get_absolute_odb_value(path, &startup_enabled,
+                                sizeof(startup_enabled), TID_BOOL))
+        return false;
+    gRpv130EnabledForRun = startup_enabled != FALSE;
 
 #define SET_RPV130_INFO(name, value, size, type) \
     do { \
@@ -429,6 +445,8 @@ static bool initialize_rpv130_odb()
     } while (0)
     SET_RPV130_VARIABLE_DEFAULT("CommunicationOK", &default_communication_ok,
                                 sizeof(default_communication_ok), TID_BOOL);
+    SET_RPV130_VARIABLE_DEFAULT("EnabledForRun", &default_communication_ok,
+                                sizeof(default_communication_ok), TID_BOOL);
     SET_RPV130_VARIABLE_DEFAULT("Latch1", &default_status,
                                 sizeof(default_status), TID_BYTE);
     SET_RPV130_VARIABLE_DEFAULT("Latch2", &default_status,
@@ -442,12 +460,40 @@ static bool initialize_rpv130_odb()
     SET_RPV130_VARIABLE_DEFAULT("CSR2", &default_status,
                                 sizeof(default_status), TID_BYTE);
 #undef SET_RPV130_VARIABLE_DEFAULT
+    const BOOL enabled_for_run = gRpv130EnabledForRun ? TRUE : FALSE;
+    if (!make_odb_path(path, sizeof(path), RPV130_VARIABLES_PATH,
+                       "EnabledForRun") ||
+        !set_absolute_odb_value(path, &enabled_for_run,
+                                sizeof(enabled_for_run), 1, TID_BOOL))
+        return false;
     return true;
+}
+
+static void publish_rpv130_disabled_state()
+{
+    const BOOL no = FALSE;
+    const BYTE zero = 0;
+    set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun", &no,
+                      sizeof(no), 1, TID_BOOL);
+    set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK", &no,
+                      sizeof(no), 1, TID_BOOL);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch1", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch2", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "RSFF", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Through", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR1", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR2", &zero,
+                      sizeof(zero), 1, TID_BYTE);
 }
 
 static void publish_rpv130_status(bool force)
 {
-    if (!gVme)
+    if (!gRpv130EnabledForRun || !gVme)
         return;
     const DWORD now = ss_millitime();
     if (!force &&
@@ -480,6 +526,10 @@ static void publish_rpv130_status(bool force)
                       sizeof(status.csr2), 1, TID_BYTE);
     set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK",
                       &communication_ok, sizeof(communication_ok), 1,
+                      TID_BOOL);
+    const BOOL enabled_for_run = TRUE;
+    set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun",
+                      &enabled_for_run, sizeof(enabled_for_run), 1,
                       TID_BOOL);
 }
 
@@ -619,6 +669,7 @@ static bool publish_v7xx_variables(const char *path, V7xxRuntimeState &r,
 {
     bool ok=true;
 #define PV7(k,m,t) do { ok=set_module_output(path,k,&r.m,sizeof(r.m),1,t)&&ok; } while(0)
+    PV7("EnabledForRun",enabled_for_run,TID_BOOL);
     PV7("CommunicationOK",communication_ok,TID_BOOL); PV7("Status1",status1,TID_WORD);
     PV7("Status2",status2,TID_WORD); PV7("DataReady",data_ready,TID_BOOL);
     PV7("Busy",busy,TID_BOOL); PV7("BufferEmpty",buffer_empty,TID_BOOL);
@@ -631,6 +682,7 @@ static bool publish_v1190_variables()
 {
     bool ok=true;
 #define PV1190(k,m,t) do { ok=set_module_output(V1190_VARIABLES_PATH,k,&gV1190Runtime.m,sizeof(gV1190Runtime.m),1,t)&&ok; } while(0)
+    PV1190("EnabledForRun",enabled_for_run,TID_BOOL);
     PV1190("CommunicationOK",communication_ok,TID_BOOL); PV1190("Status",status,TID_WORD);
     PV1190("DataReady",data_ready,TID_BOOL); PV1190("AlmostFull",almost_full,TID_BOOL);
     PV1190("Full",full,TID_BOOL); PV1190("TriggerMatching",trigger_matching,TID_BOOL);
@@ -826,6 +878,7 @@ static bool publish_v1720e_variables()
                                &gV1720Runtime.member, \
                                sizeof(gV1720Runtime.member), 1, type) && ok; \
     } while (0)
+    PUBLISH_VARIABLE("EnabledForRun", enabled_for_run, TID_BOOL);
     PUBLISH_VARIABLE("CommunicationOK", communication_ok, TID_BOOL);
     PUBLISH_VARIABLE("AcquisitionControl", acquisition_control, TID_DWORD);
     PUBLISH_VARIABLE("AcquisitionStatus", acquisition_status, TID_DWORD);
@@ -2062,6 +2115,55 @@ static bool validate_and_snapshot_module_settings()
     gV792RunSettings=a; gV1190RunSettings=b; gV775RunSettings=c; return true;
 }
 
+static bool snapshot_rpv130_enabled_for_run()
+{
+    char path[256];
+    BOOL enabled = FALSE;
+    if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH, "Enabled") ||
+        !get_absolute_odb_value(path, &enabled, sizeof(enabled), TID_BOOL))
+        return false;
+    gRpv130EnabledForRun = enabled != FALSE;
+    return true;
+}
+
+static void publish_vme_enabled_for_run()
+{
+    gV792Runtime.enabled_for_run = gV792RunSettings.enabled;
+    gV1190Runtime.enabled_for_run = gV1190RunSettings.enabled;
+    gV775Runtime.enabled_for_run = gV775RunSettings.enabled;
+    gV1720Runtime.enabled_for_run = gV1720RunSettings.enabled;
+    gV792Runtime.dirty = true;
+    gV1190Runtime.dirty = true;
+    gV775Runtime.dirty = true;
+    gV1720Runtime.dirty = true;
+    publish_v7xx_variables(V792_VARIABLES_PATH, gV792Runtime,
+                           gV792LastVariablesPublish);
+    publish_v1190_variables();
+    publish_v7xx_variables(V775_VARIABLES_PATH, gV775Runtime,
+                           gV775LastVariablesPublish);
+    publish_v1720e_variables();
+    if (gRpv130EnabledForRun) {
+        const BOOL yes = TRUE;
+        set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun", &yes,
+                          sizeof(yes), 1, TID_BOOL);
+    } else {
+        publish_rpv130_disabled_state();
+    }
+}
+
+static bool validate_v792_event_source_dependency()
+{
+    if (!gV792RunSettings.enabled &&
+        (gV1190RunSettings.enabled || gV775RunSettings.enabled ||
+         gV1720RunSettings.enabled)) {
+        cm_msg(MERROR, frontend_name,
+               "V792 must be enabled when any VME physics readout module "
+               "is enabled");
+        return false;
+    }
+    return true;
+}
+
 [[maybe_unused]] static bool log_current_configuration(const char *phase)
 {
     WORD vf = 0, vs1 = 0, vs2 = 0, vb = 0, iped = 0;
@@ -2570,12 +2672,21 @@ INT begin_of_run(INT run_number, char *error)
     printf("Begin run %d\n", run_number);
     reset_run_statistics();
 
-    if (!validate_and_snapshot_module_settings() || !snapshot_v1720e_settings_for_run()) {
+    if (!validate_and_snapshot_module_settings() ||
+        !snapshot_v1720e_settings_for_run() ||
+        !snapshot_rpv130_enabled_for_run()) {
         cm_msg(MERROR, frontend_name,
                "Cannot snapshot/validate VME module Settings at BOR");
         snprintf(error, 256, "Invalid VME module ODB Settings");
         return FE_ERR_ODB;
     }
+    if (!validate_v792_event_source_dependency()) {
+        snprintf(error, 256,
+                 "V792 must be enabled when any VME physics readout module "
+                 "is enabled");
+        return FE_ERR_ODB;
+    }
+    publish_vme_enabled_for_run();
     set_module_readback_valid(V792_READBACK_PATH,false);
     set_module_readback_valid(V1190_READBACK_PATH,false);
     set_module_readback_valid(V775_READBACK_PATH,false);

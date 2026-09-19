@@ -43,6 +43,7 @@ static_assert(kAsicCount * kChannelsPerAsic == easiroc::kAdcChannelCount,
               "EASIROC hardware channel information is inconsistent");
 
 struct FrontendSettings {
+  bool enabled = true;
   std::string ip_address = kDefaultIpAddress;
   easiroc::DaqEnables enables;
 };
@@ -60,6 +61,7 @@ struct RuntimeStatistics {
 };
 
 struct RuntimeState {
+  bool enabled_for_run = false;
   bool rbcp_communication_ok = false;
   bool tcp_reachable = false;
   bool tcp_connected = false;
@@ -74,6 +76,7 @@ struct RuntimeState {
 // access. All communication is explicit in BOR, polling, and cleanup paths.
 struct FrontendState {
   FrontendSettings settings;
+  bool run_active = false;
   easiroc::DaqControl daq_control;
 
   std::unique_ptr<RbcpClient> rbcp;
@@ -143,6 +146,8 @@ bool set_odb_string(const std::string& path, const std::string& value,
 }
 
 bool publish_runtime_variables() {
+  const BOOL enabled_for_run =
+      g_state.runtime.enabled_for_run ? TRUE : FALSE;
   const BOOL rbcp_ok = g_state.runtime.rbcp_communication_ok ? TRUE : FALSE;
   const BOOL tcp_reachable = g_state.runtime.tcp_reachable ? TRUE : FALSE;
   const BOOL tcp_connected = g_state.runtime.tcp_connected ? TRUE : FALSE;
@@ -158,6 +163,7 @@ bool publish_runtime_variables() {
 #define PUBLISH_QWORD(base, name, value) \
   ok = set_odb_value(odb_path(base, name), &(value), sizeof(value), 1, \
                      TID_QWORD) && ok
+  PUBLISH_BOOL("EnabledForRun", enabled_for_run);
   PUBLISH_BOOL("RBCPCommunicationOK", rbcp_ok);
   PUBLISH_BOOL("TCPReachable", tcp_reachable);
   PUBLISH_BOOL("TCPConnected", tcp_connected);
@@ -198,7 +204,9 @@ bool initialize_odb() {
   std::snprintf(default_ip, sizeof(default_ip), "%s", kDefaultIpAddress);
   const BOOL yes = TRUE;
   const BOOL no = FALSE;
-  if (!ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
+  if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
+                        &yes, sizeof(yes), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
                         default_ip, sizeof(default_ip), 1, TID_STRING) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ADCEnabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
@@ -275,6 +283,10 @@ INT read_settings(FrontendSettings* settings) {
   FrontendSettings next;
   next.ip_address = ip_address;
 
+  path = odb_path(kSettingsPath, "Enabled");
+  status = read_bool_setting(path.c_str(), &next.enabled);
+  if (status != SUCCESS) return status;
+
   path = odb_path(kSettingsPath, "Acquisition/ADCEnabled");
   status = read_bool_setting(path.c_str(), &next.enables.adc);
   if (status != SUCCESS) return status;
@@ -289,6 +301,26 @@ INT read_settings(FrontendSettings* settings) {
 
   *settings = next;
   return SUCCESS;
+}
+
+void set_firmware_readback_valid(bool valid) {
+  const BOOL value = valid ? TRUE : FALSE;
+  set_odb_value(odb_path(kReadbackPath, "Firmware/Valid"), &value,
+                sizeof(value), 1, TID_BOOL);
+}
+
+void reset_software_readout_state() {
+  g_state.tcp.reset();
+  g_state.parser.reset();
+  g_state.pending_events.clear();
+  g_state.rbcp.reset();
+  g_state.daq_start_attempted = false;
+}
+
+void set_disabled_runtime_state() {
+  reset_software_readout_state();
+  g_state.runtime = {};
+  set_firmware_readback_valid(false);
 }
 
 void run_diagnostic(std::string host) {
@@ -481,6 +513,14 @@ INT frontend_init() {
 
   const INT settings_status = read_settings(&g_state.settings);
   if (settings_status != SUCCESS) return settings_status;
+  if (!g_state.settings.enabled) {
+    set_disabled_runtime_state();
+    publish_runtime_variables();
+    cm_msg(MINFO, "frontend_init",
+           "NIM-EASIROC disabled in ODB; startup hardware diagnostics "
+           "skipped");
+    return SUCCESS;
+  }
   start_diagnostic(g_state.settings.ip_address);
 
   cm_msg(MINFO, "frontend_init",
@@ -492,6 +532,7 @@ INT frontend_init() {
 INT frontend_exit() {
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
   const CleanupResult cleanup = stop_acquisition("frontend_exit", true);
+  g_state.run_active = false;
   if (!cleanup.error.empty()) g_state.runtime.last_error = cleanup.error;
   g_state.runtime.acquisition_fault = !cleanup.daq_off_succeeded ||
                                       !cleanup.drain_succeeded;
@@ -516,6 +557,20 @@ INT begin_of_run(INT run_number, char* error) {
     return status;
   }
 
+  g_state.settings = run_settings;
+  g_state.run_active = true;
+  if (!run_settings.enabled) {
+    set_disabled_runtime_state();
+    publish_runtime_variables();
+    cm_msg(MINFO, "begin_of_run",
+           "Run %d: NIM-EASIROC disabled by BOR Settings snapshot; "
+           "hardware access skipped",
+           run_number);
+    return SUCCESS;
+  }
+
+  g_state.runtime.enabled_for_run = true;
+
   if (!run_settings.enables.adc || !run_settings.enables.tdc ||
       run_settings.enables.scaler) {
     const char* message =
@@ -523,6 +578,7 @@ INT begin_of_run(INT run_number, char* error) {
         "ScalerEnabled=n";
     cm_msg(MERROR, "begin_of_run", "%s", message);
     if (error != nullptr) std::snprintf(error, 256, "%s", message);
+    g_state.run_active = false;
     g_state.runtime.last_error = message;
     publish_runtime_variables();
     return FE_ERR_ODB;
@@ -531,6 +587,7 @@ INT begin_of_run(INT run_number, char* error) {
   const CleanupResult previous = stop_acquisition("begin_of_run", false);
   if (!previous.daq_off_succeeded) {
     g_state.runtime.acquisition_fault = true;
+    g_state.run_active = false;
     g_state.runtime.last_error = previous.error;
     publish_runtime_variables();
     if (error != nullptr)
@@ -538,7 +595,6 @@ INT begin_of_run(INT run_number, char* error) {
     return FE_ERR_HW;
   }
 
-  g_state.settings = run_settings;
   g_state.runtime.event_counter = 0;
   g_state.runtime.statistics = {};
   g_state.runtime.acquisition_fault = false;
@@ -584,6 +640,7 @@ INT begin_of_run(INT run_number, char* error) {
     std::string message = start_error;
     if (!cleanup.error.empty()) message += "; " + cleanup.error;
     cm_msg(MERROR, "begin_of_run", "%s", message.c_str());
+    g_state.run_active = false;
     g_state.runtime.acquisition_fault = true;
     g_state.runtime.last_error = message;
     publish_runtime_variables();
@@ -594,8 +651,19 @@ INT begin_of_run(INT run_number, char* error) {
 
 INT end_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  if (!g_state.runtime.enabled_for_run) {
+    set_disabled_runtime_state();
+    g_state.run_active = false;
+    publish_runtime_variables();
+    cm_msg(MINFO, "end_of_run",
+           "Run %d: NIM-EASIROC was disabled; software state cleared "
+           "without hardware access",
+           run_number);
+    return SUCCESS;
+  }
   cm_msg(MINFO, "end_of_run", "Stopping acquisition for run %d", run_number);
   const CleanupResult cleanup = stop_acquisition("end_of_run", true);
+  g_state.run_active = false;
   if (!cleanup.error.empty()) {
     g_state.runtime.last_error = cleanup.error;
     if (error != nullptr)
@@ -622,7 +690,12 @@ INT resume_run(INT, char* error) {
 INT frontend_loop() { return SUCCESS; }
 
 INT poll_event(INT, INT, BOOL test) {
-  if (test || !g_state.runtime.acquisition_running || !g_state.tcp ||
+  if (test) return FALSE;
+  if (!g_state.run_active || !g_state.runtime.enabled_for_run) {
+    ss_sleep(10);
+    return FALSE;
+  }
+  if (!g_state.runtime.acquisition_running || !g_state.tcp ||
       !g_state.parser)
     return FALSE;
   if (!g_state.pending_events.empty()) return TRUE;
@@ -673,7 +746,9 @@ INT poll_event(INT, INT, BOOL test) {
 INT interrupt_configure(INT, INT, PTYPE) { return SUCCESS; }
 
 INT read_physics_event(char* pevent, INT) {
-  if (g_state.pending_events.empty()) return 0;
+  if (!g_state.run_active || !g_state.runtime.enabled_for_run ||
+      g_state.pending_events.empty())
+    return 0;
 
   const easiroc::DecodedEvent event =
       std::move(g_state.pending_events.front());
@@ -713,12 +788,16 @@ INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
   publish_runtime_variables();
 
-  if (g_state.runtime.acquisition_running || g_state.daq_start_attempted)
-    return 0;
+  if (g_state.run_active) return 0;
 
   FrontendSettings settings;
   if (read_settings(&settings) == SUCCESS) {
-    start_diagnostic(settings.ip_address);
+    if (settings.enabled) {
+      start_diagnostic(settings.ip_address);
+    } else {
+      set_disabled_runtime_state();
+      publish_runtime_variables();
+    }
   }
 
   // Status is published directly into ODB. Returning zero suppresses an empty
