@@ -33,19 +33,23 @@ LIBS     = -lCAENVME -lm -lz -lutil -lpthread
 
 TARGET   = fevme_test.exe
 DIAG_TARGET = fevme_test_diag.exe
+RPV130_TEST_TARGET = test_rpv130_status.exe
 
 COMMON_OBJS = caenvme.o \
            v792.o \
            v775.o \
-           v1720e.o
+           v1720e.o \
+           rpv130.o
 OBJS     = fevme_test.o $(COMMON_OBJS)
 DIAG_OBJS = fevme_test_diag.o $(COMMON_OBJS)
 
-.PHONY: all diagnostic clean
+.PHONY: all diagnostic rpv130-test clean
 
 all: $(TARGET)
 
 diagnostic: $(DIAG_TARGET)
+
+rpv130-test: $(RPV130_TEST_TARGET)
 
 
 # Link the MIDAS frontend executable.
@@ -54,6 +58,9 @@ $(TARGET): $(OBJS) $(MFEOBJ) $(MIDASLIB)
 
 $(DIAG_TARGET): $(DIAG_OBJS) $(MFEOBJ) $(MIDASLIB)
 	$(CXX) -o $@ $(DIAG_OBJS) $(MFEOBJ) $(MIDASLIB) $(LIBS)
+
+$(RPV130_TEST_TARGET): test_rpv130_status.o rpv130.o caenvme.o
+	$(CXX) -o $@ $^ $(LIBS)
 
 
 # Compile the MIDAS frontend source.
@@ -81,6 +88,12 @@ v775.o: v775.c v775.h
 v1720e.o: v1720e.c v1720e.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
+rpv130.o: rpv130.cxx rpv130.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+test_rpv130_status.o: test_rpv130_status.cxx rpv130.h caenvme.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 
 clean:
-	rm -f fevme_test.o fevme_test_diag.o $(COMMON_OBJS) $(TARGET) $(DIAG_TARGET)
+	rm -f fevme_test.o fevme_test_diag.o test_rpv130_status.o $(COMMON_OBJS) $(TARGET) $(DIAG_TARGET) $(RPV130_TEST_TARGET)

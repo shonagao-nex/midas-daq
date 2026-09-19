@@ -96,6 +96,9 @@ void v775_Status(MVME_INTERFACE *mvme, DWORD base)
     printf("  Buffer Full:  %s\n",
            status2 & V775_STATUS2_BUFFER_FULL ? "Y" : "N");
     printf("Bit Set 2: 0x%04x\n", bitset2);
+    printf("  VALID=0 datum write: %s (invalid datum %s buffer)\n",
+           bitset2 & V775_BIT2_VALID_CONTROL ? "ENABLED" : "DISABLED",
+           bitset2 & V775_BIT2_VALID_CONTROL ? "is written to" : "is not written to");
     printf("  Common Start/Stop: %s\n",
            bitset2 & V775_BIT2_COMMON_STOP ? "Common Stop" : "Common Start");
     printf("  Empty Program: %s\n",

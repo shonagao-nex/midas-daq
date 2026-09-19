@@ -8,6 +8,7 @@
 #include "vme/v792.h"
 #include "v775.h"
 #include "v1720e.h"
+#include "rpv130.h"
 
 /* Module locations. */
 #define V792_BASE 0x00600000
@@ -44,10 +45,10 @@ static const WORD V792_BIT2_ALL_TRIGGER = 0x4000;
 static const WORD V775_RUN_FULL_SCALE = 0x00FF; // nominal 140 ns / 35 ps LSB
 static const WORD V775_RUN_SET_BITS = V775_BIT2_OVER_RANGE |
                                        V775_BIT2_LOW_THRESHOLD |
-                                       V775_BIT2_VALID_CONTROL |
                                        V775_BIT2_COMMON_STOP |
                                        V775_BIT2_EMPTY_PROGRAM;
-static const WORD V775_RUN_CLEAR_BITS = V775_BIT2_SLIDE_ENABLE |
+static const WORD V775_RUN_CLEAR_BITS = V775_BIT2_VALID_CONTROL |
+                                         V775_BIT2_SLIDE_ENABLE |
                                          V775_BIT2_ALL_TRIGGER;
 
 /* Finite ready/handshake polling limits. */
@@ -112,7 +113,7 @@ static const size_t V1190_CHANNEL_MASK_WORDS = 8;
 const char *frontend_name = "fe_vme_test";      // MIDAS frontend name
 const char *frontend_file_name = __FILE__;      // Frontend source file name
 
-BOOL frontend_call_loop = FALSE;                // Disable periodic call to frontend_loop()
+BOOL frontend_call_loop = TRUE;                 // Enable periodic read-only status monitoring
 BOOL equipment_common_overwrite = TRUE;         // Apply polled/run-only settings to existing ODB equipment
 INT display_period = 1000;                      // MIDAS status display update period [ms]
 INT max_event_size = 1024 * 1024;               // Maximum event size [bytes]
@@ -121,6 +122,50 @@ INT event_buffer_size = 10 * 1024 * 1024;       // MIDAS event buffer size [byte
 
 static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
+static const DWORD RPV130_POLL_PERIOD_MS = 5000;
+static DWORD gRpv130LastPoll = 0;
+static const char *RPV130_ODB_PATH = "/Equipment/VME/Variables/RPV130";
+
+static bool set_odb_value(const char *name, const void *value, INT size, DWORD type)
+{
+    HNDLE hDB = 0;
+    cm_get_experiment_database(&hDB, NULL);
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", RPV130_ODB_PATH, name);
+    const INT result = db_set_value(hDB, 0, path, value, size, 1, type);
+    if (result != DB_SUCCESS)
+        cm_msg(MERROR, frontend_name, "Cannot update ODB %s: status %d", path, result);
+    return result == DB_SUCCESS;
+}
+
+static void publish_rpv130_status(bool force)
+{
+    if (!gVme)
+        return;
+    const DWORD now = ss_millitime();
+    if (!force && static_cast<DWORD>(now - gRpv130LastPoll) < RPV130_POLL_PERIOD_MS)
+        return;
+    gRpv130LastPoll = now;
+
+    RPV130_STATUS status = {};
+    const INT read_result = rpv130_read_status(gVme, RPV130_BASE_ADDRESS, &status);
+    const BOOL communication_ok = read_result == MVME_SUCCESS;
+    const DWORD base_address = RPV130_BASE_ADDRESS;
+    set_odb_value("Base Address", &base_address, sizeof(base_address), TID_DWORD);
+    set_odb_value("Latch1", &status.latch1, sizeof(status.latch1), TID_BYTE);
+    set_odb_value("Latch2", &status.latch2, sizeof(status.latch2), TID_BYTE);
+    set_odb_value("RSFF", &status.rsff, sizeof(status.rsff), TID_BYTE);
+    set_odb_value("Through", &status.through, sizeof(status.through), TID_BYTE);
+    set_odb_value("CSR1", &status.csr1, sizeof(status.csr1), TID_BYTE);
+    set_odb_value("CSR2", &status.csr2, sizeof(status.csr2), TID_BYTE);
+    if (!communication_ok) {
+        cm_msg(MERROR, frontend_name,
+               "RPV130 read-only status poll failed at base 0x%04X: status %d",
+               RPV130_BASE_ADDRESS, read_result);
+    }
+    set_odb_value("Communication OK", &communication_ok,
+                  sizeof(communication_ok), TID_BOOL);
+}
 
 struct RunStatistics {
     uint64_t counter_mismatch_count;
@@ -1171,6 +1216,8 @@ static bool verify_v775_configuration()
     bool ok = verify_value("V775", "Full Scale Range", V775_RUN_FULL_SCALE, fsr & 0xFF);
     ok = verify_value("V775", "required set bits", V775_RUN_SET_BITS,
                       bits & V775_RUN_SET_BITS) && ok;
+    ok = verify_value("V775", "VALID=0 datum write disabled", 0,
+                      !!(bits & V775_BIT2_VALID_CONTROL)) && ok;
     return verify_value("V775", "required clear bits", 0,
                         bits & V775_RUN_CLEAR_BITS) && ok;
 }
@@ -1378,6 +1425,7 @@ INT frontend_init()
     mvme_set_dmode(gVme, MVME_DMODE_D16);
 
     printf("VME interface opened.\n");
+    publish_rpv130_status(true);
     if (!check_module_communication()) {
         mvme_close(gVme);
         gVme = NULL;
@@ -1505,9 +1553,10 @@ INT resume_run(INT run_number, char *error)
 }
 
 
-/* Periodic frontend loop; disabled because frontend_call_loop is FALSE. */
+/* Poll RPV130 status outside the DAQ event readout path. */
 INT frontend_loop()
 {
+    publish_rpv130_status(false);
     return SUCCESS;
 }
 
