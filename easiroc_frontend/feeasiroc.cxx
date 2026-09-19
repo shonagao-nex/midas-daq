@@ -13,8 +13,10 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -30,6 +32,8 @@ constexpr char kSettingsPath[] = "/Equipment/EASIROC/Settings";
 constexpr char kInfoPath[] = "/Equipment/EASIROC/Info";
 constexpr char kReadbackPath[] = "/Equipment/EASIROC/Readback";
 constexpr char kVariablesPath[] = "/Equipment/EASIROC/Variables";
+constexpr char kRunSnapshotPath[] = "/Equipment/EASIROC/RunSnapshot";
+constexpr DWORD kRunSnapshotSchemaVersion = 1;
 constexpr int kReceiveTimeoutMs = 100;
 constexpr int kDrainQuietMs = 100;
 constexpr int kDrainMaximumMs = 1000;
@@ -72,6 +76,28 @@ struct RuntimeState {
   RuntimeStatistics statistics;
 };
 
+struct FirmwareObservation {
+  bool valid = false;
+  easiroc::FirmwareVersion firmware;
+  std::string observed_ip_address;
+  std::uint64_t observed_at_unix_time = 0;
+  std::string observed_at_iso8601;
+  std::string source;
+};
+
+struct EasirocRunSnapshot {
+  DWORD schema_version = kRunSnapshotSchemaVersion;
+  std::string snapshot_id;
+  INT run_number = 0;
+  std::uint64_t bor_unix_time = 0;
+  std::string bor_time_iso8601;
+  std::string frontend_name = "feeasiroc";
+  bool frontend_bor_complete = false;
+  bool enabled_for_run = false;
+  FrontendSettings requested;
+  FirmwareObservation firmware;
+};
+
 // This state is passive: construction and destruction perform no hardware
 // access. All communication is explicit in BOR, polling, and cleanup paths.
 struct FrontendState {
@@ -85,6 +111,8 @@ struct FrontendState {
   std::deque<easiroc::DecodedEvent> pending_events;
   bool daq_start_attempted = false;
   RuntimeState runtime;
+  FirmwareObservation firmware_observation;
+  EasirocRunSnapshot run_snapshot;
 
   // Connection points for the existing Slow Control policy. They are not
   // encoded or applied by this frontend.
@@ -95,9 +123,12 @@ struct FrontendState {
 FrontendState g_state;
 
 struct DiagnosticResult {
+  std::string host;
   bool rbcp_communication_ok = false;
   bool tcp_reachable = false;
   std::optional<easiroc::FirmwareVersion> firmware;
+  std::uint64_t firmware_observed_at_unix_time = 0;
+  std::string firmware_observed_at_iso8601;
   std::string error;
 };
 
@@ -143,6 +174,108 @@ bool set_odb_string(const std::string& path, const std::string& value,
   std::vector<char> buffer(capacity, '\0');
   std::copy(bounded.begin(), bounded.end(), buffer.begin());
   return set_odb_value(path, buffer.data(), buffer.size(), 1, TID_STRING);
+}
+
+std::string formatIso8601Utc(std::time_t value) {
+  std::tm utc{};
+  char buffer[32] = {};
+  if (gmtime_r(&value, &utc) == nullptr ||
+      std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
+    return {};
+  return buffer;
+}
+
+void reset_run_snapshot(INT run_number) {
+  g_state.run_snapshot = {};
+  auto& snapshot = g_state.run_snapshot;
+  snapshot.schema_version = kRunSnapshotSchemaVersion;
+  snapshot.run_number = run_number;
+  const std::time_t now = std::time(nullptr);
+  snapshot.bor_unix_time =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  snapshot.bor_time_iso8601 = formatIso8601Utc(now);
+  snapshot.frontend_name = "feeasiroc";
+  snapshot.snapshot_id =
+      "run-" + std::to_string(run_number) + "_" +
+      std::to_string(snapshot.bor_unix_time) + "_feeasiroc";
+}
+
+bool publish_run_snapshot() {
+  const auto& snapshot = g_state.run_snapshot;
+  const std::string metadata = odb_path(kRunSnapshotPath, "Metadata");
+  const std::string requested = odb_path(kRunSnapshotPath, "Requested");
+  const std::string firmware = odb_path(kRunSnapshotPath, "Readback/Firmware");
+  const BOOL enabled_for_run = snapshot.enabled_for_run ? TRUE : FALSE;
+  const BOOL requested_enabled = snapshot.requested.enabled ? TRUE : FALSE;
+  const BOOL adc = snapshot.requested.enables.adc ? TRUE : FALSE;
+  const BOOL tdc = snapshot.requested.enables.tdc ? TRUE : FALSE;
+  const BOOL scaler = snapshot.requested.enables.scaler ? TRUE : FALSE;
+  const BOOL firmware_valid = snapshot.firmware.valid ? TRUE : FALSE;
+  bool ok = true;
+  ok = set_odb_value(odb_path(metadata.c_str(), "SchemaVersion"),
+                     &snapshot.schema_version, sizeof(snapshot.schema_version),
+                     1, TID_DWORD) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "SnapshotId"),
+                      snapshot.snapshot_id, 128) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "RunNumber"),
+                     &snapshot.run_number, sizeof(snapshot.run_number), 1,
+                     TID_INT) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "BORUnixTime"),
+                     &snapshot.bor_unix_time,
+                     sizeof(snapshot.bor_unix_time), 1, TID_QWORD) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "BORTimeISO8601"),
+                      snapshot.bor_time_iso8601, 32) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "FrontendName"),
+                      snapshot.frontend_name, 32) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "EnabledForRun"),
+                     &enabled_for_run, sizeof(enabled_for_run), 1, TID_BOOL) &&
+       ok;
+
+  ok = set_odb_value(odb_path(requested.c_str(), "Enabled"),
+                     &requested_enabled, sizeof(requested_enabled), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_string(odb_path(requested.c_str(), "IPAddress"),
+                      snapshot.requested.ip_address, 64) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "ADCEnabled"), &adc,
+                     sizeof(adc), 1, TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "TDCEnabled"), &tdc,
+                     sizeof(tdc), 1, TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "ScalerEnabled"), &scaler,
+                     sizeof(scaler), 1, TID_BOOL) && ok;
+
+  ok = set_odb_value(odb_path(firmware.c_str(), "Valid"), &firmware_valid,
+                     sizeof(firmware_valid), 1, TID_BOOL) && ok;
+  const std::string version = snapshot.firmware.valid
+                                  ? snapshot.firmware.firmware.versionString()
+                                  : std::string();
+  const std::string synthesis_date =
+      snapshot.firmware.valid
+          ? snapshot.firmware.firmware.synthesisDateString()
+          : std::string();
+  ok = set_odb_string(odb_path(firmware.c_str(), "Version"), version, 64) && ok;
+  ok = set_odb_string(odb_path(firmware.c_str(), "SynthesisDate"),
+                      synthesis_date, 64) && ok;
+  ok = set_odb_value(odb_path(firmware.c_str(), "Raw"),
+                     snapshot.firmware.firmware.raw.data(),
+                     snapshot.firmware.firmware.raw.size(),
+                     snapshot.firmware.firmware.raw.size(), TID_BYTE) && ok;
+  ok = set_odb_value(odb_path(firmware.c_str(), "ObservedAtUnixTime"),
+                     &snapshot.firmware.observed_at_unix_time,
+                     sizeof(snapshot.firmware.observed_at_unix_time), 1,
+                     TID_QWORD) && ok;
+  ok = set_odb_string(odb_path(firmware.c_str(), "ObservedAtISO8601"),
+                      snapshot.firmware.observed_at_iso8601, 32) && ok;
+  ok = set_odb_string(odb_path(firmware.c_str(), "Source"),
+                      snapshot.firmware.source, 32) && ok;
+  /* Publish the completion marker last. If any preceding write failed,
+   * leave the fixed subtree explicitly incomplete. */
+  const BOOL published_complete =
+      (snapshot.frontend_bor_complete && ok) ? TRUE : FALSE;
+  const bool complete_ok = set_odb_value(
+      odb_path(metadata.c_str(), "FrontendBORComplete"), &published_complete,
+      sizeof(published_complete), 1, TID_BOOL);
+  ok = complete_ok && ok;
+  return ok;
 }
 
 bool publish_runtime_variables() {
@@ -251,7 +384,8 @@ bool initialize_odb() {
       !set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"), empty_raw.data(),
                      empty_raw.size(), empty_raw.size(), TID_BYTE))
     return false;
-  return publish_runtime_variables();
+  reset_run_snapshot(0);
+  return publish_runtime_variables() && publish_run_snapshot();
 }
 
 INT read_bool_setting(const char* name, bool* value) {
@@ -320,15 +454,21 @@ void reset_software_readout_state() {
 void set_disabled_runtime_state() {
   reset_software_readout_state();
   g_state.runtime = {};
+  g_state.firmware_observation = {};
   set_firmware_readback_valid(false);
 }
 
 void run_diagnostic(std::string host) {
   DiagnosticResult result;
+  result.host = host;
 
   try {
     const auto firmware = easiroc::readFirmwareVersion(host);
     result.firmware = firmware;
+    const std::time_t observed = std::time(nullptr);
+    result.firmware_observed_at_unix_time =
+        observed < 0 ? 0 : static_cast<std::uint64_t>(observed);
+    result.firmware_observed_at_iso8601 = formatIso8601Utc(observed);
     result.rbcp_communication_ok = true;
   } catch (const std::exception& error) {
     result.error = std::string("RBCP firmware read: ") + error.what();
@@ -375,6 +515,7 @@ void publish_completed_diagnostic() {
   const BOOL invalid = FALSE;
   const std::string valid_path = odb_path(kReadbackPath, "Firmware/Valid");
   set_odb_value(valid_path, &invalid, sizeof(invalid), 1, TID_BOOL);
+  g_state.firmware_observation = {};
   if (result->firmware) {
     const auto& firmware = *result->firmware;
     bool readback_ok =
@@ -390,6 +531,14 @@ void publish_completed_diagnostic() {
     if (readback_ok) {
       const BOOL valid = TRUE;
       set_odb_value(valid_path, &valid, sizeof(valid), 1, TID_BOOL);
+      g_state.firmware_observation.valid = true;
+      g_state.firmware_observation.firmware = firmware;
+      g_state.firmware_observation.observed_ip_address = result->host;
+      g_state.firmware_observation.observed_at_unix_time =
+          result->firmware_observed_at_unix_time;
+      g_state.firmware_observation.observed_at_iso8601 =
+          result->firmware_observed_at_iso8601;
+      g_state.firmware_observation.source = "StoppedDiagnostic";
     }
   }
 
@@ -473,6 +622,22 @@ void handle_acquisition_error(const std::string& message) {
            transition_error);
 }
 
+bool finalize_run_snapshot(const FrontendSettings& settings) {
+  auto& snapshot = g_state.run_snapshot;
+  snapshot.requested = settings;
+  snapshot.enabled_for_run = settings.enabled;
+  snapshot.firmware =
+      settings.enabled && g_state.firmware_observation.valid &&
+              g_state.firmware_observation.observed_ip_address ==
+                  settings.ip_address
+          ? g_state.firmware_observation
+          : FirmwareObservation{};
+  snapshot.frontend_bor_complete = true;
+  if (publish_run_snapshot()) return true;
+  snapshot.frontend_bor_complete = false;
+  return false;
+}
+
 }  // namespace
 
 const char* frontend_name = "feeasiroc";
@@ -485,6 +650,7 @@ INT event_buffer_size = 2 * 1024 * 1024;
 
 INT read_physics_event(char*, INT);
 INT read_status_event(char*, INT);
+INT read_configuration_event(char*, INT);
 INT poll_event(INT source, INT count, BOOL test);
 
 BOOL equipment_common_overwrite = TRUE;
@@ -503,6 +669,10 @@ EQUIPMENT equipment[] = {
       RO_RUNNING | RO_STOPPED | RO_PAUSED, 10000, 0, 0, 0, "", "", "", "",
       "", FALSE},
      read_status_event},
+    {"EASIROC Configuration",
+     {6, 0, "SYSTEM", EQ_PERIODIC, 0, "MIDAS", TRUE, RO_BOR, 0, 0, 0, 0,
+      "", "", "", "", "", FALSE},
+     read_configuration_event},
     {""}};
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -543,6 +713,7 @@ INT frontend_exit() {
 
 INT begin_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  reset_run_snapshot(run_number);
 
   // The read-only startup diagnostic must not share TCP/RBCP access with an
   // active acquisition.
@@ -561,6 +732,13 @@ INT begin_of_run(INT run_number, char* error) {
   g_state.run_active = true;
   if (!run_settings.enabled) {
     set_disabled_runtime_state();
+    if (!finalize_run_snapshot(run_settings)) {
+      g_state.run_active = false;
+      if (error != nullptr)
+        std::snprintf(error, 256,
+                      "Cannot publish completed EASIROC RunSnapshot");
+      return FE_ERR_ODB;
+    }
     publish_runtime_variables();
     cm_msg(MINFO, "begin_of_run",
            "Run %d: NIM-EASIROC disabled by BOR Settings snapshot; "
@@ -631,6 +809,20 @@ INT begin_of_run(INT run_number, char* error) {
     g_state.runtime.acquisition_running = true;
     g_state.runtime.acquisition_fault = false;
     g_state.runtime.last_error.clear();
+    if (!finalize_run_snapshot(run_settings)) {
+      const CleanupResult cleanup = stop_acquisition("begin_of_run", false);
+      g_state.run_active = false;
+      g_state.runtime.acquisition_fault = true;
+      g_state.runtime.last_error =
+          "Cannot publish completed EASIROC RunSnapshot";
+      if (!cleanup.error.empty())
+        g_state.runtime.last_error += "; " + cleanup.error;
+      publish_runtime_variables();
+      if (error != nullptr)
+        std::snprintf(error, 256, "%s",
+                      g_state.runtime.last_error.c_str());
+      return FE_ERR_ODB;
+    }
     publish_runtime_variables();
     return SUCCESS;
   } catch (const std::exception& exception) {
@@ -803,4 +995,44 @@ INT read_status_event(char*, INT) {
   // Status is published directly into ODB. Returning zero suppresses an empty
   // MIDAS event; no TCP stream data is received here.
   return 0;
+}
+
+INT read_configuration_event(char* pevent, INT) {
+  if (!g_state.run_snapshot.frontend_bor_complete) return 0;
+
+  HNDLE key = 0;
+  const INT find_status = db_find_key(hDB, 0, kRunSnapshotPath, &key);
+  if (find_status != DB_SUCCESS) {
+    cm_msg(MERROR, "read_configuration_event",
+           "Cannot find completed EASIROC RunSnapshot: status %d",
+           find_status);
+    return 0;
+  }
+
+  char* json = nullptr;
+  int json_capacity = 0;
+  int json_length = 0;
+  const INT json_status =
+      db_copy_json_save(hDB, key, &json, &json_capacity, &json_length);
+  if (json_status != DB_SUCCESS || json == nullptr || json_length <= 0) {
+    cm_msg(MERROR, "read_configuration_event",
+           "Cannot serialize EASIROC RunSnapshot JSON: status %d length %d",
+           json_status, json_length);
+    std::free(json);
+    return 0;
+  }
+  if (json_length > max_event_size - 64) {
+    cm_msg(MERROR, "read_configuration_event",
+           "EASIROC RunSnapshot JSON is too large: %d bytes", json_length);
+    std::free(json);
+    return 0;
+  }
+
+  bk_init32(pevent);
+  char* data = nullptr;
+  bk_create(pevent, "ECFG", TID_CHAR, reinterpret_cast<void**>(&data));
+  std::memcpy(data, json, static_cast<std::size_t>(json_length));
+  bk_close(pevent, data + json_length);
+  std::free(json);
+  return bk_size(pevent);
 }

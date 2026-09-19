@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "midas.h"
 #include "mfe.h"
@@ -130,6 +132,8 @@ static DWORD gRpv130LastPoll = 0;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
+static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
+static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
 static bool gRpv130EnabledForRun = true;
 
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
@@ -311,6 +315,83 @@ struct V775Settings {
     BOOL all_trigger_enabled;
 };
 
+struct V792ReadbackSnapshot {
+    BOOL valid;
+    WORD firmware_revision;
+    WORD iped;
+    BOOL zero_suppression_enabled;
+    BOOL all_trigger_enabled;
+    WORD bit_set2_raw;
+    WORD threshold[32];
+};
+
+struct V1190ReadbackSnapshot {
+    BOOL valid;
+    WORD firmware_revision;
+    WORD configuration_rom_version;
+    char board_type[32];
+    V1190Settings settings;
+    WORD error_mask;
+    DWORD effective_fifo_size_words;
+    WORD control_raw;
+};
+
+struct V775ReadbackSnapshot {
+    BOOL valid;
+    WORD firmware_revision;
+    WORD full_scale_range;
+    WORD fast_clear_window;
+    BOOL over_range_enabled;
+    BOOL low_threshold_enabled;
+    BOOL common_stop;
+    BOOL empty_program_enabled;
+    BOOL valid_control_enabled;
+    BOOL sliding_scale_enabled;
+    BOOL all_trigger_enabled;
+    WORD bit_set2_raw;
+    WORD threshold[32];
+};
+
+struct V1720EReadbackSnapshot {
+    BOOL valid;
+    DWORD board_info;
+    DWORD roc_firmware_revision;
+    DWORD buffer_organization;
+    DWORD custom_size_raw;
+    DWORD record_length_samples;
+    DWORD post_trigger;
+    BOOL software_trigger_enabled;
+    BOOL external_trigger_enabled;
+    BOOL channel_self_trigger_enabled[V1720E_CHANNEL_COUNT];
+    BOOL channel_enabled[V1720E_CHANNEL_COUNT];
+    WORD dc_offset[V1720E_CHANNEL_COUNT];
+    BOOL zero_suppression_enabled;
+    BOOL pack25_enabled;
+    DWORD trigger_source_raw;
+    DWORD channel_enable_raw;
+    DWORD channel_config_raw;
+};
+
+struct VmeRunSnapshot {
+    DWORD schema_version;
+    char snapshot_id[128];
+    INT run_number;
+    uint64_t bor_unix_time;
+    char bor_time_iso8601[32];
+    char frontend_name[32];
+    BOOL frontend_bor_complete;
+    BOOL enabled_for_run;
+    V792Settings v792_requested;
+    V1190Settings v1190_requested;
+    V775Settings v775_requested;
+    V1720ESettings v1720e_requested;
+    BOOL rpv130_enabled;
+    V792ReadbackSnapshot v792_readback;
+    V1190ReadbackSnapshot v1190_readback;
+    V775ReadbackSnapshot v775_readback;
+    V1720EReadbackSnapshot v1720e_readback;
+};
+
 struct V7xxRuntimeState {
     BOOL enabled_for_run;
     BOOL communication_ok;
@@ -388,6 +469,7 @@ static V775Settings default_v775_settings()
 static V792Settings gV792RunSettings = default_v792_settings();
 static V1190Settings gV1190RunSettings = default_v1190_settings();
 static V775Settings gV775RunSettings = default_v775_settings();
+static VmeRunSnapshot gVmeRunSnapshot = {};
 static V7xxRuntimeState gV792Runtime = {};
 static V1190RuntimeState gV1190Runtime = {};
 static V7xxRuntimeState gV775Runtime = {};
@@ -402,6 +484,253 @@ static bool set_module_output(const char *base, const char *name,
     char path[256];
     return make_odb_path(path, sizeof(path), base, name) &&
            set_absolute_odb_value(path, value, size, count, type);
+}
+
+static bool set_vme_snapshot_value(const char *relative_path,
+                                   const void *value, INT size, INT count,
+                                   DWORD type)
+{
+    char path[320];
+    return make_odb_path(path, sizeof(path), VME_RUN_SNAPSHOT_PATH,
+                         relative_path) &&
+           set_absolute_odb_value(path, value, size, count, type);
+}
+
+static void format_iso8601_utc(time_t value, char *buffer, size_t capacity)
+{
+    struct tm utc = {};
+    if (gmtime_r(&value, &utc) == NULL ||
+        strftime(buffer, capacity, "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
+        buffer[0] = '\0';
+}
+
+static void reset_vme_run_snapshot(INT run_number)
+{
+    gVmeRunSnapshot = {};
+    gVmeRunSnapshot.schema_version = RUN_SNAPSHOT_SCHEMA_VERSION;
+    gVmeRunSnapshot.run_number = run_number;
+    const time_t now = time(NULL);
+    gVmeRunSnapshot.bor_unix_time =
+        now < 0 ? 0 : static_cast<uint64_t>(now);
+    format_iso8601_utc(now, gVmeRunSnapshot.bor_time_iso8601,
+                       sizeof(gVmeRunSnapshot.bor_time_iso8601));
+    snprintf(gVmeRunSnapshot.frontend_name,
+             sizeof(gVmeRunSnapshot.frontend_name), "%s", frontend_name);
+    snprintf(gVmeRunSnapshot.snapshot_id,
+             sizeof(gVmeRunSnapshot.snapshot_id), "run-%d_%llu_%s",
+             run_number,
+             static_cast<unsigned long long>(gVmeRunSnapshot.bor_unix_time),
+             frontend_name);
+    snprintf(gVmeRunSnapshot.v1190_readback.board_type,
+             sizeof(gVmeRunSnapshot.v1190_readback.board_type), "Unknown");
+}
+
+static bool publish_vme_run_snapshot()
+{
+    bool ok = true;
+#define SNAP(path, value, count, type) \
+    do { \
+        ok = set_vme_snapshot_value(path, &(value), sizeof(value), count, type) \
+             && ok; \
+    } while (0)
+#define SNAP_STRING(path, value) \
+    do { \
+        ok = set_vme_snapshot_value(path, value, sizeof(value), 1, TID_STRING) \
+             && ok; \
+    } while (0)
+    SNAP("Metadata/SchemaVersion", gVmeRunSnapshot.schema_version, 1,
+         TID_DWORD);
+    SNAP_STRING("Metadata/SnapshotId", gVmeRunSnapshot.snapshot_id);
+    SNAP("Metadata/RunNumber", gVmeRunSnapshot.run_number, 1, TID_INT);
+    SNAP("Metadata/BORUnixTime", gVmeRunSnapshot.bor_unix_time, 1,
+         TID_QWORD);
+    SNAP_STRING("Metadata/BORTimeISO8601",
+                gVmeRunSnapshot.bor_time_iso8601);
+    SNAP_STRING("Metadata/FrontendName", gVmeRunSnapshot.frontend_name);
+    SNAP("Metadata/EnabledForRun", gVmeRunSnapshot.enabled_for_run, 1,
+         TID_BOOL);
+
+#define SNAP_V792(base, object) \
+    SNAP(base "/Enabled", object.enabled, 1, TID_BOOL); \
+    SNAP(base "/Iped", object.iped, 1, TID_WORD); \
+    SNAP(base "/ZeroSuppressionEnabled", object.zero_suppression_enabled, 1, TID_BOOL); \
+    SNAP(base "/AllTriggerEnabled", object.all_trigger_enabled, 1, TID_BOOL)
+    SNAP_V792("Requested/V792", gVmeRunSnapshot.v792_requested);
+#undef SNAP_V792
+
+#define SNAP_V1190(base, object) \
+    SNAP(base "/Enabled", object.enabled, 1, TID_BOOL); \
+    SNAP(base "/TriggerMatchingEnabled", object.trigger_matching_enabled, 1, TID_BOOL); \
+    SNAP(base "/WindowWidth", object.window_width, 1, TID_DWORD); \
+    SNAP(base "/WindowOffset", object.window_offset, 1, TID_INT); \
+    SNAP(base "/ExtraSearchMargin", object.extra_search_margin, 1, TID_DWORD); \
+    SNAP(base "/RejectMargin", object.reject_margin, 1, TID_DWORD); \
+    SNAP(base "/TriggerSubtractionEnabled", object.trigger_subtraction_enabled, 1, TID_BOOL); \
+    SNAP(base "/EdgeMode", object.edge_mode, 1, TID_DWORD); \
+    SNAP(base "/ResolutionPs", object.resolution_ps, 1, TID_DWORD); \
+    SNAP(base "/DeadTimeNs", object.dead_time_ns, 1, TID_DWORD); \
+    SNAP(base "/MaxHitsPerEvent", object.max_hits_per_event, 1, TID_INT); \
+    SNAP(base "/TdcHeaderEnabled", object.tdc_header_enabled, 1, TID_BOOL); \
+    SNAP(base "/EmptyEventEnabled", object.empty_event_enabled, 1, TID_BOOL); \
+    SNAP(base "/EventFifoEnabled", object.event_fifo_enabled, 1, TID_BOOL); \
+    SNAP(base "/ExtendedTriggerTimeEnabled", object.extended_trigger_time_enabled, 1, TID_BOOL); \
+    SNAP(base "/ChannelEnabled", object.channel_enabled, 128, TID_BOOL)
+    SNAP_V1190("Requested/V1190", gVmeRunSnapshot.v1190_requested);
+#undef SNAP_V1190
+
+#define SNAP_V775(base, object) \
+    SNAP(base "/Enabled", object.enabled, 1, TID_BOOL); \
+    SNAP(base "/FullScaleRange", object.full_scale_range, 1, TID_WORD); \
+    SNAP(base "/OverRangeEnabled", object.over_range_enabled, 1, TID_BOOL); \
+    SNAP(base "/LowThresholdEnabled", object.low_threshold_enabled, 1, TID_BOOL); \
+    SNAP(base "/CommonStop", object.common_stop, 1, TID_BOOL); \
+    SNAP(base "/EmptyProgramEnabled", object.empty_program_enabled, 1, TID_BOOL); \
+    SNAP(base "/ValidControlEnabled", object.valid_control_enabled, 1, TID_BOOL); \
+    SNAP(base "/SlidingScaleEnabled", object.sliding_scale_enabled, 1, TID_BOOL); \
+    SNAP(base "/AllTriggerEnabled", object.all_trigger_enabled, 1, TID_BOOL)
+    SNAP_V775("Requested/V775", gVmeRunSnapshot.v775_requested);
+#undef SNAP_V775
+
+    SNAP("Requested/V1720E/Enabled", gVmeRunSnapshot.v1720e_requested.enabled,
+         1, TID_BOOL);
+    SNAP("Requested/V1720E/BufferOrganization",
+         gVmeRunSnapshot.v1720e_requested.buffer_organization, 1, TID_DWORD);
+    SNAP("Requested/V1720E/RecordLengthSamples",
+         gVmeRunSnapshot.v1720e_requested.record_length_samples, 1,
+         TID_DWORD);
+    SNAP("Requested/V1720E/PostTrigger",
+         gVmeRunSnapshot.v1720e_requested.post_trigger, 1, TID_DWORD);
+    SNAP("Requested/V1720E/SoftwareTriggerEnabled",
+         gVmeRunSnapshot.v1720e_requested.software_trigger_enabled, 1,
+         TID_BOOL);
+    SNAP("Requested/V1720E/ExternalTriggerEnabled",
+         gVmeRunSnapshot.v1720e_requested.external_trigger_enabled, 1,
+         TID_BOOL);
+    SNAP("Requested/V1720E/ChannelSelfTriggerEnabled",
+         gVmeRunSnapshot.v1720e_requested.channel_self_trigger_enabled,
+         V1720E_CHANNEL_COUNT, TID_BOOL);
+    SNAP("Requested/V1720E/ChannelEnabled",
+         gVmeRunSnapshot.v1720e_requested.channel_enabled,
+         V1720E_CHANNEL_COUNT, TID_BOOL);
+    SNAP("Requested/V1720E/DCOffset",
+         gVmeRunSnapshot.v1720e_requested.dc_offset, V1720E_CHANNEL_COUNT,
+         TID_WORD);
+    SNAP("Requested/RPV130/Enabled", gVmeRunSnapshot.rpv130_enabled, 1,
+         TID_BOOL);
+
+    SNAP("Readback/V792/Valid", gVmeRunSnapshot.v792_readback.valid, 1,
+         TID_BOOL);
+    SNAP("Readback/V792/FirmwareRevision",
+         gVmeRunSnapshot.v792_readback.firmware_revision, 1, TID_WORD);
+    SNAP("Readback/V792/Iped", gVmeRunSnapshot.v792_readback.iped, 1,
+         TID_WORD);
+    SNAP("Readback/V792/ZeroSuppressionEnabled",
+         gVmeRunSnapshot.v792_readback.zero_suppression_enabled, 1,
+         TID_BOOL);
+    SNAP("Readback/V792/AllTriggerEnabled",
+         gVmeRunSnapshot.v792_readback.all_trigger_enabled, 1, TID_BOOL);
+    SNAP("Readback/V792/BitSet2Raw",
+         gVmeRunSnapshot.v792_readback.bit_set2_raw, 1, TID_WORD);
+    SNAP("Readback/V792/Threshold",
+         gVmeRunSnapshot.v792_readback.threshold, 32, TID_WORD);
+
+    const V1190ReadbackSnapshot &r1190 = gVmeRunSnapshot.v1190_readback;
+    SNAP("Readback/V1190/Valid", r1190.valid, 1, TID_BOOL);
+    SNAP("Readback/V1190/FirmwareRevision", r1190.firmware_revision, 1,
+         TID_WORD);
+    SNAP("Readback/V1190/ConfigurationRomVersion",
+         r1190.configuration_rom_version, 1, TID_WORD);
+    SNAP_STRING("Readback/V1190/BoardType", r1190.board_type);
+#define SNAP_R1190(name, member, count, type) \
+    SNAP("Readback/V1190/" name, r1190.settings.member, count, type)
+    SNAP_R1190("TriggerMatchingEnabled", trigger_matching_enabled, 1, TID_BOOL);
+    SNAP_R1190("WindowWidth", window_width, 1, TID_DWORD);
+    SNAP_R1190("WindowOffset", window_offset, 1, TID_INT);
+    SNAP_R1190("ExtraSearchMargin", extra_search_margin, 1, TID_DWORD);
+    SNAP_R1190("RejectMargin", reject_margin, 1, TID_DWORD);
+    SNAP_R1190("TriggerSubtractionEnabled", trigger_subtraction_enabled, 1, TID_BOOL);
+    SNAP_R1190("EdgeMode", edge_mode, 1, TID_DWORD);
+    SNAP_R1190("ResolutionPs", resolution_ps, 1, TID_DWORD);
+    SNAP_R1190("DeadTimeNs", dead_time_ns, 1, TID_DWORD);
+    SNAP_R1190("MaxHitsPerEvent", max_hits_per_event, 1, TID_INT);
+    SNAP_R1190("TdcHeaderEnabled", tdc_header_enabled, 1, TID_BOOL);
+    SNAP_R1190("EmptyEventEnabled", empty_event_enabled, 1, TID_BOOL);
+    SNAP_R1190("EventFifoEnabled", event_fifo_enabled, 1, TID_BOOL);
+    SNAP_R1190("ExtendedTriggerTimeEnabled", extended_trigger_time_enabled, 1, TID_BOOL);
+    SNAP_R1190("ChannelEnabled", channel_enabled, 128, TID_BOOL);
+#undef SNAP_R1190
+    SNAP("Readback/V1190/ErrorMask", r1190.error_mask, 1, TID_WORD);
+    SNAP("Readback/V1190/EffectiveFifoSizeWords",
+         r1190.effective_fifo_size_words, 1, TID_DWORD);
+    SNAP("Readback/V1190/ControlRaw", r1190.control_raw, 1, TID_WORD);
+
+    const V775ReadbackSnapshot &r775 = gVmeRunSnapshot.v775_readback;
+    SNAP("Readback/V775/Valid", r775.valid, 1, TID_BOOL);
+    SNAP("Readback/V775/FirmwareRevision", r775.firmware_revision, 1,
+         TID_WORD);
+    SNAP("Readback/V775/FullScaleRange", r775.full_scale_range, 1,
+         TID_WORD);
+    SNAP("Readback/V775/FastClearWindow", r775.fast_clear_window, 1,
+         TID_WORD);
+#define SNAP_R775(name, member, type) \
+    SNAP("Readback/V775/" name, r775.member, 1, type)
+    SNAP_R775("OverRangeEnabled", over_range_enabled, TID_BOOL);
+    SNAP_R775("LowThresholdEnabled", low_threshold_enabled, TID_BOOL);
+    SNAP_R775("CommonStop", common_stop, TID_BOOL);
+    SNAP_R775("EmptyProgramEnabled", empty_program_enabled, TID_BOOL);
+    SNAP_R775("ValidControlEnabled", valid_control_enabled, TID_BOOL);
+    SNAP_R775("SlidingScaleEnabled", sliding_scale_enabled, TID_BOOL);
+    SNAP_R775("AllTriggerEnabled", all_trigger_enabled, TID_BOOL);
+#undef SNAP_R775
+    SNAP("Readback/V775/BitSet2Raw", r775.bit_set2_raw, 1, TID_WORD);
+    SNAP("Readback/V775/Threshold", r775.threshold, 32, TID_WORD);
+
+    const V1720EReadbackSnapshot &r1720 = gVmeRunSnapshot.v1720e_readback;
+    SNAP("Readback/V1720E/Valid", r1720.valid, 1, TID_BOOL);
+    SNAP("Readback/V1720E/BoardInfo", r1720.board_info, 1, TID_DWORD);
+    SNAP("Readback/V1720E/RocFirmwareRevision",
+         r1720.roc_firmware_revision, 1, TID_DWORD);
+    SNAP("Readback/V1720E/BufferOrganization",
+         r1720.buffer_organization, 1, TID_DWORD);
+    SNAP("Readback/V1720E/CustomSizeRaw", r1720.custom_size_raw, 1,
+         TID_DWORD);
+    SNAP("Readback/V1720E/RecordLengthSamples",
+         r1720.record_length_samples, 1, TID_DWORD);
+    SNAP("Readback/V1720E/PostTrigger", r1720.post_trigger, 1, TID_DWORD);
+    SNAP("Readback/V1720E/SoftwareTriggerEnabled",
+         r1720.software_trigger_enabled, 1, TID_BOOL);
+    SNAP("Readback/V1720E/ExternalTriggerEnabled",
+         r1720.external_trigger_enabled, 1, TID_BOOL);
+    SNAP("Readback/V1720E/ChannelSelfTriggerEnabled",
+         r1720.channel_self_trigger_enabled, V1720E_CHANNEL_COUNT, TID_BOOL);
+    SNAP("Readback/V1720E/ChannelEnabled", r1720.channel_enabled,
+         V1720E_CHANNEL_COUNT, TID_BOOL);
+    SNAP("Readback/V1720E/DCOffset", r1720.dc_offset,
+         V1720E_CHANNEL_COUNT, TID_WORD);
+    SNAP("Readback/V1720E/ZeroSuppressionEnabled",
+         r1720.zero_suppression_enabled, 1, TID_BOOL);
+    SNAP("Readback/V1720E/Pack25Enabled", r1720.pack25_enabled, 1,
+         TID_BOOL);
+    SNAP("Readback/V1720E/TriggerSourceRaw", r1720.trigger_source_raw, 1,
+         TID_DWORD);
+    SNAP("Readback/V1720E/ChannelEnableRaw", r1720.channel_enable_raw, 1,
+         TID_DWORD);
+    SNAP("Readback/V1720E/ChannelConfigRaw", r1720.channel_config_raw, 1,
+         TID_DWORD);
+
+    /* Publish the completion marker last. If any preceding write failed,
+     * leave the fixed subtree explicitly incomplete. */
+    {
+        BOOL published_complete =
+            (gVmeRunSnapshot.frontend_bor_complete && ok) ? TRUE : FALSE;
+        const bool complete_ok = set_vme_snapshot_value(
+            "Metadata/FrontendBORComplete", &published_complete,
+            sizeof(published_complete), 1, TID_BOOL);
+        ok = complete_ok && ok;
+    }
+#undef SNAP_STRING
+#undef SNAP
+    return ok;
 }
 
 static bool initialize_rpv130_odb()
@@ -1924,6 +2253,40 @@ static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
     set_v1720e_readback_valid(valid);
 }
 
+static void capture_v1720e_run_readback(
+    const V1720E_CONFIG_READBACK &readback, bool valid)
+{
+    V1720EReadbackSnapshot &snapshot = gVmeRunSnapshot.v1720e_readback;
+    snapshot = {};
+    snapshot.valid = valid ? TRUE : FALSE;
+    snapshot.board_info = readback.board_info;
+    snapshot.roc_firmware_revision = readback.roc_firmware;
+    snapshot.buffer_organization = readback.buffer_organization;
+    snapshot.custom_size_raw = readback.custom_size;
+    snapshot.record_length_samples =
+        readback.custom_size == V1720E_DEFAULT_CUSTOM_SIZE
+            ? V1720E_DEFAULT_RECORD_SAMPLES : 0u;
+    snapshot.post_trigger = readback.post_trigger;
+    snapshot.software_trigger_enabled =
+        (readback.trigger_source & V1720E_TRIGGER_SOFTWARE) != 0;
+    snapshot.external_trigger_enabled =
+        (readback.trigger_source & V1720E_TRIGGER_EXTERNAL) != 0;
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        snapshot.channel_self_trigger_enabled[channel] =
+            (readback.trigger_source & (1u << channel)) != 0;
+        snapshot.channel_enabled[channel] =
+            (readback.channel_enable & (1u << channel)) != 0;
+        snapshot.dc_offset[channel] = readback.dc_offset[channel];
+    }
+    snapshot.zero_suppression_enabled =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK) != 0;
+    snapshot.pack25_enabled =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_PACK25) != 0;
+    snapshot.trigger_source_raw = readback.trigger_source;
+    snapshot.channel_enable_raw = readback.channel_enable;
+    snapshot.channel_config_raw = readback.channel_config;
+}
+
 static bool verify_v1720e_readback(const V1720E_CONFIG &expected,
                                    const V1720E_CONFIG_READBACK &actual)
 {
@@ -2126,6 +2489,20 @@ static bool snapshot_rpv130_enabled_for_run()
     return true;
 }
 
+static void capture_vme_requested_snapshot()
+{
+    gVmeRunSnapshot.v792_requested = gV792RunSettings;
+    gVmeRunSnapshot.v1190_requested = gV1190RunSettings;
+    gVmeRunSnapshot.v775_requested = gV775RunSettings;
+    gVmeRunSnapshot.v1720e_requested = gV1720RunSettings;
+    gVmeRunSnapshot.rpv130_enabled =
+        gRpv130EnabledForRun ? TRUE : FALSE;
+    gVmeRunSnapshot.enabled_for_run =
+        (gV792RunSettings.enabled || gV1190RunSettings.enabled ||
+         gV775RunSettings.enabled || gV1720RunSettings.enabled ||
+         gRpv130EnabledForRun) ? TRUE : FALSE;
+}
+
 static void publish_vme_enabled_for_run()
 {
     gV792Runtime.enabled_for_run = gV792RunSettings.enabled;
@@ -2314,6 +2691,7 @@ static bool configure_v1720e_for_run()
         return false;
     }
     const bool verified = verify_v1720e_readback(gV1720RunConfig, readback);
+    capture_v1720e_run_readback(readback, verified);
     publish_v1720e_readback(readback, verified);
     if (!verified) {
         set_v1720e_communication_ok(false);
@@ -2349,6 +2727,14 @@ static bool verify_v792_configuration()
     bool ok=verify_value("V792","Iped",gV792RunSettings.iped,iped&0xFF);
     ok=verify_value("V792","ZeroSuppression",gV792RunSettings.zero_suppression_enabled,zs)&&ok;
     ok=verify_value("V792","AllTrigger",gV792RunSettings.all_trigger_enabled,all)&&ok;
+    gVmeRunSnapshot.v792_readback.valid = ok ? TRUE : FALSE;
+    gVmeRunSnapshot.v792_readback.firmware_revision = firmware;
+    gVmeRunSnapshot.v792_readback.iped = iped;
+    gVmeRunSnapshot.v792_readback.zero_suppression_enabled = zs;
+    gVmeRunSnapshot.v792_readback.all_trigger_enabled = all;
+    gVmeRunSnapshot.v792_readback.bit_set2_raw = bits;
+    memcpy(gVmeRunSnapshot.v792_readback.threshold, thresholds,
+           sizeof(thresholds));
     set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
     set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
     set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zs,sizeof(zs),1,TID_BOOL);
@@ -2391,6 +2777,16 @@ static bool verify_v1190_configuration()
     rb.empty_event_enabled=!!(c.control&V1190_CONTROL_EMPTY_EVENT); rb.event_fifo_enabled=!!(c.control&V1190_CONTROL_EVENT_FIFO); rb.extended_trigger_time_enabled=!!(c.control&V1190_CONTROL_EXT_TRIGGER_TIME);
     for(unsigned i=0;i<128;++i) rb.channel_enabled[i]=!!(c.channels[i/16]&(1u<<(i%16)));
     const char *board=(c.rom_version&0xFF)==0?"V1190A":((c.rom_version&0xFF)==1?"V1190B":"Unknown");
+    gVmeRunSnapshot.v1190_readback.valid = ok ? TRUE : FALSE;
+    gVmeRunSnapshot.v1190_readback.firmware_revision = c.firmware;
+    gVmeRunSnapshot.v1190_readback.configuration_rom_version = c.rom_version;
+    snprintf(gVmeRunSnapshot.v1190_readback.board_type,
+             sizeof(gVmeRunSnapshot.v1190_readback.board_type), "%s", board);
+    gVmeRunSnapshot.v1190_readback.settings = rb;
+    gVmeRunSnapshot.v1190_readback.error_mask = c.error_mask & 0x7FF;
+    gVmeRunSnapshot.v1190_readback.effective_fifo_size_words =
+        (c.fifo_size & 0xF) <= 7 ? (1u << ((c.fifo_size & 0xF) + 1)) : 0;
+    gVmeRunSnapshot.v1190_readback.control_raw = c.control;
 #define P1190(k,m,cnt,t) set_module_output(V1190_READBACK_PATH,k,&rb.m,sizeof(rb.m),cnt,t)
     set_module_output(V1190_READBACK_PATH,"FirmwareRevision",&c.firmware,sizeof(c.firmware),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"ConfigurationRomVersion",&c.rom_version,sizeof(c.rom_version),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"BoardType",board,strlen(board)+1,1,TID_STRING);
     P1190("TriggerMatchingEnabled",trigger_matching_enabled,1,TID_BOOL); P1190("WindowWidth",window_width,1,TID_DWORD); P1190("WindowOffset",window_offset,1,TID_INT); P1190("ExtraSearchMargin",extra_search_margin,1,TID_DWORD); P1190("RejectMargin",reject_margin,1,TID_DWORD); P1190("TriggerSubtractionEnabled",trigger_subtraction_enabled,1,TID_BOOL); P1190("EdgeMode",edge_mode,1,TID_DWORD); P1190("ResolutionPs",resolution_ps,1,TID_DWORD); P1190("DeadTimeNs",dead_time_ns,1,TID_DWORD); P1190("MaxHitsPerEvent",max_hits_per_event,1,TID_INT); P1190("TdcHeaderEnabled",tdc_header_enabled,1,TID_BOOL); P1190("EmptyEventEnabled",empty_event_enabled,1,TID_BOOL); P1190("EventFifoEnabled",event_fifo_enabled,1,TID_BOOL); P1190("ExtendedTriggerTimeEnabled",extended_trigger_time_enabled,1,TID_BOOL); P1190("ChannelEnabled",channel_enabled,128,TID_BOOL);
@@ -2410,6 +2806,20 @@ static bool verify_v775_configuration()
 #define VV775(name,member,bit) ok=verify_value("V775",name,gV775RunSettings.member,!!(bits&bit))&&ok
     VV775("OverRange",over_range_enabled,V775_BIT2_OVER_RANGE); VV775("LowThreshold",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); VV775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); VV775("EmptyProgram",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); VV775("ValidControl",valid_control_enabled,V775_BIT2_VALID_CONTROL); VV775("SlidingScale",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); VV775("AllTrigger",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
 #undef VV775
+    V775ReadbackSnapshot &snapshot = gVmeRunSnapshot.v775_readback;
+    snapshot.valid = ok ? TRUE : FALSE;
+    snapshot.firmware_revision = firmware;
+    snapshot.full_scale_range = fsr;
+    snapshot.fast_clear_window = fclr;
+    snapshot.over_range_enabled = !!(bits & V775_BIT2_OVER_RANGE);
+    snapshot.low_threshold_enabled = !!(bits & V775_BIT2_LOW_THRESHOLD);
+    snapshot.common_stop = !!(bits & V775_BIT2_COMMON_STOP);
+    snapshot.empty_program_enabled = !!(bits & V775_BIT2_EMPTY_PROGRAM);
+    snapshot.valid_control_enabled = !!(bits & V775_BIT2_VALID_CONTROL);
+    snapshot.sliding_scale_enabled = !!(bits & V775_BIT2_SLIDE_ENABLE);
+    snapshot.all_trigger_enabled = !!(bits & V775_BIT2_ALL_TRIGGER);
+    snapshot.bit_set2_raw = bits;
+    memcpy(snapshot.threshold, thresholds, sizeof(thresholds));
     set_module_output(V775_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FullScaleRange",&fsr,sizeof(fsr),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FastClearWindow",&fclr,sizeof(fclr),1,TID_WORD);
 #define RB775(k,m,b) { const BOOL v=!!(bits&b); set_module_output(V775_READBACK_PATH,k,&v,sizeof(v),1,TID_BOOL); }
     RB775("OverRangeEnabled",over_range_enabled,V775_BIT2_OVER_RANGE); RB775("LowThresholdEnabled",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); RB775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); RB775("EmptyProgramEnabled",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); RB775("ValidControlEnabled",valid_control_enabled,V775_BIT2_VALID_CONTROL); RB775("SlidingScaleEnabled",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); RB775("AllTriggerEnabled",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
@@ -2619,6 +3029,12 @@ INT frontend_init()
                "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;
     }
+    reset_vme_run_snapshot(0);
+    if (!publish_vme_run_snapshot()) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot initialize VME RunSnapshot ODB schema");
+        return FE_ERR_ODB;
+    }
 
     printf("Opening VME interface...\n");
 
@@ -2671,6 +3087,7 @@ INT begin_of_run(INT run_number, char *error)
 {
     printf("Begin run %d\n", run_number);
     reset_run_statistics();
+    reset_vme_run_snapshot(run_number);
 
     if (!validate_and_snapshot_module_settings() ||
         !snapshot_v1720e_settings_for_run() ||
@@ -2686,6 +3103,7 @@ INT begin_of_run(INT run_number, char *error)
                  "is enabled");
         return FE_ERR_ODB;
     }
+    capture_vme_requested_snapshot();
     publish_vme_enabled_for_run();
     set_module_readback_valid(V792_READBACK_PATH,false);
     set_module_readback_valid(V1190_READBACK_PATH,false);
@@ -2726,6 +3144,19 @@ INT begin_of_run(INT run_number, char *error)
         return FE_ERR_HW;
     }
 #endif
+    gVmeRunSnapshot.frontend_bor_complete = TRUE;
+    if (!publish_vme_run_snapshot()) {
+        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        if (gV1720Started) {
+            v1720e_stop(gVme, V1720E_BASE);
+            gV1720Started = false;
+        }
+        cm_msg(MERROR, frontend_name,
+               "Cannot publish completed VME RunSnapshot for run %d",
+               run_number);
+        snprintf(error, 256, "Cannot publish completed VME RunSnapshot");
+        return FE_ERR_ODB;
+    }
     return SUCCESS;
 }
 
@@ -3050,6 +3481,51 @@ INT read_vme_event(char *pevent, INT off)
                              v1720_data, v1720_event);
 }
 
+INT read_vme_configuration_event(char *pevent, INT)
+{
+    if (gVmeRunSnapshot.frontend_bor_complete != TRUE)
+        return 0;
+
+    HNDLE hDB = 0;
+    HNDLE hKey = 0;
+    cm_get_experiment_database(&hDB, NULL);
+    const INT find_status =
+        db_find_key(hDB, 0, VME_RUN_SNAPSHOT_PATH, &hKey);
+    if (find_status != DB_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot find completed VME RunSnapshot for CONFIG event: %d",
+               find_status);
+        return 0;
+    }
+
+    char *json = NULL;
+    int json_capacity = 0;
+    int json_length = 0;
+    const INT json_status = db_copy_json_save(
+        hDB, hKey, &json, &json_capacity, &json_length);
+    if (json_status != DB_SUCCESS || json == NULL || json_length <= 0) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot serialize VME RunSnapshot JSON: status %d length %d",
+               json_status, json_length);
+        free(json);
+        return 0;
+    }
+    if (json_length > max_event_size - 64) {
+        cm_msg(MERROR, frontend_name,
+               "VME RunSnapshot JSON is too large: %d bytes", json_length);
+        free(json);
+        return 0;
+    }
+
+    bk_init32(pevent);
+    char *data = NULL;
+    bk_create(pevent, "VCFG", TID_CHAR, reinterpret_cast<void **>(&data));
+    memcpy(data, json, static_cast<size_t>(json_length));
+    bk_close(pevent, data + json_length);
+    free(json);
+    return bk_size(pevent);
+}
+
 
 /* Define the MIDAS equipment handled by this frontend. */
 EQUIPMENT equipment[] = {
@@ -3076,6 +3552,25 @@ EQUIPMENT equipment[] = {
             FALSE                 // Hidden flag
         },
         read_vme_event,           // Event readout function
+    },
+    {
+        "VME Configuration",
+        {
+            5,                    // Unused across repository and current ODB
+            0,
+            "SYSTEM",
+            EQ_PERIODIC,
+            0,
+            "MIDAS",
+            TRUE,
+            RO_BOR,
+            0,
+            0,
+            0,
+            0,
+            "", "", "", "", "", FALSE
+        },
+        read_vme_configuration_event,
     },
 
     {""}                          // End of equipment list
