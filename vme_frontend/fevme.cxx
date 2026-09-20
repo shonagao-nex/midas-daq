@@ -132,6 +132,7 @@ static DWORD gRpv130LastPoll = 0;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
+static const char *RUN_COUNTERS_PATH = "/Equipment/VME/Variables/RunCounters";
 static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
 static bool gRpv130EnabledForRun = true;
@@ -1283,6 +1284,48 @@ struct RunStatistics {
 };
 
 static RunStatistics gRunStatistics = {};
+static bool gRunCountersDirty = true;
+static DWORD gRunCountersLastPublish = 0;
+
+static bool publish_run_counters()
+{
+    bool ok = true;
+#define PUBLISH_RUN_COUNTER(name, member, type) \
+    do { \
+        ok = set_module_output(RUN_COUNTERS_PATH, name, \
+                               &gRunStatistics.member, \
+                               sizeof(gRunStatistics.member), 1, type) && ok; \
+    } while (0)
+    PUBLISH_RUN_COUNTER("EventSlipCount", counter_mismatch_count, TID_QWORD);
+    PUBLISH_RUN_COUNTER("V1720EMalformedEventCount", v1720_malformed_count,
+                        TID_QWORD);
+    PUBLISH_RUN_COUNTER("V1720ESizeErrorCount", v1720_size_error_count,
+                        TID_QWORD);
+    PUBLISH_RUN_COUNTER("V1720EChannelMaskErrorCount", v1720_mask_error_count,
+                        TID_QWORD);
+    PUBLISH_RUN_COUNTER("V1720EReadTimeoutCount", v1720_read_timeout_count,
+                        TID_QWORD);
+    PUBLISH_RUN_COUNTER("V1720ECounterDiscontinuityCount",
+                        v1720_counter_discontinuity_count, TID_QWORD);
+    PUBLISH_RUN_COUNTER("FirstEventSlipSerial", first_mismatch_serial,
+                        TID_DWORD);
+    PUBLISH_RUN_COUNTER("LastEventSlipSerial", last_mismatch_serial,
+                        TID_DWORD);
+#undef PUBLISH_RUN_COUNTER
+    gRunCountersDirty = !ok;
+    gRunCountersLastPublish = ss_millitime();
+    return ok;
+}
+
+static void mark_run_counters_dirty()
+{
+    gRunCountersDirty = true;
+}
+
+static bool initialize_run_counters_odb()
+{
+    return publish_run_counters();
+}
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
 static WORD gV1190SavedControl = 0;
@@ -1845,6 +1888,7 @@ static bool wait_for_v1720e_data_ready()
             gV1720Runtime.communication_ok = FALSE;
             gV1720Runtime.dirty = true;
             ++gRunStatistics.v1720_read_timeout_count;
+            mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
                    "V1720E ready read failed: status %d", status);
             return false;
@@ -1857,6 +1901,7 @@ static bool wait_for_v1720e_data_ready()
             ss_sleep(1);
     }
     ++gRunStatistics.v1720_read_timeout_count;
+    mark_run_counters_dirty();
     cm_msg(MERROR, frontend_name,
            "V1720E DataReady timeout after %u polls (Event Stored %u); "
            "V792 FIFO was not consumed",
@@ -3024,7 +3069,7 @@ INT frontend_init()
 #endif
 
     if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
-        !initialize_v1720e_odb()) {
+        !initialize_v1720e_odb() || !initialize_run_counters_odb()) {
         cm_msg(MERROR, frontend_name,
                "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;
@@ -3087,6 +3132,13 @@ INT begin_of_run(INT run_number, char *error)
 {
     printf("Begin run %d\n", run_number);
     reset_run_statistics();
+    mark_run_counters_dirty();
+    if (!publish_run_counters()) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot reset VME RunCounters ODB values at BOR");
+        snprintf(error, 256, "Cannot reset VME RunCounters");
+        return FE_ERR_ODB;
+    }
     reset_vme_run_snapshot(run_number);
 
     if (!validate_and_snapshot_module_settings() ||
@@ -3166,10 +3218,17 @@ INT end_of_run(INT run_number, char *error)
     bool restore_failed = false;
     printf("End run %d\n", run_number);
     if (!stop_v1720e_and_publish_state("EOR")) {
+        publish_run_counters();
         snprintf(error, 256, "V1720E Acquisition Stop failed");
         return FE_ERR_HW;
     }
     log_run_statistics();
+    if (!publish_run_counters()) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot publish final VME RunCounters ODB values at EOR");
+        snprintf(error, 256, "Cannot publish final VME RunCounters");
+        return FE_ERR_ODB;
+    }
     refresh_enabled_module_variables();
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
@@ -3211,6 +3270,8 @@ INT frontend_loop()
         const DWORD elapsed=static_cast<DWORD>(now-last);
         return (dirty&&elapsed>=MODULE_VARIABLES_MIN_PUBLISH_INTERVAL_MS)||elapsed>=MODULE_VARIABLES_HEARTBEAT_INTERVAL_MS;
     };
+    if (due(now, gRunCountersLastPublish, gRunCountersDirty))
+        publish_run_counters();
     if(gV792RunSettings.enabled && due(now,gV792LastVariablesPublish,gV792Runtime.dirty)) {
         WORD s1=0,s2=0; DWORD counter=gV792Runtime.event_counter;
         if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 runtime Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 runtime Status2")) {
@@ -3289,6 +3350,7 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
         gRunStatistics.first_mismatch_serial = midas_serial;
     ++gRunStatistics.counter_mismatch_count;
     gRunStatistics.last_mismatch_serial = midas_serial;
+    mark_run_counters_dirty();
 
     const uint64_t count = gRunStatistics.counter_mismatch_count;
     if (count <= 10) {
@@ -3325,12 +3387,14 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
 {
     if (!event.size_valid) {
         ++gRunStatistics.v1720_size_error_count;
+        mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
                midas_serial, event.event_size, gV1720ExpectedEventWords);
     }
     if (!event.channel_mask_valid) {
         ++gRunStatistics.v1720_mask_error_count;
+        mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0x%02X",
                midas_serial, event.channel_mask, gV1720ExpectedChannelMask);
@@ -3347,6 +3411,7 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
             0x7FFFFFFFu;
         if (counter_delta != 1) {
             ++gRunStatistics.v1720_counter_discontinuity_count;
+            mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
                    "V1720E counter discontinuity at MIDAS serial %u: "
                    "previous=%u current=%u delta=%u",
@@ -3453,6 +3518,7 @@ INT read_vme_event(char *pevent, INT off)
                 gV1720Runtime.communication_ok = FALSE;
             gV1720Runtime.dirty = true;
             ++gRunStatistics.v1720_malformed_count;
+            mark_run_counters_dirty();
             gReadoutFailed = true;
             cm_msg(MERROR, frontend_name,
                    "V1720E readout disabled after malformed/partial event: "
