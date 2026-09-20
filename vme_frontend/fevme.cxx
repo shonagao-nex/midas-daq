@@ -133,6 +133,8 @@ static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
 static const char *RUN_COUNTERS_PATH = "/Equipment/VME/Variables/RunCounters";
+static const char *FRONTEND_VARIABLES_PATH =
+    "/Equipment/VME/Variables/Frontend";
 static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
 static bool gRpv130EnabledForRun = true;
@@ -261,6 +263,49 @@ static bool get_absolute_odb_value(const char *path, void *value, INT size,
         return false;
     }
     return true;
+}
+
+static bool publish_configuration_status(bool configuration_ok,
+                                         INT run_number)
+{
+    const BOOL value = configuration_ok ? TRUE : FALSE;
+    const time_t now = time(NULL);
+    const uint64_t checked_unix =
+        now < 0 ? 0 : static_cast<uint64_t>(now);
+    char path[256];
+    bool ok = true;
+
+    /* Clear the gate first on negative updates. On positive updates, publish
+     * the identifying metadata before opening the gate. */
+    if (!configuration_ok) {
+        ok = make_odb_path(path, sizeof(path), FRONTEND_VARIABLES_PATH,
+                           "ConfigurationOK") &&
+             set_absolute_odb_value(path, &value, sizeof(value), 1,
+                                    TID_BOOL) && ok;
+    }
+    ok = make_odb_path(path, sizeof(path), FRONTEND_VARIABLES_PATH,
+                       "ConfigurationCheckedUnix") &&
+         set_absolute_odb_value(path, &checked_unix, sizeof(checked_unix), 1,
+                                TID_QWORD) && ok;
+    ok = make_odb_path(path, sizeof(path), FRONTEND_VARIABLES_PATH,
+                       "ConfigurationRunNumber") &&
+         set_absolute_odb_value(path, &run_number, sizeof(run_number), 1,
+                                TID_INT) && ok;
+    if (configuration_ok) {
+        ok = make_odb_path(path, sizeof(path), FRONTEND_VARIABLES_PATH,
+                           "ConfigurationOK") &&
+             set_absolute_odb_value(path, &value, sizeof(value), 1,
+                                    TID_BOOL) && ok;
+    }
+    return ok;
+}
+
+static void mark_configuration_failed(INT run_number)
+{
+    if (!publish_configuration_status(false, run_number))
+        cm_msg(MERROR, frontend_name,
+               "Cannot publish failed VME configuration status for run %d",
+               run_number);
 }
 
 static const char *V792_SETTINGS_PATH = "/Equipment/VME/Settings/V792";
@@ -2976,6 +3021,20 @@ static bool prepare_modules_for_run()
     return true;
 }
 
+static bool vme_configuration_ready()
+{
+    return gVmeRunSnapshot.frontend_bor_complete == TRUE &&
+           (!gV792RunSettings.enabled ||
+            gVmeRunSnapshot.v792_readback.valid == TRUE) &&
+           (!gV1190RunSettings.enabled ||
+            gVmeRunSnapshot.v1190_readback.valid == TRUE) &&
+           (!gV775RunSettings.enabled ||
+            gVmeRunSnapshot.v775_readback.valid == TRUE) &&
+           (!gV1720RunSettings.enabled ||
+            (gVmeRunSnapshot.v1720e_readback.valid == TRUE &&
+             gV1720Started));
+}
+
 #if ENABLE_V792_SW_TRIGGER_TEST
 static void setup_v792_sw_trigger_test()
 {
@@ -3074,6 +3133,11 @@ INT frontend_init()
                "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;
     }
+    if (!publish_configuration_status(false, 0)) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot initialize VME frontend configuration status");
+        return FE_ERR_ODB;
+    }
     reset_vme_run_snapshot(0);
     if (!publish_vme_run_snapshot()) {
         cm_msg(MERROR, frontend_name,
@@ -3131,12 +3195,18 @@ INT frontend_exit()
 INT begin_of_run(INT run_number, char *error)
 {
     printf("Begin run %d\n", run_number);
+    if (!publish_configuration_status(false, run_number)) {
+        snprintf(error, 256,
+                 "Cannot reset VME configuration status at BOR");
+        return FE_ERR_ODB;
+    }
     reset_run_statistics();
     mark_run_counters_dirty();
     if (!publish_run_counters()) {
         cm_msg(MERROR, frontend_name,
                "Cannot reset VME RunCounters ODB values at BOR");
         snprintf(error, 256, "Cannot reset VME RunCounters");
+        mark_configuration_failed(run_number);
         return FE_ERR_ODB;
     }
     reset_vme_run_snapshot(run_number);
@@ -3147,12 +3217,14 @@ INT begin_of_run(INT run_number, char *error)
         cm_msg(MERROR, frontend_name,
                "Cannot snapshot/validate VME module Settings at BOR");
         snprintf(error, 256, "Invalid VME module ODB Settings");
+        mark_configuration_failed(run_number);
         return FE_ERR_ODB;
     }
     if (!validate_v792_event_source_dependency()) {
         snprintf(error, 256,
                  "V792 must be enabled when any VME physics readout module "
                  "is enabled");
+        mark_configuration_failed(run_number);
         return FE_ERR_ODB;
     }
     capture_vme_requested_snapshot();
@@ -3166,6 +3238,7 @@ INT begin_of_run(INT run_number, char *error)
         cm_msg(MERROR, frontend_name,
                "BOR configuration failed; refusing to start run %d", run_number);
         snprintf(error, 256, "Normal BOR module preparation failed");
+        mark_configuration_failed(run_number);
         return FE_ERR_HW;
     }
 
@@ -3181,6 +3254,7 @@ INT begin_of_run(INT run_number, char *error)
             v1720e_stop(gVme, V1720E_BASE);
             gV1720Started = false;
         }
+        mark_configuration_failed(run_number);
         return FE_ERR_HW;
     }
 #endif
@@ -3193,10 +3267,23 @@ INT begin_of_run(INT run_number, char *error)
             v1720e_stop(gVme, V1720E_BASE);
             gV1720Started = false;
         }
+        mark_configuration_failed(run_number);
         return FE_ERR_HW;
     }
 #endif
     gVmeRunSnapshot.frontend_bor_complete = TRUE;
+    if (!vme_configuration_ready()) {
+        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        if (gV1720Started) {
+            v1720e_stop(gVme, V1720E_BASE);
+            gV1720Started = false;
+        }
+        cm_msg(MERROR, frontend_name,
+               "VME BOR completed without all enabled modules ready");
+        snprintf(error, 256, "VME configuration readiness check failed");
+        mark_configuration_failed(run_number);
+        return FE_ERR_HW;
+    }
     if (!publish_vme_run_snapshot()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
         if (gV1720Started) {
@@ -3207,6 +3294,21 @@ INT begin_of_run(INT run_number, char *error)
                "Cannot publish completed VME RunSnapshot for run %d",
                run_number);
         snprintf(error, 256, "Cannot publish completed VME RunSnapshot");
+        mark_configuration_failed(run_number);
+        return FE_ERR_ODB;
+    }
+    if (!publish_configuration_status(true, run_number)) {
+        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        publish_vme_run_snapshot();
+        if (gV1720Started) {
+            v1720e_stop(gVme, V1720E_BASE);
+            gV1720Started = false;
+        }
+        cm_msg(MERROR, frontend_name,
+               "Cannot publish successful VME configuration status for run %d",
+               run_number);
+        snprintf(error, 256, "Cannot publish VME configuration status");
+        mark_configuration_failed(run_number);
         return FE_ERR_ODB;
     }
     return SUCCESS;

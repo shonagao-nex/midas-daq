@@ -176,6 +176,38 @@ bool set_odb_string(const std::string& path, const std::string& value,
   return set_odb_value(path, buffer.data(), buffer.size(), 1, TID_STRING);
 }
 
+bool publish_configuration_status(bool configuration_ok, INT run_number) {
+  const BOOL value = configuration_ok ? TRUE : FALSE;
+  const std::time_t now = std::time(nullptr);
+  const std::uint64_t checked_unix =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  const std::string frontend = odb_path(kVariablesPath, "Frontend");
+  bool ok = true;
+
+  // Clear the gate first on negative updates. On positive updates, publish
+  // the identifying metadata before opening the gate.
+  if (!configuration_ok)
+    ok = set_odb_value(odb_path(frontend.c_str(), "ConfigurationOK"),
+                       &value, sizeof(value), 1, TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(frontend.c_str(), "ConfigurationCheckedUnix"),
+           &checked_unix, sizeof(checked_unix), 1, TID_QWORD) && ok;
+  ok = set_odb_value(
+           odb_path(frontend.c_str(), "ConfigurationRunNumber"),
+           &run_number, sizeof(run_number), 1, TID_INT) && ok;
+  if (configuration_ok)
+    ok = set_odb_value(odb_path(frontend.c_str(), "ConfigurationOK"),
+                       &value, sizeof(value), 1, TID_BOOL) && ok;
+  return ok;
+}
+
+void mark_configuration_failed(INT run_number) {
+  if (!publish_configuration_status(false, run_number))
+    cm_msg(MERROR, "begin_of_run",
+           "Cannot publish failed EASIROC configuration status for run %d",
+           run_number);
+}
+
 std::string formatIso8601Utc(std::time_t value) {
   std::tm utc{};
   char buffer[32] = {};
@@ -385,7 +417,8 @@ bool initialize_odb() {
                      empty_raw.size(), empty_raw.size(), TID_BYTE))
     return false;
   reset_run_snapshot(0);
-  return publish_runtime_variables() && publish_run_snapshot();
+  return publish_configuration_status(false, 0) &&
+         publish_runtime_variables() && publish_run_snapshot();
 }
 
 INT read_bool_setting(const char* name, bool* value) {
@@ -638,6 +671,17 @@ bool finalize_run_snapshot(const FrontendSettings& settings) {
   return false;
 }
 
+bool configuration_ready(const FrontendSettings& settings) {
+  if (!g_state.run_snapshot.frontend_bor_complete) return false;
+  if (!settings.enabled) return true;
+  return g_state.runtime.enabled_for_run &&
+         g_state.runtime.rbcp_communication_ok &&
+         g_state.runtime.tcp_reachable && g_state.runtime.tcp_connected &&
+         g_state.runtime.acquisition_running &&
+         !g_state.runtime.acquisition_fault && g_state.daq_start_attempted &&
+         g_state.rbcp && g_state.tcp && g_state.parser;
+}
+
 }  // namespace
 
 const char* frontend_name = "feeasiroc";
@@ -713,6 +757,12 @@ INT frontend_exit() {
 
 INT begin_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  if (!publish_configuration_status(false, run_number)) {
+    if (error != nullptr)
+      std::snprintf(error, 256,
+                    "Cannot reset EASIROC configuration status at BOR");
+    return FE_ERR_ODB;
+  }
   reset_run_snapshot(run_number);
 
   // The read-only startup diagnostic must not share TCP/RBCP access with an
@@ -725,6 +775,7 @@ INT begin_of_run(INT run_number, char* error) {
   if (status != SUCCESS) {
     if (error != nullptr)
       std::snprintf(error, 256, "Cannot read NIM-EASIROC settings from ODB");
+    mark_configuration_failed(run_number);
     return status;
   }
 
@@ -737,9 +788,30 @@ INT begin_of_run(INT run_number, char* error) {
       if (error != nullptr)
         std::snprintf(error, 256,
                       "Cannot publish completed EASIROC RunSnapshot");
+      mark_configuration_failed(run_number);
       return FE_ERR_ODB;
     }
     publish_runtime_variables();
+    if (!configuration_ready(run_settings)) {
+      g_state.run_snapshot.frontend_bor_complete = false;
+      publish_run_snapshot();
+      g_state.run_active = false;
+      if (error != nullptr)
+        std::snprintf(error, 256,
+                      "EASIROC configuration readiness check failed");
+      mark_configuration_failed(run_number);
+      return FE_ERR_HW;
+    }
+    if (!publish_configuration_status(true, run_number)) {
+      g_state.run_snapshot.frontend_bor_complete = false;
+      publish_run_snapshot();
+      g_state.run_active = false;
+      if (error != nullptr)
+        std::snprintf(error, 256,
+                      "Cannot publish successful EASIROC configuration status");
+      mark_configuration_failed(run_number);
+      return FE_ERR_ODB;
+    }
     cm_msg(MINFO, "begin_of_run",
            "Run %d: NIM-EASIROC disabled by BOR Settings snapshot; "
            "hardware access skipped",
@@ -759,6 +831,7 @@ INT begin_of_run(INT run_number, char* error) {
     g_state.run_active = false;
     g_state.runtime.last_error = message;
     publish_runtime_variables();
+    mark_configuration_failed(run_number);
     return FE_ERR_ODB;
   }
 
@@ -770,6 +843,7 @@ INT begin_of_run(INT run_number, char* error) {
     publish_runtime_variables();
     if (error != nullptr)
       std::snprintf(error, 256, "%s", previous.error.c_str());
+    mark_configuration_failed(run_number);
     return FE_ERR_HW;
   }
 
@@ -821,9 +895,46 @@ INT begin_of_run(INT run_number, char* error) {
       if (error != nullptr)
         std::snprintf(error, 256, "%s",
                       g_state.runtime.last_error.c_str());
+      mark_configuration_failed(run_number);
       return FE_ERR_ODB;
     }
     publish_runtime_variables();
+    if (!configuration_ready(run_settings)) {
+      const CleanupResult cleanup =
+          stop_acquisition("begin_of_run", false);
+      g_state.run_snapshot.frontend_bor_complete = false;
+      publish_run_snapshot();
+      g_state.run_active = false;
+      g_state.runtime.acquisition_fault = true;
+      g_state.runtime.last_error =
+          "EASIROC configuration readiness check failed";
+      if (!cleanup.error.empty())
+        g_state.runtime.last_error += "; " + cleanup.error;
+      publish_runtime_variables();
+      if (error != nullptr)
+        std::snprintf(error, 256, "%s",
+                      g_state.runtime.last_error.c_str());
+      mark_configuration_failed(run_number);
+      return FE_ERR_HW;
+    }
+    if (!publish_configuration_status(true, run_number)) {
+      const CleanupResult cleanup =
+          stop_acquisition("begin_of_run", false);
+      g_state.run_snapshot.frontend_bor_complete = false;
+      publish_run_snapshot();
+      g_state.run_active = false;
+      g_state.runtime.acquisition_fault = true;
+      g_state.runtime.last_error =
+          "Cannot publish successful EASIROC configuration status";
+      if (!cleanup.error.empty())
+        g_state.runtime.last_error += "; " + cleanup.error;
+      publish_runtime_variables();
+      if (error != nullptr)
+        std::snprintf(error, 256, "%s",
+                      g_state.runtime.last_error.c_str());
+      mark_configuration_failed(run_number);
+      return FE_ERR_ODB;
+    }
     return SUCCESS;
   } catch (const std::exception& exception) {
     const std::string start_error =
@@ -837,6 +948,7 @@ INT begin_of_run(INT run_number, char* error) {
     g_state.runtime.last_error = message;
     publish_runtime_variables();
     if (error != nullptr) std::snprintf(error, 256, "%s", message.c_str());
+    mark_configuration_failed(run_number);
     return FE_ERR_HW;
   }
 }
