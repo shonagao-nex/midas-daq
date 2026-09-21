@@ -1,11 +1,11 @@
 #include "midas.h"
 #include "mfe.h"
 
-#include "easiroc_asic_apply.h"
 #include "easiroc_daq_control.h"
+#include "easiroc_last_applied.h"
+#include "easiroc_manual_apply.h"
 #include "easiroc_readout.h"
 #include "easiroc_run_settings.h"
-#include "easiroc_slow_control.h"
 #include "easiroc_status.h"
 #include "easiroc_stream.h"
 #include "rbcp.h"
@@ -33,11 +33,13 @@
 namespace {
 
 constexpr char kSettingsPath[] = "/Equipment/EASIROC/Settings";
+constexpr char kCommandsPath[] = "/Equipment/EASIROC/Commands";
 constexpr char kInfoPath[] = "/Equipment/EASIROC/Info";
 constexpr char kReadbackPath[] = "/Equipment/EASIROC/Readback";
 constexpr char kVariablesPath[] = "/Equipment/EASIROC/Variables";
 constexpr char kRunSnapshotPath[] = "/Equipment/EASIROC/RunSnapshot";
-constexpr DWORD kRunSnapshotSchemaVersion = 3;
+constexpr DWORD kRunSnapshotSchemaVersion =
+    easiroc::kEasirocRunSnapshotSchemaVersion;
 constexpr int kReceiveTimeoutMs = 100;
 constexpr int kDrainQuietMs = 100;
 constexpr int kDrainMaximumMs = 1000;
@@ -81,15 +83,6 @@ struct RuntimeState {
   RuntimeStatistics statistics;
 };
 
-struct AsicApplyRuntimeStatus {
-  bool apply_attempted = false;
-  bool sequence_succeeded = false;
-  std::string current_error;
-  std::string last_apply_error;
-  INT last_apply_run_number = 0;
-  std::uint64_t last_apply_unix_time = 0;
-};
-
 struct FirmwareObservation {
   bool valid = false;
   easiroc::FirmwareVersion firmware;
@@ -109,7 +102,12 @@ struct EasirocRunSnapshot {
   bool frontend_bor_complete = false;
   bool enabled_for_run = false;
   FrontendSettings requested;
-  easiroc::AsicApplyResult apply;
+  struct {
+    bool attempted = false;
+    bool sequence_succeeded = false;
+    std::string error;
+  } apply;
+  easiroc::AsicSlowControlConsistencySnapshot consistency;
   FirmwareObservation firmware;
 };
 
@@ -126,7 +124,9 @@ struct FrontendState {
   std::deque<easiroc::DecodedEvent> pending_events;
   bool daq_start_attempted = false;
   RuntimeState runtime;
-  AsicApplyRuntimeStatus asic_apply;
+  easiroc::ManualApplyStatus asic_apply;
+  easiroc::AppliedAsicSlowControlSettings last_applied;
+  bool hardware_state_indeterminate = false;
   FirmwareObservation firmware_observation;
   EasirocRunSnapshot run_snapshot;
 
@@ -178,6 +178,18 @@ bool ensure_odb_value(const std::string& path, const void* default_value,
     return false;
   }
   return set_odb_value(path, default_value, size, count, type);
+}
+
+bool read_odb_dword(const std::string& path, DWORD* value) {
+  INT size = sizeof(*value);
+  const INT status =
+      db_get_value(hDB, 0, path.c_str(), value, &size, TID_DWORD, FALSE);
+  if (status != DB_SUCCESS) {
+    cm_msg(MERROR, "read_odb", "Cannot read %s (status %d)", path.c_str(),
+           status);
+    return false;
+  }
+  return true;
 }
 
 bool set_odb_string(const std::string& path, const std::string& value,
@@ -244,30 +256,12 @@ void reset_run_snapshot(INT run_number) {
       std::to_string(snapshot.bor_unix_time) + "_feeasiroc";
 }
 
-void reset_apply_status_for_bor() {
-  g_state.asic_apply.apply_attempted = false;
-  g_state.asic_apply.sequence_succeeded = false;
-  g_state.asic_apply.current_error.clear();
-}
-
-void record_apply_result(INT run_number,
-                         const easiroc::AsicApplyResult& result,
-                         std::uint64_t attempt_unix_time) {
-  g_state.asic_apply.apply_attempted = result.attempted;
-  g_state.asic_apply.sequence_succeeded = result.sequence_succeeded;
-  g_state.asic_apply.current_error = result.error;
-  if (result.attempted) {
-    g_state.asic_apply.last_apply_run_number = run_number;
-    g_state.asic_apply.last_apply_unix_time = attempt_unix_time;
-    g_state.asic_apply.last_apply_error = result.error;
-  }
-}
-
 bool publish_run_snapshot() {
   const auto& snapshot = g_state.run_snapshot;
   const std::string metadata = odb_path(kRunSnapshotPath, "Metadata");
   const std::string requested = odb_path(kRunSnapshotPath, "Requested");
   const std::string apply = odb_path(kRunSnapshotPath, "Apply");
+  const std::string consistency = odb_path(kRunSnapshotPath, "Consistency");
   const std::string firmware = odb_path(kRunSnapshotPath, "Readback/Firmware");
   const BOOL enabled_for_run = snapshot.enabled_for_run ? TRUE : FALSE;
   const BOOL requested_enabled = snapshot.requested.enabled ? TRUE : FALSE;
@@ -284,9 +278,21 @@ bool publish_run_snapshot() {
       snapshot.requested.asic_slow_control.asic[1].dac_code;
   const INT asic2_dac_slope =
       snapshot.requested.asic_slow_control.asic[1].dac_slope;
+  const auto& asic1_input_dac =
+      snapshot.requested.asic_slow_control.asic[0].input_dac;
+  const auto& asic2_input_dac =
+      snapshot.requested.asic_slow_control.asic[1].input_dac;
   const BOOL apply_attempted = snapshot.apply.attempted ? TRUE : FALSE;
   const BOOL apply_succeeded =
       snapshot.apply.sequence_succeeded ? TRUE : FALSE;
+  const BOOL last_applied_valid =
+      snapshot.consistency.last_applied_valid ? TRUE : FALSE;
+  const BOOL configuration_match =
+      snapshot.consistency.configuration_match ? TRUE : FALSE;
+  const BOOL hardware_state_indeterminate =
+      snapshot.consistency.hardware_state_indeterminate ? TRUE : FALSE;
+  const DWORD last_applied_request_id =
+      snapshot.consistency.last_applied_request_id;
   const BOOL firmware_valid = snapshot.firmware.valid ? TRUE : FALSE;
   bool ok = true;
   ok = set_odb_value(odb_path(metadata.c_str(), "SchemaVersion"),
@@ -339,6 +345,16 @@ bool publish_run_snapshot() {
            odb_path(requested.c_str(),
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
            &asic2_dac_slope, sizeof(asic2_dac_slope), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[5]),
+           asic1_input_dac.data(), sizeof(asic1_input_dac),
+           asic1_input_dac.size(), TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+           asic2_input_dac.data(), sizeof(asic2_input_dac),
+           asic2_input_dac.size(), TID_INT) && ok;
 
   ok = set_odb_value(odb_path(apply.c_str(), "Attempted"),
                      &apply_attempted, sizeof(apply_attempted), 1,
@@ -348,6 +364,32 @@ bool publish_run_snapshot() {
                      TID_BOOL) && ok;
   ok = set_odb_string(odb_path(apply.c_str(), "Error"),
                       snapshot.apply.error, 256) && ok;
+
+  ok = set_odb_value(odb_path(consistency.c_str(), "LastAppliedValid"),
+                     &last_applied_valid, sizeof(last_applied_valid), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(consistency.c_str(), "ConfigurationMatch"),
+                     &configuration_match, sizeof(configuration_match), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(consistency.c_str(), "HardwareStateIndeterminate"),
+           &hardware_state_indeterminate,
+           sizeof(hardware_state_indeterminate), 1, TID_BOOL) &&
+       ok;
+  ok = set_odb_value(odb_path(consistency.c_str(), "LastAppliedRequestId"),
+                     &last_applied_request_id,
+                     sizeof(last_applied_request_id), 1, TID_DWORD) && ok;
+  ok = set_odb_value(odb_path(consistency.c_str(), "LastAppliedUnixTime"),
+                     &snapshot.consistency.last_applied_unix_time,
+                     sizeof(snapshot.consistency.last_applied_unix_time), 1,
+                     TID_QWORD) && ok;
+  ok = set_odb_string(
+           odb_path(consistency.c_str(), "Status"),
+           easiroc::hardwareConfigurationStatusName(
+               snapshot.consistency.status),
+           32) && ok;
+  ok = set_odb_string(odb_path(consistency.c_str(), "Detail"),
+                      snapshot.consistency.detail, 256) && ok;
 
   ok = set_odb_value(odb_path(firmware.c_str(), "Valid"), &firmware_valid,
                      sizeof(firmware_valid), 1, TID_BOOL) && ok;
@@ -392,10 +434,6 @@ bool publish_runtime_variables() {
   const BOOL tcp_connected = g_state.runtime.tcp_connected ? TRUE : FALSE;
   const BOOL running = g_state.runtime.acquisition_running ? TRUE : FALSE;
   const BOOL fault = g_state.runtime.acquisition_fault ? TRUE : FALSE;
-  const BOOL apply_attempted =
-      g_state.asic_apply.apply_attempted ? TRUE : FALSE;
-  const BOOL apply_succeeded =
-      g_state.asic_apply.sequence_succeeded ? TRUE : FALSE;
   const std::uint64_t pending = g_state.pending_events.size();
   const std::uint64_t buffered =
       g_state.parser ? g_state.parser->bufferedBytes() : 0;
@@ -439,24 +477,177 @@ bool publish_runtime_variables() {
                 g_state.runtime.statistics.total_drain_bytes);
   const std::string asic_slow_control =
       odb_path(kVariablesPath, "ASICSlowControl");
-  ok = set_odb_value(odb_path(asic_slow_control.c_str(), "ApplyAttempted"),
-                     &apply_attempted, sizeof(apply_attempted), 1,
-                     TID_BOOL) && ok;
+  const auto configuration = easiroc::compareAsicSlowControlSettings(
+      g_state.settings.asic_slow_control, g_state.last_applied,
+      g_state.hardware_state_indeterminate);
+  const BOOL configuration_match =
+      configuration.status == easiroc::HardwareConfigurationStatus::kMatch
+          ? TRUE
+          : FALSE;
+  const BOOL hardware_state_indeterminate =
+      g_state.hardware_state_indeterminate ? TRUE : FALSE;
+  const DWORD active_request_id = g_state.asic_apply.active_request_id;
+  const DWORD last_handled_request_id =
+      g_state.asic_apply.last_handled_request_id;
+  const DWORD last_successful_request_id =
+      g_state.asic_apply.last_successful_request_id;
+  const BOOL apply_in_progress =
+      g_state.asic_apply.apply_in_progress ? TRUE : FALSE;
+  const BOOL last_attempt_succeeded =
+      g_state.asic_apply.last_attempt_succeeded ? TRUE : FALSE;
   ok = set_odb_value(
-           odb_path(asic_slow_control.c_str(), "ApplySequenceSucceeded"),
-           &apply_succeeded, sizeof(apply_succeeded), 1, TID_BOOL) && ok;
+           odb_path(asic_slow_control.c_str(), "ActiveRequestId"),
+           &active_request_id, sizeof(active_request_id), 1, TID_DWORD) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "LastHandledRequestId"),
+           &last_handled_request_id, sizeof(last_handled_request_id), 1,
+           TID_DWORD) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "LastSuccessfulRequestId"),
+           &last_successful_request_id, sizeof(last_successful_request_id), 1,
+           TID_DWORD) && ok;
+  ok = set_odb_string(
+           odb_path(asic_slow_control.c_str(), "ApplyState"),
+           easiroc::manualApplyStateName(g_state.asic_apply.state), 32) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "ApplyInProgress"),
+           &apply_in_progress, sizeof(apply_in_progress), 1, TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "LastAttemptSucceeded"),
+           &last_attempt_succeeded, sizeof(last_attempt_succeeded), 1,
+           TID_BOOL) && ok;
   ok = set_odb_string(
            odb_path(asic_slow_control.c_str(), "LastApplyError"),
            g_state.asic_apply.last_apply_error, 256) && ok;
-  ok = set_odb_value(
-           odb_path(asic_slow_control.c_str(), "LastApplyRunNumber"),
-           &g_state.asic_apply.last_apply_run_number,
-           sizeof(g_state.asic_apply.last_apply_run_number), 1, TID_INT) && ok;
   PUBLISH_QWORD(asic_slow_control.c_str(), "LastApplyUnixTime",
                 g_state.asic_apply.last_apply_unix_time);
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "ConfigurationMatch"),
+           &configuration_match, sizeof(configuration_match), 1, TID_BOOL) &&
+       ok;
+  ok = set_odb_string(
+           odb_path(asic_slow_control.c_str(), "ConfigurationStatus"),
+           easiroc::hardwareConfigurationStatusName(configuration.status),
+           32) && ok;
+  ok = set_odb_string(
+           odb_path(asic_slow_control.c_str(), "ConfigurationDetail"),
+           configuration.detail, 256) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "HardwareStateIndeterminate"),
+           &hardware_state_indeterminate,
+           sizeof(hardware_state_indeterminate), 1, TID_BOOL) &&
+       ok;
 #undef PUBLISH_QWORD
 #undef PUBLISH_BOOL
   return ok;
+}
+
+bool initialize_manual_apply_mailbox() {
+  const DWORD zero = 0;
+  const BOOL no = FALSE;
+  std::array<char, 32> idle{};
+  std::snprintf(idle.data(), idle.size(), "%s", "Idle");
+  std::array<char, 256> empty_error{};
+  const std::uint64_t zero_time = 0;
+  const std::string command =
+      odb_path(kCommandsPath, "ASICSlowControl/ApplyRequestId");
+  const std::string status =
+      odb_path(kVariablesPath, "ASICSlowControl");
+
+  if (!ensure_odb_value(command, &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "ActiveRequestId"), &zero,
+                        sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastHandledRequestId"),
+                        &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastSuccessfulRequestId"),
+                        &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "ApplyState"), idle.data(),
+                        idle.size(), 1, TID_STRING) ||
+      !ensure_odb_value(odb_path(status.c_str(), "ApplyInProgress"), &no,
+                        sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastAttemptSucceeded"),
+                        &no, sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastApplyError"),
+                        empty_error.data(), empty_error.size(), 1,
+                        TID_STRING) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastApplyUnixTime"),
+                        &zero_time, sizeof(zero_time), 1, TID_QWORD))
+    return false;
+
+  DWORD request_id = 0;
+  DWORD last_handled_request_id = 0;
+  DWORD last_successful_request_id = 0;
+  if (!read_odb_dword(command, &request_id) ||
+      !read_odb_dword(odb_path(status.c_str(), "LastHandledRequestId"),
+                      &last_handled_request_id) ||
+      !read_odb_dword(odb_path(status.c_str(), "LastSuccessfulRequestId"),
+                      &last_successful_request_id))
+    return false;
+
+  g_state.asic_apply = {};
+  g_state.asic_apply.last_handled_request_id = last_handled_request_id;
+  g_state.asic_apply.last_successful_request_id =
+      last_successful_request_id;
+  if (request_id > last_handled_request_id) {
+    const std::time_t now = std::time(nullptr);
+    const std::uint64_t unix_time =
+        now < 0 ? 0 : static_cast<std::uint64_t>(now);
+    g_state.asic_apply = easiroc::acknowledgeStaleManualApplyRequest(
+        g_state.asic_apply, request_id, unix_time);
+    cm_msg(MINFO, "frontend_init", "WARNING: %s (request %u)",
+           g_state.asic_apply.last_apply_error.c_str(),
+           static_cast<unsigned>(request_id));
+  }
+  return true;
+}
+
+bool initialize_last_applied_odb() {
+  const std::string status = odb_path(kVariablesPath, "ASICSlowControl");
+  const std::string last_applied = odb_path(status.c_str(), "LastApplied");
+  const BOOL no = FALSE;
+  const DWORD zero_request = 0;
+  const std::uint64_t zero_time = 0;
+  const INT zero_value = 0;
+  const std::array<INT, easiroc::kInputDacChannelCount> zero_input_dac{};
+  std::array<char, 32> unknown{};
+  std::snprintf(unknown.data(), unknown.size(), "%s", "Unknown");
+  std::array<char, 256> empty_detail{};
+
+  return ensure_odb_value(odb_path(last_applied.c_str(), "Valid"), &no,
+                          sizeof(no), 1, TID_BOOL) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "RequestId"),
+                          &zero_request, sizeof(zero_request), 1,
+                          TID_DWORD) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "ApplyUnixTime"),
+                          &zero_time, sizeof(zero_time), 1, TID_QWORD) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/DiscriminatorDACCode"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/DiscriminatorDACSlope"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "ASIC1/InputDAC"),
+                          zero_input_dac.data(), sizeof(zero_input_dac),
+                          zero_input_dac.size(), TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/DiscriminatorDACCode"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/DiscriminatorDACSlope"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "ASIC2/InputDAC"),
+                          zero_input_dac.data(), sizeof(zero_input_dac),
+                          zero_input_dac.size(), TID_INT) &&
+         ensure_odb_value(odb_path(status.c_str(), "ConfigurationMatch"),
+                          &no, sizeof(no), 1, TID_BOOL) &&
+         ensure_odb_value(odb_path(status.c_str(), "ConfigurationStatus"),
+                          unknown.data(), unknown.size(), 1, TID_STRING) &&
+         ensure_odb_value(odb_path(status.c_str(), "ConfigurationDetail"),
+                          empty_detail.data(), empty_detail.size(), 1,
+                          TID_STRING) &&
+         ensure_odb_value(
+             odb_path(status.c_str(), "HardwareStateIndeterminate"), &no,
+             sizeof(no), 1, TID_BOOL);
 }
 
 bool initialize_odb() {
@@ -466,6 +657,7 @@ bool initialize_odb() {
   const BOOL no = FALSE;
   const INT default_dac_code = easiroc::kDefaultDiscriminatorDacCode;
   const INT default_dac_slope = easiroc::kDefaultDiscriminatorDacSlope;
+  const auto default_input_dac = easiroc::defaultInputDacValues();
   if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
@@ -495,7 +687,17 @@ bool initialize_odb() {
       !ensure_odb_value(
           odb_path(kSettingsPath,
                    easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
-          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT))
+          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[5]),
+          default_input_dac.data(), sizeof(default_input_dac),
+          default_input_dac.size(), TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+          default_input_dac.data(), sizeof(default_input_dac),
+          default_input_dac.size(), TID_INT))
     return false;
 
   const DWORD channel_count = easiroc::kAdcChannelCount;
@@ -533,6 +735,8 @@ bool initialize_odb() {
       !set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"), empty_raw.data(),
                      empty_raw.size(), empty_raw.size(), TID_BYTE))
     return false;
+  if (!initialize_manual_apply_mailbox() || !initialize_last_applied_odb())
+    return false;
   reset_run_snapshot(0);
   return publish_configuration_status(false, 0) &&
          publish_runtime_variables() && publish_run_snapshot();
@@ -564,6 +768,116 @@ INT read_int_setting(const char* name, int* value) {
   }
   *value = odb_value;
   return SUCCESS;
+}
+
+INT read_input_dac_setting(
+    const char* name,
+    std::array<int, easiroc::kInputDacChannelCount>* values) {
+  std::array<INT, easiroc::kInputDacChannelCount> odb_values{};
+  INT size = sizeof(odb_values);
+  const INT status =
+      db_get_value(hDB, 0, name, odb_values.data(), &size, TID_INT, FALSE);
+  if (status != DB_SUCCESS || size != static_cast<INT>(sizeof(odb_values))) {
+    cm_msg(MERROR, "read_settings",
+           "Cannot read 32-element INT array %s (status %d, size %d)", name,
+           status, size);
+    return FE_ERR_ODB;
+  }
+  std::copy(odb_values.begin(), odb_values.end(), values->begin());
+  return SUCCESS;
+}
+
+bool read_odb_qword(const std::string& path, std::uint64_t* value) {
+  INT size = sizeof(*value);
+  const INT status =
+      db_get_value(hDB, 0, path.c_str(), value, &size, TID_QWORD, FALSE);
+  if (status != DB_SUCCESS) {
+    cm_msg(MERROR, "read_odb", "Cannot read %s (status %d)", path.c_str(),
+           status);
+    return false;
+  }
+  return true;
+}
+
+bool read_last_applied_settings(
+    easiroc::AppliedAsicSlowControlSettings* result,
+    bool* hardware_state_indeterminate) {
+  const std::string status = odb_path(kVariablesPath, "ASICSlowControl");
+  const std::string last_applied_path =
+      odb_path(status.c_str(), "LastApplied");
+  easiroc::AppliedAsicSlowControlSettings next;
+  bool valid = false;
+  std::string path = odb_path(last_applied_path.c_str(), "Valid");
+  if (read_bool_setting(path.c_str(), &valid) != SUCCESS ||
+      !read_odb_dword(odb_path(last_applied_path.c_str(), "RequestId"),
+                      &next.request_id) ||
+      !read_odb_qword(odb_path(last_applied_path.c_str(), "ApplyUnixTime"),
+                      &next.apply_unix_time))
+    return false;
+  next.valid = valid;
+
+  for (std::size_t asic = 0; asic < next.asic.size(); ++asic) {
+    const std::string prefix = "ASIC" + std::to_string(asic + 1) + "/";
+    path = odb_path(last_applied_path.c_str(),
+                    prefix + "DiscriminatorDACCode");
+    if (read_int_setting(path.c_str(), &next.asic[asic].dac_code) != SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(),
+                    prefix + "DiscriminatorDACSlope");
+    if (read_int_setting(path.c_str(), &next.asic[asic].dac_slope) != SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "InputDAC");
+    if (read_input_dac_setting(path.c_str(), &next.asic[asic].input_dac) !=
+        SUCCESS)
+      return false;
+  }
+
+  bool indeterminate = false;
+  path = odb_path(status.c_str(), "HardwareStateIndeterminate");
+  if (read_bool_setting(path.c_str(), &indeterminate) != SUCCESS) return false;
+  *result = next;
+  *hardware_state_indeterminate = indeterminate;
+  return true;
+}
+
+bool load_last_applied_settings() {
+  return read_last_applied_settings(&g_state.last_applied,
+                                    &g_state.hardware_state_indeterminate);
+}
+
+bool publish_last_applied_settings(
+    const easiroc::AppliedAsicSlowControlSettings& last_applied) {
+  const std::string base =
+      odb_path(kVariablesPath, "ASICSlowControl/LastApplied");
+  const BOOL invalid = FALSE;
+  const BOOL valid = last_applied.valid ? TRUE : FALSE;
+  const DWORD request_id = last_applied.request_id;
+  bool ok = set_odb_value(odb_path(base.c_str(), "Valid"), &invalid,
+                          sizeof(invalid), 1, TID_BOOL);
+  ok = set_odb_value(odb_path(base.c_str(), "RequestId"), &request_id,
+                     sizeof(request_id), 1, TID_DWORD) && ok;
+  ok = set_odb_value(odb_path(base.c_str(), "ApplyUnixTime"),
+                     &last_applied.apply_unix_time,
+                     sizeof(last_applied.apply_unix_time), 1, TID_QWORD) && ok;
+  for (std::size_t asic = 0; asic < last_applied.asic.size(); ++asic) {
+    const std::string prefix = "ASIC" + std::to_string(asic + 1) + "/";
+    const INT dac_code = last_applied.asic[asic].dac_code;
+    const INT dac_slope = last_applied.asic[asic].dac_slope;
+    ok = set_odb_value(
+             odb_path(base.c_str(), prefix + "DiscriminatorDACCode"),
+             &dac_code, sizeof(dac_code), 1, TID_INT) && ok;
+    ok = set_odb_value(
+             odb_path(base.c_str(), prefix + "DiscriminatorDACSlope"),
+             &dac_slope, sizeof(dac_slope), 1, TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "InputDAC"),
+                       last_applied.asic[asic].input_dac.data(),
+                       sizeof(last_applied.asic[asic].input_dac),
+                       last_applied.asic[asic].input_dac.size(), TID_INT) && ok;
+  }
+  if (ok)
+    ok = set_odb_value(odb_path(base.c_str(), "Valid"), &valid,
+                       sizeof(valid), 1, TID_BOOL);
+  return ok;
 }
 
 INT read_settings(FrontendSettings* settings) {
@@ -616,10 +930,145 @@ INT read_settings(FrontendSettings* settings) {
     status = read_int_setting(
         path.c_str(), &next.asic_slow_control.asic[asic].dac_slope);
     if (status != SUCCESS) return status;
+
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[5 + asic]);
+    status = read_input_dac_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].input_dac);
+    if (status != SUCCESS) return status;
   }
 
   *settings = next;
   return SUCCESS;
+}
+
+easiroc::ManualApplyRunState read_manual_apply_run_state(bool* ok) {
+  INT run_state = 0;
+  INT size = sizeof(run_state);
+  const INT status = db_get_value(hDB, 0, "/Runinfo/State", &run_state, &size,
+                                  TID_INT, FALSE);
+  if (status != DB_SUCCESS) {
+    cm_msg(MERROR, "manual_apply", "Cannot read /Runinfo/State (status %d)",
+           status);
+    *ok = false;
+    return easiroc::ManualApplyRunState::kUnknown;
+  }
+  *ok = true;
+  switch (run_state) {
+    case STATE_STOPPED:
+      return easiroc::ManualApplyRunState::kStopped;
+    case STATE_RUNNING:
+      return easiroc::ManualApplyRunState::kRunning;
+    case STATE_PAUSED:
+      return easiroc::ManualApplyRunState::kPaused;
+    default:
+      return easiroc::ManualApplyRunState::kUnknown;
+  }
+}
+
+void publish_completed_diagnostic();
+
+void process_manual_apply_request() {
+  const std::string request_path =
+      odb_path(kCommandsPath, "ASICSlowControl/ApplyRequestId");
+  DWORD request_id = 0;
+  if (!read_odb_dword(request_path, &request_id) ||
+      request_id <= g_state.asic_apply.last_handled_request_id)
+    return;
+
+  const bool another_apply_in_progress = g_state.asic_apply.apply_in_progress;
+  const auto transition =
+      easiroc::beginManualApplyRequest(g_state.asic_apply, request_id);
+  if (!transition.handled) return;
+  g_state.asic_apply = transition.pending;
+  publish_runtime_variables();
+
+  // Serialize manual writes with the read-only startup/status diagnostic so
+  // two RBCP clients in this frontend never access the device concurrently.
+  if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
+  publish_completed_diagnostic();
+
+  const std::time_t now = std::time(nullptr);
+  const std::uint64_t unix_time =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  bool run_state_ok = false;
+  const auto run_state = read_manual_apply_run_state(&run_state_ok);
+  if (!run_state_ok) {
+    g_state.asic_apply = easiroc::rejectManualApplyRequest(
+        g_state.asic_apply,
+        "Cannot verify Run state for manual ASIC slow-control apply",
+        unix_time);
+    publish_runtime_variables();
+    return;
+  }
+
+  FrontendSettings apply_settings;
+  if (read_settings(&apply_settings) != SUCCESS) {
+    g_state.asic_apply = easiroc::rejectManualApplyRequest(
+        g_state.asic_apply,
+        "Cannot snapshot EASIROC Settings for manual slow-control apply",
+        unix_time);
+    publish_runtime_variables();
+    return;
+  }
+  // This local copy is the complete immutable request snapshot. Neither the
+  // image nor LastApplied is populated from live ODB after this point.
+  g_state.settings = apply_settings;
+
+  const easiroc::ManualApplyRequestContext context{
+      run_state, apply_settings.enabled, another_apply_in_progress};
+  std::unique_ptr<RbcpClient> manual_rbcp;
+  const auto result = easiroc::executeManualApplyBackend(
+      g_state.asic_apply, context, apply_settings.asic_slow_control,
+      g_state.last_applied, g_state.hardware_state_indeterminate, unix_time,
+      [](const easiroc::ManualApplyStatus& status) {
+        g_state.asic_apply = status;
+        publish_runtime_variables();
+      },
+      [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
+        if (!manual_rbcp)
+          manual_rbcp = std::make_unique<RbcpClient>(apply_settings.ip_address,
+                                                     kRbcpPort);
+        cm_msg(MINFO, "manual_apply",
+               "ASIC slow-control RBCP write: address 0x%08x, %zu byte(s)",
+               static_cast<unsigned>(address), data.size());
+        manual_rbcp->write(address, data);
+      },
+      [](unsigned milliseconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+      });
+
+  g_state.hardware_state_indeterminate =
+      result.hardware_state_indeterminate;
+  g_state.asic_apply = result.terminal;
+  if (result.last_applied_changed) {
+    if (publish_last_applied_settings(result.last_applied)) {
+      g_state.last_applied = result.last_applied;
+    } else {
+      g_state.asic_apply.last_successful_request_id =
+          transition.pending.last_successful_request_id;
+      g_state.asic_apply.state = easiroc::ManualApplyState::kFailed;
+      g_state.asic_apply.last_attempt_succeeded = false;
+      g_state.asic_apply.last_apply_error =
+          "ASIC slow-control sequence succeeded, but LastApplied could not "
+          "be saved to ODB";
+      load_last_applied_settings();
+    }
+  }
+  publish_runtime_variables();
+  if (g_state.asic_apply.state == easiroc::ManualApplyState::kSucceeded) {
+    cm_msg(MINFO, "manual_apply",
+           "Request %u ASIC slow-control seven-transaction sequence "
+           "succeeded; LastApplied records transmitted settings, not ASIC "
+           "readback",
+           static_cast<unsigned>(request_id));
+  } else {
+    cm_msg(MINFO, "manual_apply", "WARNING: Request %u %s: %s",
+           static_cast<unsigned>(request_id),
+           easiroc::manualApplyStateName(g_state.asic_apply.state),
+           g_state.asic_apply.last_apply_error.c_str());
+  }
 }
 
 void set_firmware_readback_valid(bool valid) {
@@ -639,7 +1088,6 @@ void reset_software_readout_state() {
 void set_disabled_runtime_state() {
   reset_software_readout_state();
   g_state.runtime = {};
-  reset_apply_status_for_bor();
   g_state.firmware_observation = {};
   set_firmware_readback_valid(false);
 }
@@ -812,10 +1260,6 @@ void populate_run_snapshot(const FrontendSettings& settings) {
   auto& snapshot = g_state.run_snapshot;
   snapshot.requested = settings;
   snapshot.enabled_for_run = settings.enabled;
-  snapshot.apply.attempted = g_state.asic_apply.apply_attempted;
-  snapshot.apply.sequence_succeeded =
-      g_state.asic_apply.sequence_succeeded;
-  snapshot.apply.error = g_state.asic_apply.current_error;
   snapshot.firmware =
       settings.enabled && g_state.firmware_observation.valid &&
               g_state.firmware_observation.observed_ip_address ==
@@ -841,13 +1285,33 @@ void publish_failed_run_snapshot(const FrontendSettings& settings) {
            "Cannot publish failed EASIROC RunSnapshot");
 }
 
+void warn_for_bor_consistency(
+    const easiroc::AsicSlowControlConsistencySnapshot& consistency) {
+  switch (consistency.status) {
+    case easiroc::HardwareConfigurationStatus::kMismatch:
+      cm_msg(MINFO, "begin_of_run",
+             "WARNING: EASIROC slow-control Settings differ from "
+             "LastApplied: %s",
+             consistency.detail.c_str());
+      return;
+    case easiroc::HardwareConfigurationStatus::kUnknown:
+      cm_msg(MINFO, "begin_of_run",
+             "WARNING: EASIROC slow-control has no valid LastApplied "
+             "configuration");
+      return;
+    case easiroc::HardwareConfigurationStatus::kIndeterminate:
+      cm_msg(MINFO, "begin_of_run",
+             "WARNING: EASIROC slow-control hardware state is "
+             "indeterminate");
+      return;
+    case easiroc::HardwareConfigurationStatus::kMatch:
+      return;
+  }
+}
+
 bool configuration_ready(const FrontendSettings& settings) {
   if (!g_state.run_snapshot.frontend_bor_complete) return false;
   if (!settings.enabled) return true;
-  if (settings.asic_slow_control.apply_at_bor &&
-      (!g_state.asic_apply.apply_attempted ||
-       !g_state.asic_apply.sequence_succeeded))
-    return false;
   return g_state.runtime.enabled_for_run &&
          g_state.runtime.rbcp_communication_ok &&
          g_state.runtime.tcp_reachable && g_state.runtime.tcp_connected &&
@@ -901,6 +1365,8 @@ INT frontend_init() {
 
   const INT settings_status = read_settings(&g_state.settings);
   if (settings_status != SUCCESS) return settings_status;
+  if (!load_last_applied_settings()) return FE_ERR_ODB;
+  if (!publish_runtime_variables()) return FE_ERR_ODB;
   if (!g_state.settings.enabled) {
     set_disabled_runtime_state();
     publish_runtime_variables();
@@ -938,7 +1404,6 @@ INT begin_of_run(INT run_number, char* error) {
     return FE_ERR_ODB;
   }
   reset_run_snapshot(run_number);
-  reset_apply_status_for_bor();
 
   // The read-only startup diagnostic must not share TCP/RBCP access with an
   // active acquisition.
@@ -967,7 +1432,31 @@ INT begin_of_run(INT run_number, char* error) {
     return FE_ERR_ODB;
   }
 
+  easiroc::AppliedAsicSlowControlSettings bor_last_applied;
+  bool bor_hardware_state_indeterminate = false;
+  if (!read_last_applied_settings(&bor_last_applied,
+                                  &bor_hardware_state_indeterminate)) {
+    if (error != nullptr)
+      std::snprintf(error, 256,
+                    "Cannot read EASIROC LastApplied settings from ODB");
+    publish_failed_run_snapshot(run_settings);
+    publish_runtime_variables();
+    mark_configuration_failed(run_number);
+    return FE_ERR_ODB;
+  }
+  g_state.run_snapshot.consistency = easiroc::snapshotAsicSlowControlConsistency(
+      run_settings.asic_slow_control, bor_last_applied,
+      bor_hardware_state_indeterminate);
+  if (easiroc::shouldWarnForAsicSlowControlConsistency(
+          run_settings.enabled, g_state.run_snapshot.consistency)) {
+    warn_for_bor_consistency(g_state.run_snapshot.consistency);
+  }
+
   g_state.settings = run_settings;
+  // Capture the validated requested configuration before any BOR hardware
+  // access. The completed snapshot is published only after acquisition setup
+  // succeeds, preserving FrontendBORComplete semantics.
+  populate_run_snapshot(run_settings);
   g_state.run_active = true;
   if (!run_settings.enabled) {
     set_disabled_runtime_state();
@@ -1049,37 +1538,6 @@ INT begin_of_run(INT run_number, char* error) {
         easiroc::kTcpConnectTimeoutMilliseconds);
     g_state.runtime.tcp_reachable = true;
     g_state.runtime.tcp_connected = true;
-
-    const std::time_t apply_time = std::time(nullptr);
-    const std::uint64_t apply_unix_time =
-        apply_time < 0 ? 0 : static_cast<std::uint64_t>(apply_time);
-    const auto apply_result = easiroc::applyAsicSlowControlAtBor(
-        run_settings.asic_slow_control,
-        [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
-          cm_msg(MINFO, "begin_of_run",
-                 "ASIC slow-control RBCP write: address 0x%08x, %zu byte(s)",
-                 static_cast<unsigned>(address), data.size());
-          g_state.rbcp->write(address, data);
-        },
-        [](unsigned milliseconds) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-        });
-    record_apply_result(run_number, apply_result, apply_unix_time);
-    if (!easiroc::asicApplyPermitsDaqOn(apply_result)) {
-      g_state.runtime.acquisition_fault = true;
-      g_state.runtime.last_error = apply_result.error;
-      publish_runtime_variables();
-      publish_failed_run_snapshot(run_settings);
-      cm_msg(MERROR, "begin_of_run", "%s", apply_result.error.c_str());
-      throw std::runtime_error(apply_result.error);
-    }
-    if (apply_result.attempted) {
-      g_state.runtime.rbcp_communication_ok = true;
-      cm_msg(MINFO, "begin_of_run",
-             "Run %d ASIC slow-control seven-transaction sequence completed; "
-             "this confirms transport completion, not ASIC readback",
-             run_number);
-    }
 
     const std::size_t drained =
         g_state.tcp->drain(kDrainQuietMs, kDrainMaximumMs);
@@ -1311,12 +1769,15 @@ INT read_physics_event(char* pevent, INT) {
 
 INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
+  process_manual_apply_request();
   publish_runtime_variables();
 
   if (g_state.run_active) return 0;
 
   FrontendSettings settings;
   if (read_settings(&settings) == SUCCESS) {
+    g_state.settings = settings;
+    publish_runtime_variables();
     if (settings.enabled) {
       start_diagnostic(settings.ip_address);
     } else {

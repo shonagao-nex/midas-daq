@@ -27,9 +27,9 @@ AsicApplyResult executeAsicApplyPlan(
     const std::vector<Transaction>& plan, const SlowControlWrite& write,
     const SlowControlDelay& delay);
 
-// Applies only the two complete ASIC images produced from the verified legacy
-// site baseline. ApplyAtBOR=false returns without encoding, planning, writing,
-// or delaying.
+// Legacy preparation wrapper retained for offline coverage. The production
+// BOR path does not call this function. ApplyAtBOR=false returns without
+// encoding, planning, writing, or delaying.
 AsicApplyResult applyAsicSlowControlAtBor(
     const AsicSlowControlSettings& settings, const SlowControlWrite& write,
     const SlowControlDelay& delay);

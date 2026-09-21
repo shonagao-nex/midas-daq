@@ -284,16 +284,25 @@ std::vector<Transaction> SlowControlPolicy::buildAsicApplyPlan(
   return plan;
 }
 
+SlowControlEncoder::Image SlowControlPolicy::encodeLegacySiteAsicOverlay(
+    std::uint16_t dac_code, std::uint16_t dac_slope,
+    const std::array<std::uint16_t, 32>& input_dac) {
+  auto config = EasirocSlowControlConfig::legacySiteDefaults();
+  config.setScalar(SlowField::kDacCode, dac_code);
+  config.setScalar(SlowField::kDacSlope, dac_slope);
+  config.setChannels(SlowField::kInputDac, input_dac);
+  return SlowControlEncoder::encode(config);
+}
+
 AsicSlowControlImages SlowControlPolicy::encodeLegacySiteThresholdOverlay(
     std::uint16_t asic1_dac_code, std::uint16_t asic1_dac_slope,
     std::uint16_t asic2_dac_code, std::uint16_t asic2_dac_slope) {
-  auto first = EasirocSlowControlConfig::legacySiteDefaults();
-  auto second = EasirocSlowControlConfig::legacySiteDefaults();
-  first.setScalar(SlowField::kDacCode, asic1_dac_code);
-  first.setScalar(SlowField::kDacSlope, asic1_dac_slope);
-  second.setScalar(SlowField::kDacCode, asic2_dac_code);
-  second.setScalar(SlowField::kDacSlope, asic2_dac_slope);
-  return {SlowControlEncoder::encode(first), SlowControlEncoder::encode(second)};
+  std::array<std::uint16_t, 32> legacy_input_dac{};
+  legacy_input_dac.fill(350);
+  return {encodeLegacySiteAsicOverlay(asic1_dac_code, asic1_dac_slope,
+                                      legacy_input_dac),
+          encodeLegacySiteAsicOverlay(asic2_dac_code, asic2_dac_slope,
+                                      legacy_input_dac)};
 }
 
 std::array<std::uint8_t, 20> SlowControlPolicy::encodeProbe(

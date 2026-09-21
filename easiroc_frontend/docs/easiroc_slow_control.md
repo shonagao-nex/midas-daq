@@ -554,6 +554,12 @@ execute a transaction.
   independently for ASIC1 and ASIC2, validates and replaces only the 10-bit
   DAC code and 1-bit DAC slope, and returns two complete encoded images. It
   does not mutate a shared baseline.
+- `SlowControlPolicy::encodeLegacySiteAsicOverlay()` is a pure, per-ASIC
+  helper that copies `legacySiteDefaults()`, overlays the discriminator DAC
+  code/slope and all 32 9-bit Input DAC values, and returns one complete
+  57-byte image through the existing encoder. The Settings snapshot already
+  contains all of these requested values. The production frontend calls it
+  only from the STOPPED-only manual-apply backend; BOR never calls it.
 - `SlowControlPolicy::buildAsicApplyPlan()` accepts two complete 57-byte images
   and emits only the seven ASIC shift/latch operations: initial direct control,
   ASIC1 write, ASIC2 write, start-cycle assertion, 100 ms delay, load/latch,
@@ -586,30 +592,129 @@ and read-register selection, big-endian pedestal/time-window data,
 selectable-logic layout, trigger width, and default trigger delays. No ODB,
 hardware readback, transport, or network operation is involved.
 
-## ODB threshold snapshot stage
+## ODB ASIC settings snapshot stage
 
 The frontend defines discriminator settings in
 `/Equipment/EASIROC/Settings`: `ASICSlowControl/ApplyAtBOR` (BOOL, false) and
 `ASIC1`/`ASIC2` `DiscriminatorDACCode` (INT, 600) and
-`DiscriminatorDACSlope` (INT, 1). Existing keys are preserved; defaults are
-created only for missing keys. Slope 0 means coarse and slope 1 means fine.
+`DiscriminatorDACSlope` (INT, 1). Each ASIC also has `InputDAC`, a 32-element
+INT array indexed by local channel 0--31, with every missing-key default set to
+350. Existing keys are preserved and are never overwritten by initialization.
+Slope 0 means coarse and slope 1 means fine.
 
 At BOR these values are read once into `FrontendSettings`. For an enabled
-frontend, each DAC code must be 0--1023 and each slope must be 0 or 1. A
+frontend, each discriminator DAC code must be 0--1023, each slope must be 0 or
+1, and every Input DAC value must fit its confirmed 9-bit field (0--511). A
 disabled frontend skips validation of this unused hardware configuration. The
-same local values are published under `RunSnapshot/Requested`, and the
-RunSnapshot schema version is 3. Since the ECFG bank serializes the complete
-RunSnapshot subtree, those requested values are included in its JSON payload.
+same local values, including both 32-element Input DAC arrays, are published
+under `RunSnapshot/Requested`, and the RunSnapshot schema version is 5. Since
+the ECFG bank serializes the complete RunSnapshot subtree, those requested
+values are included in its JSON payload without separate ECFG logic.
 
-With `ApplyAtBOR=false`, BOR does not encode an ASIC image, build a plan, or
-invoke the executor. With `ApplyAtBOR=true`, BOR overlays the requested
-thresholds on independent copies of `legacySiteDefaults()`, builds the
-ASIC-only plan, and completes all seven transactions before the
-pre-acquisition drain and DAQ ON write. Any failure aborts BOR before DAQ ON.
+`ApplyAtBOR` is retained as a deprecated compatibility field. It must be
+false for an enabled frontend. If it is true, BOR rejects the setting before
+creating acquisition TCP/RBCP connections, draining the data stream, issuing
+DAQ ON, or writing ASIC slow-control registers. A disabled frontend continues
+to ignore unused slow-control settings, including this deprecated field.
 
-`Variables/ASICSlowControl` publishes `ApplyAttempted`,
-`ApplySequenceSucceeded`, `LastApplyError`, `LastApplyRunNumber`, and
-`LastApplyUnixTime`. `RunSnapshot/Apply` publishes the per-BOR `Attempted`,
-`SequenceSucceeded`, and `Error` values. These fields report only executor and
-transport completion. They are not ASIC readback, and no `Readback/ASIC`
-subtree is created.
+BOR never encodes an ASIC image, builds an ASIC apply plan, invokes the apply
+executor, performs a slow-control RBCP write, or waits for the 100 ms apply
+delay. Discriminator DAC and Input DAC values are run-independent
+configuration: BOR only snapshots and validates them, publishes them under
+`RunSnapshot/Requested`, and records that snapshot in ECFG. Hardware apply is
+available only through the explicit manual command while the run is STOPPED.
+The encoder, ASIC-only plan builder, and transaction executor are called only
+from that manual path.
+
+Older ODBs may retain the BOR-oriented `ApplyAttempted`,
+`ApplySequenceSucceeded`, and `LastApplyRunNumber` keys. The frontend no longer
+publishes or resets those obsolete Variables. `RunSnapshot/Apply` retains its
+compatible per-BOR `Attempted`, `SequenceSucceeded`, and `Error` fields and
+reports no BOR attempt. These fields never represent ASIC readback, and no
+`Readback/ASIC` subtree is created.
+
+## Manual apply request mailbox stage
+
+The first manual-apply backend stage adds the monotonic `DWORD` request token
+`/Equipment/EASIROC/Commands/ASICSlowControl/ApplyRequestId`. The frontend
+polls it from the existing periodic Status equipment and handles a request only
+when it is greater than `Variables/ASICSlowControl/LastHandledRequestId`.
+Writing the same ID again cannot replay a request.
+
+`Variables/ASICSlowControl` publishes `ActiveRequestId`,
+`LastHandledRequestId`, `LastSuccessfulRequestId`, `ApplyState`,
+`ApplyInProgress`, `LastAttemptSucceeded`, `LastApplyError`, and
+`LastApplyUnixTime`. The supported state names are `Idle`, `Pending`,
+`Applying`, `Succeeded`, `Failed`, `Rejected`, and `Indeterminate`. The older
+BOR-oriented status keys are no longer published; the new fields in the same
+subtree own manual command acknowledgement status.
+
+On frontend startup, a request ID newer than the saved acknowledgement is
+classified as stale, acknowledged as `Indeterminate`, and never executed.
+This prevents a restart from replaying a persistent ODB command. New requests
+are accepted into `Pending` only in the normal frontend context and are
+rejected when the run is not STOPPED, the frontend is disabled, another apply
+is active, or the Settings snapshot fails validation. A safe request snapshots
+Settings once, enters `Applying`, overlays both thresholds and all Input DACs
+onto independent legacy-site baselines, and executes only the seven ASIC
+shift/latch transactions. Save to ODB and Apply are separate operations:
+editing Settings alone never writes hardware.
+
+All seven transactions must succeed before the request is acknowledged as
+`Succeeded`. The executor neither retries nor rolls back. A stale startup
+request remains acknowledgement-only and can never enter the hardware path.
+The WebGUI remains future work.
+
+## LastApplied configuration record stage
+
+`Settings` remains the desired, current ODB configuration. In contrast,
+`Variables/ASICSlowControl/LastApplied` is a record of the **last successfully
+transmitted configuration; not ASIC readback**. It contains `Valid`,
+`RequestId`, `ApplyUnixTime`, and the discriminator threshold and 32 Input DAC
+values for both ASICs. Fresh keys are initialized with `Valid = FALSE`, zero
+identifiers/timestamp, and zero-valued payload fields; existing ODB values are
+preserved.
+
+The frontend never copies Settings, legacy defaults, or nominal values into
+LastApplied merely to populate it. Only successful completion of the manual
+seven-transaction sequence updates it, using the immutable Settings snapshot
+that produced the transmitted images. Rejected or failed requests leave the
+previous LastApplied values and `LastSuccessfulRequestId` unchanged. Saving
+new Settings values therefore never changes LastApplied.
+
+`Variables/ASICSlowControl/ConfigurationMatch`, `ConfigurationStatus`, and
+`ConfigurationDetail` compare desired Settings with the LastApplied record.
+The status is `Unknown` when `Valid` is false, `Match` only when every ASIC
+threshold/slope/InputDAC value agrees, and `Mismatch` with the first differing
+field (for example `ASIC2 InputDAC[17] differs`) otherwise. `ApplyAtBOR` is
+not compared because it is a deprecated policy field rather than an ASIC
+hardware setting.
+
+`HardwareStateIndeterminate` is kept distinct from LastApplied. A partial
+manual-apply failure retains the previous successful LastApplied record and
+sets this flag; then ConfigurationStatus is `Indeterminate`, never `Match`.
+No rollback is attempted because LastApplied is a transmission record, not
+ASIC readback. A subsequent fully successful manual apply clears the flag.
+
+## BOR consistency snapshot stage
+
+BOR still performs no slow-control hardware write. After taking and validating
+the requested Settings snapshot, it takes one independent snapshot of
+LastApplied and `HardwareStateIndeterminate`, then derives a fixed consistency
+record with `compareAsicSlowControlSettings()`. It does not reuse the live
+Variables status and never rereads either ODB subtree for that run.
+
+`RunSnapshot/Consistency` contains `LastAppliedValid`,
+`ConfigurationMatch`, `HardwareStateIndeterminate`, `LastAppliedRequestId`,
+`LastAppliedUnixTime`, `Status`, and `Detail`. `Requested` already preserves
+the complete desired configuration, so LastApplied's 64 Input DAC values are
+not duplicated. SchemaVersion 5 causes the existing full-RunSnapshot ECFG JSON
+serialization to include this subtree without ECFG-specific logic.
+
+Only a valid, non-indeterminate and exactly equal LastApplied record is
+`Match`. An invalid record is `Unknown`; a difference is `Mismatch`; and a
+hardware-state uncertainty is `Indeterminate`, even if the stored values
+match. Consistency never rejects BOR. For enabled runs only, each non-match
+emits one BOR warning; disabled runs emit no such warning. `ApplyAtBOR=true`
+continues to be rejected before any hardware access and before normal DAQ
+startup.

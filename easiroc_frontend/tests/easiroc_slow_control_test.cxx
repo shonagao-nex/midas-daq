@@ -70,6 +70,22 @@ void checkOnlyThresholdBitsChanged(
           message + " at byte " + std::to_string(byte));
   }
 }
+
+std::array<std::uint16_t, 32> legacyInputDac() {
+  std::array<std::uint16_t, 32> values{};
+  values.fill(350);
+  return values;
+}
+
+easiroc::SlowControlEncoder::Image expectedAsicOverlay(
+    std::uint16_t dac_code, std::uint16_t dac_slope,
+    const std::array<std::uint16_t, 32>& input_dac) {
+  auto config = easiroc::EasirocSlowControlConfig::legacySiteDefaults();
+  config.setScalar(easiroc::SlowField::kDacCode, dac_code);
+  config.setScalar(easiroc::SlowField::kDacSlope, dac_slope);
+  config.setChannels(easiroc::SlowField::kInputDac, input_dac);
+  return easiroc::SlowControlEncoder::encode(config);
+}
 }  // namespace
 
 int main() {
@@ -114,6 +130,85 @@ int main() {
               first.values(easiroc::SlowField::kEnable32Triggers) ==
                   std::vector<std::uint16_t>{1},
           "legacy enable/control baseline was not retained");
+
+    const auto baseline_input_dac = legacyInputDac();
+    const auto full_baseline_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac);
+    check(full_baseline_overlay.size() == 57,
+          "full ASIC overlay image is not 57 bytes");
+    check(full_baseline_overlay == kLegacyYamlImage,
+          "full default overlay differs from legacy ConfigLoader image");
+
+    for (const auto channel : {std::size_t{0}, std::size_t{15},
+                               std::size_t{31}}) {
+      auto input_dac = baseline_input_dac;
+      input_dac[channel] = static_cast<std::uint16_t>(351 + channel);
+      const auto overlay =
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, input_dac);
+      check(overlay == expectedAsicOverlay(600, 1, input_dac),
+            "single-channel InputDAC overlay changed another slow-control "
+            "field at channel " +
+                std::to_string(channel));
+      check(overlay != full_baseline_overlay,
+            "single-channel InputDAC overlay did not change the image at "
+            "channel " +
+                std::to_string(channel));
+      check(encodedDacCode(overlay) == 600 &&
+                encodedDacSlope(overlay) == 1,
+            "single-channel InputDAC overlay changed the threshold");
+    }
+
+    for (const auto boundary : {std::uint16_t{0}, std::uint16_t{511}}) {
+      auto input_dac = baseline_input_dac;
+      input_dac[16] = boundary;
+      const auto overlay =
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, input_dac);
+      check(overlay == expectedAsicOverlay(600, 1, input_dac),
+            "InputDAC boundary overlay differs from existing encoder output");
+    }
+
+    auto combined_input_dac = baseline_input_dac;
+    combined_input_dac[0] = 351;
+    combined_input_dac[31] = 349;
+    const auto combined_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            601, 1, combined_input_dac);
+    check(combined_overlay ==
+              expectedAsicOverlay(601, 1, combined_input_dac),
+          "combined threshold/InputDAC overlay changed a baseline-only field");
+    check(encodedDacCode(combined_overlay) == 601 &&
+              encodedDacSlope(combined_overlay) == 1,
+          "combined overlay encoded an incorrect threshold");
+
+    auto asic1_input_dac = baseline_input_dac;
+    auto asic2_input_dac = baseline_input_dac;
+    asic1_input_dac[0] = 111;
+    asic2_input_dac[0] = 222;
+    asic2_input_dac[31] = 333;
+    const auto asic1_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, asic1_input_dac);
+    const auto asic2_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, asic2_input_dac);
+    check(asic1_overlay == expectedAsicOverlay(600, 1, asic1_input_dac) &&
+              asic2_overlay == expectedAsicOverlay(600, 1, asic2_input_dac) &&
+              asic1_overlay != asic2_overlay,
+          "ASIC1/ASIC2 full overlays were not independent");
+    check(easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, asic1_input_dac) == asic1_overlay,
+          "ASIC2 overlay modified ASIC1 helper state");
+    expectFailure(
+        [baseline_input_dac] {
+          auto invalid = baseline_input_dac;
+          invalid[31] = 512;
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, invalid);
+        },
+        "full ASIC overlay accepted an out-of-range InputDAC value");
 
     const auto default_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(

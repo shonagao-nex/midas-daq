@@ -1,0 +1,70 @@
+<!doctype html>
+<html class="mcss" lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EASIROC Slow Control</title>
+  <link rel="stylesheet" href="midas.css">
+  <link rel="stylesheet" href="easiroc.css">
+  <script src="midas.js"></script>
+  <script src="mhttpd.js"></script>
+  <script src="easiroc-mock-data.js"></script>
+  <script src="easiroc.js" defer></script>
+</head>
+<body class="mcss" onload="initializeEasirocPage()">
+  <div id="mheader"></div><div id="msidenav"></div>
+  <main id="mmain" class="easiroc-main">
+    <noscript><p class="message error">JavaScript is required for this page.</p></noscript>
+    <header class="page-header">
+      <div><h1>EASIROC Slow Control</h1><p>Settings are editable and applicable only while STOPPED. BOR never writes slow-control hardware; it records Settings versus LastApplied consistency.</p></div>
+      <div class="run-state"><span>Run state</span><strong id="run-state">—</strong></div>
+    </header>
+    <div id="message" class="message" role="alert" hidden></div>
+    <section id="mock-panel" class="mock-panel" hidden>
+      <strong>MOCK PREVIEW</strong><span>No MIDAS or hardware access is performed.</span>
+      <span id="mock-buttons" class="mock-buttons"></span>
+    </section>
+
+    <section class="panel operation-panel">
+      <div><h2>Operation</h2><p id="operation-note">Loading frontend status…</p></div>
+      <div class="operation-actions">
+        <button id="save-button" type="button" disabled>Save to ODB</button>
+        <button id="apply-button" type="button" disabled>Apply to hardware</button>
+        <strong id="save-state" class="save-state">Loading</strong>
+      </div>
+    </section>
+
+    <section class="panel settings-panel">
+      <div class="section-title"><div><h2>Desired Settings</h2><p>Typing changes only staged browser values. Save to ODB before Apply to hardware.</p></div><strong id="unsaved-state" class="unsaved clean">Saved</strong></div>
+      <div id="settings-lock" class="settings-lock" hidden>Settings are locked unless Run state is STOPPED.</div>
+      <div class="asic-layout">
+        <section class="asic-card" aria-labelledby="asic1-title"><h3 id="asic1-title">ASIC1</h3><div class="thresholds"><label>Discriminator DAC Code <input id="asic1-dac-code" type="number" min="0" max="1023" step="1" disabled></label><label>Discriminator Slope <select id="asic1-dac-slope" disabled><option value="0">0 — coarse</option><option value="1">1 — fine</option></select></label></div><h4>Input DAC</h4><div id="asic1-input-dac" class="input-dac-grid" aria-label="ASIC1 Input DAC channels"></div></section>
+        <section class="asic-card" aria-labelledby="asic2-title"><h3 id="asic2-title">ASIC2</h3><div class="thresholds"><label>Discriminator DAC Code <input id="asic2-dac-code" type="number" min="0" max="1023" step="1" disabled></label><label>Discriminator Slope <select id="asic2-dac-slope" disabled><option value="0">0 — coarse</option><option value="1">1 — fine</option></select></label></div><h4>Input DAC</h4><div id="asic2-input-dac" class="input-dac-grid" aria-label="ASIC2 Input DAC channels"></div></section>
+      </div>
+    </section>
+
+    <section class="panel status-panel">
+      <h2>Manual Apply Status</h2>
+      <dl class="status-grid">
+        <div><dt>ApplyState</dt><dd id="apply-state">—</dd></div><div><dt>ApplyInProgress</dt><dd id="apply-in-progress">—</dd></div><div><dt>ActiveRequestId</dt><dd id="active-request-id">—</dd></div><div><dt>LastHandledRequestId</dt><dd id="last-handled-request-id">—</dd></div><div><dt>LastSuccessfulRequestId</dt><dd id="last-successful-request-id">—</dd></div><div><dt>LastAttemptSucceeded</dt><dd id="last-attempt-succeeded">—</dd></div><div><dt>LastApplyUnixTime</dt><dd id="last-apply-unix-time">—</dd></div><div class="wide"><dt>LastApplyError</dt><dd id="last-apply-error">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel status-panel">
+      <h2>Settings versus LastApplied</h2>
+      <dl class="status-grid">
+        <div><dt>ConfigurationStatus</dt><dd id="configuration-status" class="configuration-status">—</dd></div><div><dt>ConfigurationMatch</dt><dd id="configuration-match">—</dd></div><div><dt>HardwareStateIndeterminate</dt><dd id="hardware-state-indeterminate">—</dd></div><div class="wide"><dt>ConfigurationDetail</dt><dd id="configuration-detail">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel last-applied-panel">
+      <h2>LastApplied</h2><p>Last successfully transmitted configuration; not ASIC readback.</p>
+      <dl class="status-grid"><div><dt>Valid</dt><dd id="last-applied-valid">—</dd></div><div><dt>RequestId</dt><dd id="last-applied-request-id">—</dd></div><div><dt>ApplyUnixTime</dt><dd id="last-applied-unix-time">—</dd></div></dl>
+      <details><summary>Show transmitted ASIC settings</summary><div id="last-applied-details" class="last-applied-details">No LastApplied settings loaded.</div></details>
+    </section>
+
+    <details class="panel deprecated"><summary>Advanced / Deprecated</summary><p>ApplyAtBOR: <strong id="apply-at-bor">—</strong>. Must remain FALSE. This page does not provide a control to change it.</p></details>
+    <nav class="page-links"><a href="daq.html">DAQ dashboard</a><a href="/?cmd=odb&amp;odb_path=%2FEquipment%2FEASIROC">EASIROC ODB</a><a href="/?cmd=Messages">MIDAS Messages</a></nav>
+  </main>
+</body>
+</html>

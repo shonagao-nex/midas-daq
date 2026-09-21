@@ -42,11 +42,13 @@ int main() {
     auto enabled = disabled;
     enabled.apply_at_bor = true;
     std::vector<ObservedOperation> operations;
+    std::vector<std::vector<std::uint8_t>> baseline_write_payloads;
     const auto succeeded = easiroc::applyAsicSlowControlAtBor(
         enabled,
         [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
           operations.push_back({easiroc::TransactionType::kWrite, address,
                                 data.size(), 0});
+          baseline_write_payloads.push_back(data);
         },
         [&](unsigned milliseconds) {
           operations.push_back(
@@ -83,6 +85,22 @@ int main() {
             "non-ASIC aggregate-plan transaction reached executor");
     }
 
+    auto input_dac_changed = enabled;
+    input_dac_changed.asic[0].input_dac[0] = 0;
+    input_dac_changed.asic[0].input_dac[17] = 511;
+    input_dac_changed.asic[1].input_dac[31] = 0;
+    std::vector<std::vector<std::uint8_t>> changed_write_payloads;
+    const auto input_dac_ignored = easiroc::applyAsicSlowControlAtBor(
+        input_dac_changed,
+        [&](std::uint32_t, const std::vector<std::uint8_t>& data) {
+          changed_write_payloads.push_back(data);
+        },
+        [](unsigned) {});
+    check(input_dac_ignored.sequence_succeeded,
+          "valid InputDAC values blocked the legacy threshold-only wrapper");
+    check(changed_write_payloads == baseline_write_payloads,
+          "InputDAC values changed the legacy threshold-only wrapper");
+
     writes = 0;
     delays = 0;
     const auto failed = easiroc::applyAsicSlowControlAtBor(
@@ -98,7 +116,8 @@ int main() {
           "executor continued after the failing write");
     check(failed.error.find("transaction 3/7 failed: mock RBCP failure") !=
                   std::string::npos &&
-              failed.error.find("state may be unknown") != std::string::npos,
+              failed.error.find("state may be indeterminate") !=
+                  std::string::npos,
           "LastApplyError text lacks transaction cause or safety warning");
     bool daq_on_called = false;
     if (easiroc::asicApplyPermitsDaqOn(failed)) daq_on_called = true;

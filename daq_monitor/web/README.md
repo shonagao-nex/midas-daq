@@ -42,7 +42,8 @@ set /Custom/DAQ daq.html
 ```
 
 If `/Custom/Path` already points elsewhere, do not overwrite it. Copy or
-symlink `daq.html`, `daq.css`, `daq.js`, and `mock-data.js` into that existing
+symlink `daq.html`, `daq.css`, `daq.js`, `mock-data.js`, `easiroc.html`,
+`easiroc.css`, `easiroc.js`, and `easiroc-mock-data.js` into that existing
 directory, then set only `/Custom/DAQ` to `daq.html`.
 
 After registration the page is available from the `DAQ` side-menu entry or:
@@ -97,6 +98,27 @@ cleared by a reload. Recent messages come from MIDAS JSON-RPC
 The Alarm ON/OFF control affects only the browser beep and is stored in
 `localStorage`. It does not change any MIDAS alarm. A short Web Audio beep is
 requested only on a new transition into global ERROR.
+
+## EASIROC slow-control page
+
+`easiroc.html` is linked from the dashboard and provides a STOPPED-only
+staging view for discriminator thresholds and both 32-channel Input DAC
+arrays. Editing does not write ODB or hardware. `Save to ODB` writes the six
+Settings values and requires an ODB readback of every value before accepting
+the save. `Apply to hardware` is disabled until the staged values equal ODB,
+the run is STOPPED, EASIROC is enabled, and the frontend mailbox is idle.
+
+Apply writes one new monotonic `ApplyRequestId` to the existing command
+mailbox and waits for the frontend terminal acknowledgement; it never writes
+hardware directly. Since the frontend compares request IDs using ordinary
+ordered DWORD values, the page refuses to wrap at `0xffffffff` rather than
+replaying an old token. LastApplied is explicitly labelled as the last
+successfully transmitted configuration, not ASIC readback. `ApplyAtBOR` is
+read-only in an Advanced/Deprecated panel and is never writable from this UI.
+
+Open `easiroc.html?mock=1` for offline preview. Its scenario buttons cover
+Match, Mismatch, Unknown, Indeterminate, Applying, Succeeded, Failed,
+Rejected, and Unsaved changes without contacting MIDAS.
 
 ## Data sources
 

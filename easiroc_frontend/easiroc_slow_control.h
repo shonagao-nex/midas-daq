@@ -167,6 +167,14 @@ class SlowControlPolicy {
   static std::vector<Transaction> buildAsicApplyPlan(
       const AsicSlowControlImages& images);
 
+  // Copies the complete legacy-site production baseline for one ASIC,
+  // overlays only discriminator DAC code/slope and all 32 Input DAC values,
+  // then encodes one complete 57-byte image. The same pure helper is used for
+  // either ASIC; it has no chip-specific or global state.
+  static SlowControlEncoder::Image encodeLegacySiteAsicOverlay(
+      std::uint16_t dac_code, std::uint16_t dac_slope,
+      const std::array<std::uint16_t, 32>& input_dac);
+
   // Copies the confirmed legacy-site production baseline for both ASICs,
   // overlays only discriminator DAC code/slope, then encodes complete images.
   static AsicSlowControlImages encodeLegacySiteThresholdOverlay(

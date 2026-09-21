@@ -13,8 +13,8 @@ std::string failureMessage(std::size_t transaction_index,
   return "ASIC slow-control transaction " +
          std::to_string(transaction_index + 1) + "/" +
          std::to_string(kAsicApplyTransactionCount) + " failed: " + detail +
-         "; ASIC slow-control state may be unknown after partial apply "
-         "failure";
+         "; ASIC slow-control hardware state may be indeterminate after "
+         "partial apply failure";
 }
 
 }  // namespace
@@ -27,7 +27,8 @@ AsicApplyResult executeAsicApplyPlan(
   if (plan.size() != kAsicApplyTransactionCount) {
     result.error =
         "ASIC-only apply plan must contain exactly 7 transactions; ASIC "
-        "slow-control state may be unknown after partial apply failure";
+        "slow-control hardware state may be indeterminate after partial "
+        "apply failure";
     return result;
   }
 
