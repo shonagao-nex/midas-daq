@@ -78,6 +78,11 @@ class EasirocSlowControlConfig {
 
   static EasirocSlowControlConfig referenceDefaults();
 
+  // Reproduces the complete ASIC configuration currently established by the
+  // legacy site YAML files. This is the production baseline for future ODB
+  // overlays; the zero-initialized constructor is not a production setting.
+  static EasirocSlowControlConfig legacySiteDefaults();
+
   void setScalar(SlowField field, std::uint16_t value);
   void setChannels(SlowField field,
                    const std::array<std::uint16_t, 32>& values);
@@ -91,9 +96,13 @@ class EasirocSlowControlConfig {
 
 class SlowControlEncoder {
  public:
-  static std::array<std::uint8_t, 57> encode(
+  using Image = std::array<std::uint8_t, 57>;
+
+  static Image encode(
       const EasirocSlowControlConfig& config);
 };
+
+using AsicSlowControlImages = std::array<SlowControlEncoder::Image, 2>;
 
 enum class ProbeOutput {
   kPaHighGain,
@@ -153,6 +162,19 @@ struct SlowControlConfig {
 
 class SlowControlPolicy {
  public:
+  // Builds only the seven operations needed to shift and latch two complete
+  // ASIC images. It deliberately excludes all FPGA-side and probe settings.
+  static std::vector<Transaction> buildAsicApplyPlan(
+      const AsicSlowControlImages& images);
+
+  // Copies the confirmed legacy-site production baseline for both ASICs,
+  // overlays only discriminator DAC code/slope, then encodes complete images.
+  static AsicSlowControlImages encodeLegacySiteThresholdOverlay(
+      std::uint16_t asic1_dac_code, std::uint16_t asic1_dac_slope,
+      std::uint16_t asic2_dac_code, std::uint16_t asic2_dac_slope);
+
+  // Aggregate legacy plan. Do not use this when only ASIC images should be
+  // applied; it also writes probe and FPGA-side configuration.
   static std::vector<Transaction> buildApplyPlan(
       const SlowControlConfig& config);
 

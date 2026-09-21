@@ -1,8 +1,10 @@
 #include "midas.h"
 #include "mfe.h"
 
+#include "easiroc_asic_apply.h"
 #include "easiroc_daq_control.h"
 #include "easiroc_readout.h"
+#include "easiroc_run_settings.h"
 #include "easiroc_slow_control.h"
 #include "easiroc_status.h"
 #include "easiroc_stream.h"
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -23,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -33,7 +37,7 @@ constexpr char kInfoPath[] = "/Equipment/EASIROC/Info";
 constexpr char kReadbackPath[] = "/Equipment/EASIROC/Readback";
 constexpr char kVariablesPath[] = "/Equipment/EASIROC/Variables";
 constexpr char kRunSnapshotPath[] = "/Equipment/EASIROC/RunSnapshot";
-constexpr DWORD kRunSnapshotSchemaVersion = 1;
+constexpr DWORD kRunSnapshotSchemaVersion = 3;
 constexpr int kReceiveTimeoutMs = 100;
 constexpr int kDrainQuietMs = 100;
 constexpr int kDrainMaximumMs = 1000;
@@ -50,6 +54,7 @@ struct FrontendSettings {
   bool enabled = true;
   std::string ip_address = kDefaultIpAddress;
   easiroc::DaqEnables enables;
+  easiroc::AsicSlowControlSettings asic_slow_control;
 };
 
 struct RuntimeStatistics {
@@ -76,6 +81,15 @@ struct RuntimeState {
   RuntimeStatistics statistics;
 };
 
+struct AsicApplyRuntimeStatus {
+  bool apply_attempted = false;
+  bool sequence_succeeded = false;
+  std::string current_error;
+  std::string last_apply_error;
+  INT last_apply_run_number = 0;
+  std::uint64_t last_apply_unix_time = 0;
+};
+
 struct FirmwareObservation {
   bool valid = false;
   easiroc::FirmwareVersion firmware;
@@ -95,6 +109,7 @@ struct EasirocRunSnapshot {
   bool frontend_bor_complete = false;
   bool enabled_for_run = false;
   FrontendSettings requested;
+  easiroc::AsicApplyResult apply;
   FirmwareObservation firmware;
 };
 
@@ -111,13 +126,10 @@ struct FrontendState {
   std::deque<easiroc::DecodedEvent> pending_events;
   bool daq_start_attempted = false;
   RuntimeState runtime;
+  AsicApplyRuntimeStatus asic_apply;
   FirmwareObservation firmware_observation;
   EasirocRunSnapshot run_snapshot;
 
-  // Connection points for the existing Slow Control policy. They are not
-  // encoded or applied by this frontend.
-  easiroc::EasirocSlowControlConfig slow_control_1;
-  easiroc::EasirocSlowControlConfig slow_control_2;
 };
 
 FrontendState g_state;
@@ -141,8 +153,8 @@ struct DiagnosticWorker {
 
 DiagnosticWorker g_diagnostic;
 
-std::string odb_path(const char* base, const char* name) {
-  return std::string(base) + "/" + name;
+std::string odb_path(const char* base, std::string_view name) {
+  return std::string(base) + "/" + std::string(name);
 }
 
 bool set_odb_value(const std::string& path, const void* value, INT size,
@@ -232,16 +244,49 @@ void reset_run_snapshot(INT run_number) {
       std::to_string(snapshot.bor_unix_time) + "_feeasiroc";
 }
 
+void reset_apply_status_for_bor() {
+  g_state.asic_apply.apply_attempted = false;
+  g_state.asic_apply.sequence_succeeded = false;
+  g_state.asic_apply.current_error.clear();
+}
+
+void record_apply_result(INT run_number,
+                         const easiroc::AsicApplyResult& result,
+                         std::uint64_t attempt_unix_time) {
+  g_state.asic_apply.apply_attempted = result.attempted;
+  g_state.asic_apply.sequence_succeeded = result.sequence_succeeded;
+  g_state.asic_apply.current_error = result.error;
+  if (result.attempted) {
+    g_state.asic_apply.last_apply_run_number = run_number;
+    g_state.asic_apply.last_apply_unix_time = attempt_unix_time;
+    g_state.asic_apply.last_apply_error = result.error;
+  }
+}
+
 bool publish_run_snapshot() {
   const auto& snapshot = g_state.run_snapshot;
   const std::string metadata = odb_path(kRunSnapshotPath, "Metadata");
   const std::string requested = odb_path(kRunSnapshotPath, "Requested");
+  const std::string apply = odb_path(kRunSnapshotPath, "Apply");
   const std::string firmware = odb_path(kRunSnapshotPath, "Readback/Firmware");
   const BOOL enabled_for_run = snapshot.enabled_for_run ? TRUE : FALSE;
   const BOOL requested_enabled = snapshot.requested.enabled ? TRUE : FALSE;
   const BOOL adc = snapshot.requested.enables.adc ? TRUE : FALSE;
   const BOOL tdc = snapshot.requested.enables.tdc ? TRUE : FALSE;
   const BOOL scaler = snapshot.requested.enables.scaler ? TRUE : FALSE;
+  const BOOL apply_at_bor =
+      snapshot.requested.asic_slow_control.apply_at_bor ? TRUE : FALSE;
+  const INT asic1_dac_code =
+      snapshot.requested.asic_slow_control.asic[0].dac_code;
+  const INT asic1_dac_slope =
+      snapshot.requested.asic_slow_control.asic[0].dac_slope;
+  const INT asic2_dac_code =
+      snapshot.requested.asic_slow_control.asic[1].dac_code;
+  const INT asic2_dac_slope =
+      snapshot.requested.asic_slow_control.asic[1].dac_slope;
+  const BOOL apply_attempted = snapshot.apply.attempted ? TRUE : FALSE;
+  const BOOL apply_succeeded =
+      snapshot.apply.sequence_succeeded ? TRUE : FALSE;
   const BOOL firmware_valid = snapshot.firmware.valid ? TRUE : FALSE;
   bool ok = true;
   ok = set_odb_value(odb_path(metadata.c_str(), "SchemaVersion"),
@@ -274,6 +319,35 @@ bool publish_run_snapshot() {
                      sizeof(tdc), 1, TID_BOOL) && ok;
   ok = set_odb_value(odb_path(requested.c_str(), "ScalerEnabled"), &scaler,
                      sizeof(scaler), 1, TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[0]),
+           &apply_at_bor, sizeof(apply_at_bor), 1, TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[1]),
+           &asic1_dac_code, sizeof(asic1_dac_code), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[2]),
+           &asic1_dac_slope, sizeof(asic1_dac_slope), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[3]),
+           &asic2_dac_code, sizeof(asic2_dac_code), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
+           &asic2_dac_slope, sizeof(asic2_dac_slope), 1, TID_INT) && ok;
+
+  ok = set_odb_value(odb_path(apply.c_str(), "Attempted"),
+                     &apply_attempted, sizeof(apply_attempted), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(apply.c_str(), "SequenceSucceeded"),
+                     &apply_succeeded, sizeof(apply_succeeded), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_string(odb_path(apply.c_str(), "Error"),
+                      snapshot.apply.error, 256) && ok;
 
   ok = set_odb_value(odb_path(firmware.c_str(), "Valid"), &firmware_valid,
                      sizeof(firmware_valid), 1, TID_BOOL) && ok;
@@ -318,6 +392,10 @@ bool publish_runtime_variables() {
   const BOOL tcp_connected = g_state.runtime.tcp_connected ? TRUE : FALSE;
   const BOOL running = g_state.runtime.acquisition_running ? TRUE : FALSE;
   const BOOL fault = g_state.runtime.acquisition_fault ? TRUE : FALSE;
+  const BOOL apply_attempted =
+      g_state.asic_apply.apply_attempted ? TRUE : FALSE;
+  const BOOL apply_succeeded =
+      g_state.asic_apply.sequence_succeeded ? TRUE : FALSE;
   const std::uint64_t pending = g_state.pending_events.size();
   const std::uint64_t buffered =
       g_state.parser ? g_state.parser->bufferedBytes() : 0;
@@ -359,6 +437,23 @@ bool publish_runtime_variables() {
                 g_state.runtime.statistics.last_drain_bytes);
   PUBLISH_QWORD(statistics.c_str(), "TotalDrainBytes",
                 g_state.runtime.statistics.total_drain_bytes);
+  const std::string asic_slow_control =
+      odb_path(kVariablesPath, "ASICSlowControl");
+  ok = set_odb_value(odb_path(asic_slow_control.c_str(), "ApplyAttempted"),
+                     &apply_attempted, sizeof(apply_attempted), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "ApplySequenceSucceeded"),
+           &apply_succeeded, sizeof(apply_succeeded), 1, TID_BOOL) && ok;
+  ok = set_odb_string(
+           odb_path(asic_slow_control.c_str(), "LastApplyError"),
+           g_state.asic_apply.last_apply_error, 256) && ok;
+  ok = set_odb_value(
+           odb_path(asic_slow_control.c_str(), "LastApplyRunNumber"),
+           &g_state.asic_apply.last_apply_run_number,
+           sizeof(g_state.asic_apply.last_apply_run_number), 1, TID_INT) && ok;
+  PUBLISH_QWORD(asic_slow_control.c_str(), "LastApplyUnixTime",
+                g_state.asic_apply.last_apply_unix_time);
 #undef PUBLISH_QWORD
 #undef PUBLISH_BOOL
   return ok;
@@ -369,6 +464,8 @@ bool initialize_odb() {
   std::snprintf(default_ip, sizeof(default_ip), "%s", kDefaultIpAddress);
   const BOOL yes = TRUE;
   const BOOL no = FALSE;
+  const INT default_dac_code = easiroc::kDefaultDiscriminatorDacCode;
+  const INT default_dac_slope = easiroc::kDefaultDiscriminatorDacSlope;
   if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
@@ -378,7 +475,27 @@ bool initialize_odb() {
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/TDCEnabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ScalerEnabled"),
-                        &no, sizeof(no), 1, TID_BOOL))
+                        &no, sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[0]),
+          &no, sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[1]),
+          &default_dac_code, sizeof(default_dac_code), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[2]),
+          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[3]),
+          &default_dac_code, sizeof(default_dac_code), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
+          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT))
     return false;
 
   const DWORD channel_count = easiroc::kAdcChannelCount;
@@ -435,6 +552,20 @@ INT read_bool_setting(const char* name, bool* value) {
   return SUCCESS;
 }
 
+INT read_int_setting(const char* name, int* value) {
+  INT odb_value = static_cast<INT>(*value);
+  INT size = sizeof(odb_value);
+  const INT status =
+      db_get_value(hDB, 0, name, &odb_value, &size, TID_INT, FALSE);
+  if (status != DB_SUCCESS) {
+    cm_msg(MERROR, "read_settings", "Cannot read %s (status %d)", name,
+           status);
+    return FE_ERR_ODB;
+  }
+  *value = odb_value;
+  return SUCCESS;
+}
+
 INT read_settings(FrontendSettings* settings) {
   char ip_address[64] = {};
   INT size = sizeof(ip_address);
@@ -466,6 +597,27 @@ INT read_settings(FrontendSettings* settings) {
   status = read_bool_setting(path.c_str(), &next.enables.scaler);
   if (status != SUCCESS) return status;
 
+  path = odb_path(kSettingsPath,
+                  easiroc::kAsicSlowControlRequestedSnapshotPaths[0]);
+  status = read_bool_setting(path.c_str(),
+                             &next.asic_slow_control.apply_at_bor);
+  if (status != SUCCESS) return status;
+
+  for (std::size_t asic = 0; asic < next.asic_slow_control.asic.size(); ++asic) {
+    const std::size_t first_path = 1 + asic * 2;
+    path = odb_path(kSettingsPath,
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].dac_code);
+    if (status != SUCCESS) return status;
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 1]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].dac_slope);
+    if (status != SUCCESS) return status;
+  }
+
   *settings = next;
   return SUCCESS;
 }
@@ -487,6 +639,7 @@ void reset_software_readout_state() {
 void set_disabled_runtime_state() {
   reset_software_readout_state();
   g_state.runtime = {};
+  reset_apply_status_for_bor();
   g_state.firmware_observation = {};
   set_firmware_readback_valid(false);
 }
@@ -655,25 +808,46 @@ void handle_acquisition_error(const std::string& message) {
            transition_error);
 }
 
-bool finalize_run_snapshot(const FrontendSettings& settings) {
+void populate_run_snapshot(const FrontendSettings& settings) {
   auto& snapshot = g_state.run_snapshot;
   snapshot.requested = settings;
   snapshot.enabled_for_run = settings.enabled;
+  snapshot.apply.attempted = g_state.asic_apply.apply_attempted;
+  snapshot.apply.sequence_succeeded =
+      g_state.asic_apply.sequence_succeeded;
+  snapshot.apply.error = g_state.asic_apply.current_error;
   snapshot.firmware =
       settings.enabled && g_state.firmware_observation.valid &&
               g_state.firmware_observation.observed_ip_address ==
                   settings.ip_address
           ? g_state.firmware_observation
           : FirmwareObservation{};
+}
+
+bool finalize_run_snapshot(const FrontendSettings& settings) {
+  auto& snapshot = g_state.run_snapshot;
+  populate_run_snapshot(settings);
   snapshot.frontend_bor_complete = true;
   if (publish_run_snapshot()) return true;
   snapshot.frontend_bor_complete = false;
   return false;
 }
 
+void publish_failed_run_snapshot(const FrontendSettings& settings) {
+  populate_run_snapshot(settings);
+  g_state.run_snapshot.frontend_bor_complete = false;
+  if (!publish_run_snapshot())
+    cm_msg(MERROR, "begin_of_run",
+           "Cannot publish failed EASIROC RunSnapshot");
+}
+
 bool configuration_ready(const FrontendSettings& settings) {
   if (!g_state.run_snapshot.frontend_bor_complete) return false;
   if (!settings.enabled) return true;
+  if (settings.asic_slow_control.apply_at_bor &&
+      (!g_state.asic_apply.apply_attempted ||
+       !g_state.asic_apply.sequence_succeeded))
+    return false;
   return g_state.runtime.enabled_for_run &&
          g_state.runtime.rbcp_communication_ok &&
          g_state.runtime.tcp_reachable && g_state.runtime.tcp_connected &&
@@ -764,6 +938,7 @@ INT begin_of_run(INT run_number, char* error) {
     return FE_ERR_ODB;
   }
   reset_run_snapshot(run_number);
+  reset_apply_status_for_bor();
 
   // The read-only startup diagnostic must not share TCP/RBCP access with an
   // active acquisition.
@@ -777,6 +952,19 @@ INT begin_of_run(INT run_number, char* error) {
       std::snprintf(error, 256, "Cannot read NIM-EASIROC settings from ODB");
     mark_configuration_failed(run_number);
     return status;
+  }
+
+  if (const auto validation_error =
+          easiroc::validateAsicSlowControlBorSettings(
+              run_settings.enabled, run_settings.asic_slow_control)) {
+    cm_msg(MERROR, "begin_of_run", "%s", validation_error->c_str());
+    if (error != nullptr)
+      std::snprintf(error, 256, "%s", validation_error->c_str());
+    g_state.run_snapshot.requested = run_settings;
+    publish_failed_run_snapshot(run_settings);
+    publish_runtime_variables();
+    mark_configuration_failed(run_number);
+    return FE_ERR_ODB;
   }
 
   g_state.settings = run_settings;
@@ -861,6 +1049,38 @@ INT begin_of_run(INT run_number, char* error) {
         easiroc::kTcpConnectTimeoutMilliseconds);
     g_state.runtime.tcp_reachable = true;
     g_state.runtime.tcp_connected = true;
+
+    const std::time_t apply_time = std::time(nullptr);
+    const std::uint64_t apply_unix_time =
+        apply_time < 0 ? 0 : static_cast<std::uint64_t>(apply_time);
+    const auto apply_result = easiroc::applyAsicSlowControlAtBor(
+        run_settings.asic_slow_control,
+        [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
+          cm_msg(MINFO, "begin_of_run",
+                 "ASIC slow-control RBCP write: address 0x%08x, %zu byte(s)",
+                 static_cast<unsigned>(address), data.size());
+          g_state.rbcp->write(address, data);
+        },
+        [](unsigned milliseconds) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        });
+    record_apply_result(run_number, apply_result, apply_unix_time);
+    if (!easiroc::asicApplyPermitsDaqOn(apply_result)) {
+      g_state.runtime.acquisition_fault = true;
+      g_state.runtime.last_error = apply_result.error;
+      publish_runtime_variables();
+      publish_failed_run_snapshot(run_settings);
+      cm_msg(MERROR, "begin_of_run", "%s", apply_result.error.c_str());
+      throw std::runtime_error(apply_result.error);
+    }
+    if (apply_result.attempted) {
+      g_state.runtime.rbcp_communication_ok = true;
+      cm_msg(MINFO, "begin_of_run",
+             "Run %d ASIC slow-control seven-transaction sequence completed; "
+             "this confirms transport completion, not ASIC readback",
+             run_number);
+    }
+
     const std::size_t drained =
         g_state.tcp->drain(kDrainQuietMs, kDrainMaximumMs);
     g_state.runtime.statistics.last_drain_bytes = drained;
@@ -946,6 +1166,7 @@ INT begin_of_run(INT run_number, char* error) {
     g_state.run_active = false;
     g_state.runtime.acquisition_fault = true;
     g_state.runtime.last_error = message;
+    publish_failed_run_snapshot(run_settings);
     publish_runtime_variables();
     if (error != nullptr) std::snprintf(error, 256, "%s", message.c_str());
     mark_configuration_failed(run_number);

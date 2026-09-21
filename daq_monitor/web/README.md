@@ -1,8 +1,9 @@
 # DAQ general-user Custom page
 
-`daq.html` is the first general-user MIDAS dashboard. It reads status from
-`/DAQ/Status` and the standard MIDAS equipment statistics records. Apart from
-the Start and Stop buttons, it does not write ODB or hardware state.
+`daq.html` is the general-user MIDAS dashboard. It reads status from
+`/DAQ/Status` and the standard MIDAS equipment statistics records. Start and
+Stop use the existing MIDAS transitions. The only direct ODB writes are module
+Enable settings while the run state is STOPPED; the page never writes hardware.
 
 ## Offline preview
 
@@ -13,9 +14,10 @@ daq.html?mock=1
 ```
 
 This uses `mock-data.js`, does not contact MIDAS, and disables both transition
-buttons. Missing `midas.css`, `midas.js`, or `mhttpd.js` warnings are harmless
-when the file is opened directly; those resources are supplied by mhttpd in
-live use.
+buttons. Its scenario buttons cover STOPPED + WARNING, RUNNING + OK, and
+RUNNING + ERROR. Mock Enable switches change only the in-browser mock object.
+Missing `midas.css`, `midas.js`, or `mhttpd.js` warnings are harmless when the
+file is opened directly; those resources are supplied by mhttpd in live use.
 
 ## Live installation
 
@@ -54,13 +56,18 @@ separate deployment step.
 
 ## General-user dashboard notes
 
-The HEALTH table uses the frontend-published module records, not fixed GUI
-addresses: `/Equipment/VME/Info/<module>/BaseAddress` and
-`/Equipment/VME/Variables/<module>/{EnabledForRun,CommunicationOK}` for V792,
-V1190, V775, V1720E, and RPV130. EASIROC uses
-`/Equipment/EASIROC/Settings/Network/IPAddress` and its communication
-Variables. A missing ODB address is shown as `—`; the page does not fall back
-to a hard-coded address.
+The Equipment table uses the frontend-published module records, not fixed GUI
+addresses: `/Equipment/VME/Info/<module>/BaseAddress`, the existing
+`/Equipment/VME/Settings/<module>/Enabled` setting, and
+`/Equipment/VME/Variables/<module>/CommunicationOK` for V792, V1190, V775,
+V1720E, and RPV130. EASIROC uses `/Equipment/EASIROC/Settings/Enabled`, its
+network address setting, and its communication Variables. A missing ODB value
+is shown as `—`; the page does not fall back to a hard-coded value.
+
+Enable controls are locked for RUNNING and PAUSED. While STOPPED, a change is
+written to the existing setting and then read back before the displayed state
+is accepted. The module-name links use mhttpd's installed
+`?cmd=odb&odb_path=...` URL form and point to the corresponding Settings tree.
 
 Raw hardware `EventCounter` values are deliberately excluded from the
 general-user HEALTH table. Their meanings and readout timing differ by module,
@@ -80,8 +87,16 @@ do not affect Start or Stop. A future automatic-stop implementation could own
 `/DAQ/Settings/StopAfterSeconds` and `/DAQ/Settings/StopAfterEvents`, with
 `0` meaning disabled.
 
-`daq.html?mock=1` shows a RUNNING example with connected, disabled, and
-disconnected modules. `daq.html?mock=stopped` shows STOPPED last-run labels.
+The rate-history canvas keeps up to one day in browser memory. The visible
+range can be switched between 10 minutes, 30 minutes, 1 hour, 6 hours,
+12 hours, and 1 day. Sampling can independently be switched between 1, 5,
+10, and 30 seconds without clearing existing history. History is intentionally
+cleared by a reload. Recent messages come from MIDAS JSON-RPC
+`cm_msg_retrieve`; the standard Messages and Status links remain available.
+
+The Alarm ON/OFF control affects only the browser beep and is stored in
+`localStorage`. It does not change any MIDAS alarm. A short Web Audio beep is
+requested only on a new transition into global ERROR.
 
 ## Data sources
 
@@ -89,10 +104,14 @@ The page uses these monitor-owned records:
 
 - `/DAQ/Status/Global/{Severity,Summary,CanStart,CanStartReason}`
 - `/DAQ/Status/Run/{RunNumber,State,DurationSec}`
-- `/DAQ/Status/Frontends/VME/{Reason,EventSlipCount,CounterDiscontinuityCount}`
-- `/DAQ/Status/Frontends/EASIROC/{Reason}`
-- `/DAQ/Status/Logger/{Severity,Connected,CurrentFilename}`
-- `/DAQ/Status/Disk/{Severity,Path,FreeGB}`
+- `/DAQ/Status/Frontends/VME/{Severity,Reason,Connected,EventSlipCount}`
+- `/DAQ/Status/Frontends/EASIROC/{Severity,Reason,Connected}`
+- `/DAQ/Status/Logger/CurrentFilename`
+- `/DAQ/Status/Disk/{Severity,Path,FreeGB,TotalGB}`
+
+Run timestamps come from standard `/Runinfo/{Start time,Stop time}`. Module
+Enable values and communication readbacks come from the Settings and Variables
+paths documented above.
 
 It also reads the standard MIDAS statistics fields `Events per sec.`,
 `kBytes per sec.`, and `Events sent` from:

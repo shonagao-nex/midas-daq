@@ -203,6 +203,24 @@ EasirocSlowControlConfig EasirocSlowControlConfig::referenceDefaults() {
   return config;
 }
 
+EasirocSlowControlConfig EasirocSlowControlConfig::legacySiteDefaults() {
+  // Start from the complete legacy DefaultRegisterValue.yml configuration,
+  // then apply RegisterValue.yml and InputDAC.yml site overrides. Keep this
+  // baseline complete: future ODB fields must overlay it rather than a
+  // zero-initialized EasirocSlowControlConfig.
+  auto config = referenceDefaults();
+  std::array<std::uint16_t, 32> input_dac{};
+  input_dac.fill(350);
+  config.setChannels(SlowField::kInputDac, input_dac);
+  config.setScalar(SlowField::kCapacitorHighGainPaFeedback, 8);  // 100 fF
+  config.setScalar(SlowField::kCapacitorLowGainPaFeedback, 8);   // 100 fF
+  config.setScalar(SlowField::kTimeConstantHighGainShaper, 4);   // 100 ns
+  config.setScalar(SlowField::kTimeConstantLowGainShaper, 2);    // 50 ns
+  config.setScalar(SlowField::kDacCode, 600);
+  config.setScalar(SlowField::kDacSlope, 1);  // fine
+  return config;
+}
+
 void EasirocSlowControlConfig::setScalar(SlowField field,
                                          std::uint16_t value) {
   const auto& descriptor = kFields.at(index(field));
@@ -229,7 +247,7 @@ const std::vector<std::uint16_t>& EasirocSlowControlConfig::values(
   return values_.at(index(field));
 }
 
-std::array<std::uint8_t, 57> SlowControlEncoder::encode(
+SlowControlEncoder::Image SlowControlEncoder::encode(
     const EasirocSlowControlConfig& config) {
   std::vector<std::uint8_t> bytes(57, 0);
   std::size_t bit_position = 0;
@@ -257,6 +275,25 @@ std::array<std::uint8_t, 57> SlowControlEncoder::encode(
   std::array<std::uint8_t, 57> result{};
   std::copy(bytes.begin(), bytes.end(), result.begin());
   return result;
+}
+
+std::vector<Transaction> SlowControlPolicy::buildAsicApplyPlan(
+    const AsicSlowControlImages& images) {
+  std::vector<Transaction> plan;
+  appendSerialApply(plan, true, asVector(images[0]), asVector(images[1]));
+  return plan;
+}
+
+AsicSlowControlImages SlowControlPolicy::encodeLegacySiteThresholdOverlay(
+    std::uint16_t asic1_dac_code, std::uint16_t asic1_dac_slope,
+    std::uint16_t asic2_dac_code, std::uint16_t asic2_dac_slope) {
+  auto first = EasirocSlowControlConfig::legacySiteDefaults();
+  auto second = EasirocSlowControlConfig::legacySiteDefaults();
+  first.setScalar(SlowField::kDacCode, asic1_dac_code);
+  first.setScalar(SlowField::kDacSlope, asic1_dac_slope);
+  second.setScalar(SlowField::kDacCode, asic2_dac_code);
+  second.setScalar(SlowField::kDacSlope, asic2_dac_slope);
+  return {SlowControlEncoder::encode(first), SlowControlEncoder::encode(second)};
 }
 
 std::array<std::uint8_t, 20> SlowControlPolicy::encodeProbe(
@@ -327,10 +364,11 @@ std::array<std::uint8_t, 3> SlowControlPolicy::encodeTriggerDelay(
 
 std::vector<Transaction> SlowControlPolicy::buildApplyPlan(
     const SlowControlConfig& config) {
-  std::vector<Transaction> plan;
-  const auto first_image = SlowControlEncoder::encode(config.easiroc[0]);
-  const auto second_image = SlowControlEncoder::encode(config.easiroc[1]);
-  appendSerialApply(plan, true, asVector(first_image), asVector(second_image));
+  const AsicSlowControlImages images{{
+      SlowControlEncoder::encode(config.easiroc[0]),
+      SlowControlEncoder::encode(config.easiroc[1]),
+  }};
+  std::vector<Transaction> plan = buildAsicApplyPlan(images);
 
   const auto first_probe = encodeProbe(config.probe[0], 0);
   const auto second_probe = encodeProbe(config.probe[1], 1);

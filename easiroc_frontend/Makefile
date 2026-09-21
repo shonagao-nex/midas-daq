@@ -15,7 +15,8 @@ BIN_TEST_DIR := $(BIN_DIR)/tests
 PRODUCTION_TARGET := $(BIN_DIR)/feeasiroc
 TEST_NAMES := easiroc_test easiroc_event_test easiroc_stream_test \
 	easiroc_daq_control_test easiroc_slow_control_test \
-	easiroc_readout_test easiroc_read_one easiroc_read_many
+	easiroc_run_settings_test easiroc_asic_apply_test easiroc_readout_test \
+	easiroc_read_one easiroc_read_many
 TEST_TARGETS := $(addprefix $(BIN_TEST_DIR)/,$(TEST_NAMES))
 
 obj = $(patsubst %.cxx,$(BUILD_DIR)/%.o,$(1))
@@ -26,8 +27,12 @@ EVENT_TEST_OBJECTS := $(call obj,tests/easiroc_event_test.cxx easiroc_event.cxx)
 STREAM_TEST_OBJECTS := $(call obj,tests/easiroc_stream_test.cxx easiroc_stream.cxx easiroc_event.cxx)
 DAQ_TEST_OBJECTS := $(call obj,tests/easiroc_daq_control_test.cxx easiroc_daq_control.cxx)
 SLOW_CONTROL_TEST_OBJECTS := $(call obj,tests/easiroc_slow_control_test.cxx easiroc_slow_control.cxx)
+RUN_SETTINGS_TEST_OBJECTS := $(call obj,tests/easiroc_run_settings_test.cxx easiroc_run_settings.cxx)
+ASIC_APPLY_TEST_OBJECTS := $(call obj,tests/easiroc_asic_apply_test.cxx easiroc_asic_apply.cxx \
+	easiroc_run_settings.cxx easiroc_slow_control.cxx)
 READOUT_TEST_OBJECTS := $(call obj,tests/easiroc_readout_test.cxx easiroc_readout.cxx)
-FEEASIROC_OBJECTS := $(call obj,feeasiroc.cxx easiroc_daq_control.cxx easiroc_slow_control.cxx \
+FEEASIROC_OBJECTS := $(call obj,feeasiroc.cxx easiroc_daq_control.cxx easiroc_run_settings.cxx \
+	easiroc_asic_apply.cxx easiroc_slow_control.cxx \
 	easiroc_status.cxx easiroc_stream.cxx easiroc_event.cxx easiroc_readout.cxx rbcp.cxx \
 	tcp_probe.cxx) $(MIDASSYS)/lib/mfe.o
 READ_ONE_OBJECTS := $(call obj,tests/easiroc_read_one.cxx easiroc_daq_control.cxx easiroc_stream.cxx \
@@ -35,7 +40,9 @@ READ_ONE_OBJECTS := $(call obj,tests/easiroc_read_one.cxx easiroc_daq_control.cx
 READ_MANY_OBJECTS := $(call obj,tests/easiroc_read_many.cxx easiroc_daq_control.cxx \
 	easiroc_stream.cxx easiroc_event.cxx rbcp.cxx tcp_probe.cxx)
 ALL_OBJECTS := $(OBJECTS) $(EVENT_TEST_OBJECTS) $(STREAM_TEST_OBJECTS) \
-	$(DAQ_TEST_OBJECTS) $(SLOW_CONTROL_TEST_OBJECTS) $(READOUT_TEST_OBJECTS) \
+	$(DAQ_TEST_OBJECTS) $(SLOW_CONTROL_TEST_OBJECTS) $(RUN_SETTINGS_TEST_OBJECTS) \
+	$(ASIC_APPLY_TEST_OBJECTS) \
+	$(READOUT_TEST_OBJECTS) \
 	$(FEEASIROC_OBJECTS) $(READ_ONE_OBJECTS) $(READ_MANY_OBJECTS)
 DEPS := $(filter $(BUILD_DIR)/%.d,$(ALL_OBJECTS:.o=.d))
 
@@ -49,11 +56,15 @@ $(TEST_NAMES): %: $(BIN_TEST_DIR)/%
 
 check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	$(BIN_TEST_DIR)/easiroc_daq_control_test $(BIN_TEST_DIR)/easiroc_slow_control_test \
+	$(BIN_TEST_DIR)/easiroc_run_settings_test \
+	$(BIN_TEST_DIR)/easiroc_asic_apply_test \
 	$(BIN_TEST_DIR)/easiroc_readout_test
 	./$(BIN_TEST_DIR)/easiroc_event_test
 	./$(BIN_TEST_DIR)/easiroc_stream_test
 	./$(BIN_TEST_DIR)/easiroc_daq_control_test
 	./$(BIN_TEST_DIR)/easiroc_slow_control_test
+	./$(BIN_TEST_DIR)/easiroc_run_settings_test
+	./$(BIN_TEST_DIR)/easiroc_asic_apply_test
 	./$(BIN_TEST_DIR)/easiroc_readout_test
 
 $(BIN_TEST_DIR)/easiroc_test: $(OBJECTS)
@@ -76,6 +87,14 @@ $(BIN_TEST_DIR)/easiroc_slow_control_test: $(SLOW_CONTROL_TEST_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
+$(BIN_TEST_DIR)/easiroc_run_settings_test: $(RUN_SETTINGS_TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+$(BIN_TEST_DIR)/easiroc_asic_apply_test: $(ASIC_APPLY_TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
 $(BIN_TEST_DIR)/easiroc_readout_test: $(READOUT_TEST_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
@@ -94,7 +113,9 @@ $(PRODUCTION_TARGET): $(FEEASIROC_OBJECTS)
 		$(MIDAS_LIBS) $(LDLIBS)
 
 $(BUILD_DIR)/feeasiroc.o: CPPFLAGS += $(MIDAS_CPPFLAGS)
-$(BUILD_DIR)/feeasiroc.o: feeasiroc.cxx easiroc_daq_control.h easiroc_slow_control.h \
+$(BUILD_DIR)/feeasiroc.o: feeasiroc.cxx easiroc_daq_control.h easiroc_run_settings.h \
+	easiroc_asic_apply.h \
+	easiroc_slow_control.h \
 	easiroc_status.h easiroc_stream.h easiroc_readout.h rbcp.h tcp_probe.h
 
 $(BUILD_DIR)/tests/easiroc_test.o: tests/easiroc_test.cxx easiroc_status.h
@@ -109,6 +130,13 @@ $(BUILD_DIR)/easiroc_daq_control.o: easiroc_daq_control.cxx easiroc_daq_control.
 $(BUILD_DIR)/tests/easiroc_daq_control_test.o: tests/easiroc_daq_control_test.cxx easiroc_daq_control.h
 $(BUILD_DIR)/easiroc_slow_control.o: easiroc_slow_control.cxx easiroc_slow_control.h
 $(BUILD_DIR)/tests/easiroc_slow_control_test.o: tests/easiroc_slow_control_test.cxx easiroc_slow_control.h
+$(BUILD_DIR)/easiroc_run_settings.o: easiroc_run_settings.cxx easiroc_run_settings.h
+$(BUILD_DIR)/tests/easiroc_run_settings_test.o: tests/easiroc_run_settings_test.cxx \
+	easiroc_run_settings.h
+$(BUILD_DIR)/easiroc_asic_apply.o: easiroc_asic_apply.cxx easiroc_asic_apply.h \
+	easiroc_run_settings.h easiroc_slow_control.h
+$(BUILD_DIR)/tests/easiroc_asic_apply_test.o: tests/easiroc_asic_apply_test.cxx \
+	easiroc_asic_apply.h
 $(BUILD_DIR)/easiroc_readout.o: easiroc_readout.cxx easiroc_readout.h easiroc_event.h
 $(BUILD_DIR)/tests/easiroc_readout_test.o: tests/easiroc_readout_test.cxx easiroc_readout.h \
 	easiroc_event.h

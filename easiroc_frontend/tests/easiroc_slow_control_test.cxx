@@ -26,19 +26,6 @@ void expectFailure(Function function, const std::string& message) {
   throw std::runtime_error(message);
 }
 
-easiroc::EasirocSlowControlConfig makeLegacySiteConfig() {
-  auto config = easiroc::EasirocSlowControlConfig::referenceDefaults();
-  std::array<std::uint16_t, 32> input_dac{};
-  input_dac.fill(350);
-  config.setChannels(easiroc::SlowField::kInputDac, input_dac);
-  config.setScalar(easiroc::SlowField::kCapacitorHighGainPaFeedback, 8);
-  config.setScalar(easiroc::SlowField::kCapacitorLowGainPaFeedback, 8);
-  config.setScalar(easiroc::SlowField::kTimeConstantHighGainShaper, 4);
-  config.setScalar(easiroc::SlowField::kTimeConstantLowGainShaper, 2);
-  config.setScalar(easiroc::SlowField::kDacCode, 600);
-  return config;
-}
-
 constexpr std::array<std::uint8_t, 57> kLegacyYamlImage{{
     0xc0, 0xff, 0x9f, 0xc6, 0xff, 0xff, 0xff, 0xbf, 0x7d, 0xdf,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0xe3,
@@ -54,26 +41,132 @@ bool isWrite(const easiroc::Transaction& transaction, std::uint32_t address,
          transaction.address == address && transaction.data == data &&
          transaction.delay_ms == 0;
 }
+
+std::uint16_t encodedDacCode(const easiroc::SlowControlEncoder::Image& image) {
+  // After the legacy byte/bit reversals, DAC code bits 0..5 occupy image[3]
+  // bits 5..0 and bits 6..9 occupy image[2] bits 7..4.
+  std::uint16_t result = 0;
+  for (unsigned bit = 0; bit < 10; ++bit) {
+    const unsigned image_byte = bit < 6 ? 3 : 2;
+    const unsigned image_bit = bit < 6 ? 5 - bit : 13 - bit;
+    if ((image[image_byte] & (1u << image_bit)) != 0) result |= 1u << bit;
+  }
+  return result;
+}
+
+std::uint16_t encodedDacSlope(
+    const easiroc::SlowControlEncoder::Image& image) {
+  // DAC slope immediately follows DAC code and becomes image[2] bit 3.
+  return static_cast<std::uint16_t>((image[2] >> 3) & 0x01);
+}
+
+void checkOnlyThresholdBitsChanged(
+    const easiroc::SlowControlEncoder::Image& baseline,
+    const easiroc::SlowControlEncoder::Image& changed,
+    const std::string& message) {
+  for (std::size_t byte = 0; byte < baseline.size(); ++byte) {
+    const std::uint8_t allowed = byte == 2 ? 0xf8 : (byte == 3 ? 0x3f : 0x00);
+    check(((baseline[byte] ^ changed[byte]) & ~allowed) == 0,
+          message + " at byte " + std::to_string(byte));
+  }
+}
 }  // namespace
 
 int main() {
   try {
-    const auto first = makeLegacySiteConfig();
-    const auto second = makeLegacySiteConfig();  // EASIROC2 uses "same".
+    const auto first = easiroc::EasirocSlowControlConfig::legacySiteDefaults();
+    const auto second =
+        easiroc::EasirocSlowControlConfig::legacySiteDefaults();
     const auto first_image = easiroc::SlowControlEncoder::encode(first);
     const auto second_image = easiroc::SlowControlEncoder::encode(second);
+    check(first_image.size() == 57, "production ASIC image is not 57 bytes");
     check(first_image == kLegacyYamlImage,
-          "EASIROC1 image differs from legacy ConfigLoader algorithm");
+          "production baseline differs from legacy ConfigLoader image");
     check(second_image == kLegacyYamlImage,
           "EASIROC2 image differs from legacy same-value configuration");
+    check(first_image == second_image,
+          "identical ASIC configurations produced different images");
 
     check(first.values(easiroc::SlowField::kDacCode) ==
               std::vector<std::uint16_t>{600},
           "raw 10-bit threshold code was not retained");
+    check(first.values(easiroc::SlowField::kDacSlope) ==
+              std::vector<std::uint16_t>{1},
+          "legacy fine DAC slope was not retained");
     check(first.values(easiroc::SlowField::kInputDac).size() == 32 &&
               first.values(easiroc::SlowField::kInputDac).front() == 350 &&
               first.values(easiroc::SlowField::kInputDac).back() == 350,
           "raw 32-channel 9-bit Input DAC array was not retained");
+    check(first.values(easiroc::SlowField::kCapacitorHighGainPaFeedback) ==
+                  std::vector<std::uint16_t>{8} &&
+              first.values(easiroc::SlowField::kCapacitorLowGainPaFeedback) ==
+                  std::vector<std::uint16_t>{8},
+          "legacy 100 fF feedback settings were not retained");
+    check(first.values(easiroc::SlowField::kTimeConstantHighGainShaper) ==
+                  std::vector<std::uint16_t>{4} &&
+              first.values(easiroc::SlowField::kTimeConstantLowGainShaper) ==
+                  std::vector<std::uint16_t>{2},
+          "legacy HG/LG shaping settings were not retained");
+    check(first.values(easiroc::SlowField::kEnableDiscriminator) ==
+                  std::vector<std::uint16_t>{1} &&
+              first.values(easiroc::SlowField::kEnableDac) ==
+                  std::vector<std::uint16_t>{1} &&
+              first.values(easiroc::SlowField::kEnable32Triggers) ==
+                  std::vector<std::uint16_t>{1},
+          "legacy enable/control baseline was not retained");
+
+    const auto default_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(
+            600, 1, 600, 1);
+    check(default_overlay[0] == kLegacyYamlImage &&
+              default_overlay[1] == kLegacyYamlImage,
+          "default threshold overlay differs from production baseline");
+
+    for (const auto dac_code : {std::uint16_t{0}, std::uint16_t{600},
+                                std::uint16_t{1023}}) {
+      for (const auto dac_slope : {std::uint16_t{0}, std::uint16_t{1}}) {
+        const auto images =
+            easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(
+                dac_code, dac_slope, dac_code, dac_slope);
+        check(images[0].size() == 57 && images[1].size() == 57,
+              "threshold boundary overlay did not produce 57-byte images");
+        check(encodedDacCode(images[0]) == dac_code &&
+                  encodedDacCode(images[1]) == dac_code,
+              "DAC code boundary was encoded at unexpected bits");
+        check(encodedDacSlope(images[0]) == dac_slope &&
+                  encodedDacSlope(images[1]) == dac_slope,
+              "DAC slope boundary was encoded at unexpected bit");
+        checkOnlyThresholdBitsChanged(
+            first_image, images[0],
+            "ASIC1 threshold overlay changed a non-threshold bit");
+        checkOnlyThresholdBitsChanged(
+            second_image, images[1],
+            "ASIC2 threshold overlay changed a non-threshold bit");
+      }
+    }
+
+    const auto independent_overlays =
+        easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(0, 0,
+                                                                    1023, 1);
+    check(encodedDacCode(independent_overlays[0]) == 0 &&
+              encodedDacSlope(independent_overlays[0]) == 0 &&
+              encodedDacCode(independent_overlays[1]) == 1023 &&
+              encodedDacSlope(independent_overlays[1]) == 1,
+          "ASIC1/ASIC2 threshold overlays were not independent");
+    check(easiroc::SlowControlEncoder::encode(first) == first_image,
+          "threshold overlay modified the source production baseline");
+    expectFailure(
+        [] {
+          easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(
+              1024, 1, 600, 1);
+        },
+        "out-of-range ASIC1 threshold code was accepted");
+    expectFailure(
+        [] {
+          easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(
+              600, 1, 600, 2);
+        },
+        "out-of-range ASIC2 DAC slope was accepted");
 
     auto bit_order_config = first;
     bit_order_config.setScalar(
@@ -118,6 +211,27 @@ int main() {
     config.trigger_width_ns = 100;
     config.time_window_ns = 4095;
     config.trigger_delay = easiroc::TriggerDelayConfig{};
+
+    const easiroc::AsicSlowControlImages baseline_images{{first_image,
+                                                          second_image}};
+    const auto asic_plan =
+        easiroc::SlowControlPolicy::buildAsicApplyPlan(baseline_images);
+    check(asic_plan.size() == 7,
+          "ASIC-only apply plan does not contain exactly seven operations");
+    check(isWrite(asic_plan[0], 0x00000000, {0xde, 0xde, 0x00}) &&
+              isWrite(asic_plan[1], 0x00000003,
+                      std::vector<std::uint8_t>(first_image.begin(),
+                                                first_image.end())) &&
+              isWrite(asic_plan[2], 0x0000003d,
+                      std::vector<std::uint8_t>(second_image.begin(),
+                                                second_image.end())) &&
+              isWrite(asic_plan[3], 0x00000000, {0xde, 0xde, 0x03}),
+          "ASIC-only image/start-cycle sequence differs");
+    check(asic_plan[4].type == easiroc::TransactionType::kDelay &&
+              asic_plan[4].delay_ms == 100 &&
+              isWrite(asic_plan[5], 0x00000000, {0xfe, 0xfe, 0x00}) &&
+              isWrite(asic_plan[6], 0x00000000, {0xde, 0xde, 0x00}),
+          "ASIC-only delay/load/release sequence differs");
 
     const auto plan = easiroc::SlowControlPolicy::buildApplyPlan(config);
     check(plan.size() == 24, "apply plan transaction count differs");

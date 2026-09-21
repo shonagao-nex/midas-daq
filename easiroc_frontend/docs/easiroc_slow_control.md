@@ -534,6 +534,13 @@ execute a transaction.
 - `EasirocSlowControlConfig` stores raw numeric ASIC fields. The confirmed raw
   threshold (`DAC code`, 10 bits) and per-channel Input DAC codes (32 x 9 bits)
   are supported without a physical-unit conversion.
+- `EasirocSlowControlConfig::legacySiteDefaults()` is the production baseline
+  for future ODB overlays. It starts with the complete legacy
+  `DefaultRegisterValue.yml` configuration and applies the confirmed site
+  overrides from `RegisterValue.yml` and `InputDAC.yml`: DAC code 600, fine
+  slope (1), all Input DAC codes 350, 100 fF HG/LG feedback, 100 ns HG shaping,
+  and 50 ns LG shaping. The zero-initialized constructor remains useful for
+  explicit tests but must not be used as a production ASIC configuration.
 - `SlowControlEncoder` validates field widths/counts and produces exactly one
   57-byte image using the legacy field order, per-field bit order, active-low
   transformation, per-byte bit reversal, and final byte reversal.
@@ -543,17 +550,66 @@ execute a transaction.
 - `SlowControlPolicy::buildApplyPlan` produces an ordered vector of write and
   delay descriptions. A write contains a register address and bytes; a delay
   contains milliseconds. Neither type has an execute method.
+- `SlowControlPolicy::encodeLegacySiteThresholdOverlay()` copies that baseline
+  independently for ASIC1 and ASIC2, validates and replaces only the 10-bit
+  DAC code and 1-bit DAC slope, and returns two complete encoded images. It
+  does not mutate a shared baseline.
+- `SlowControlPolicy::buildAsicApplyPlan()` accepts two complete 57-byte images
+  and emits only the seven ASIC shift/latch operations: initial direct control,
+  ASIC1 write, ASIC2 write, start-cycle assertion, 100 ms delay, load/latch,
+  and load release. It contains no probe, read-register, pedestal, selectable
+  logic, trigger-width, time-window, or trigger-delay operation.
 
 The aggregate plan follows the legacy `slowcontrol` order: ASIC image/latch,
 probe image/latch, read-register reset/selection, pedestal suppression,
 selectable logic, trigger width, and time window. Trigger mode/delays are added
 only when explicitly present because the legacy normal startup leaves that
-call disabled.
+call disabled. This aggregate plan remains available for legacy/offline use;
+BOR uses only the ASIC-only plan.
+
+`easiroc_asic_apply` executes that seven-transaction plan through injected
+write and delay functions. The production frontend binds them to
+`RbcpClient::write()` and `sleep_for()`, while offline tests use mocks. A
+failed transaction stops the sequence immediately. No rollback is attempted
+because there is no authoritative ASIC configuration readback; the reported
+error explicitly states that the ASIC slow-control state may be unknown after
+a partial failure.
 
 `easiroc_slow_control_test` compares both ASIC images for the supplied YAML
 settings against a fixed 57-byte golden vector derived independently from the
-legacy `ConfigLoader` algorithm. It also checks raw threshold/Input DAC limits,
-MSB-to-LSB and active-low effects, direct-control start/load transitions, both
-100 ms delay positions, probe/read-register selection, big-endian pedestal and
-time-window data, selectable-logic layout, trigger width, and default trigger
-delays. No hardware or network operation is involved.
+legacy `ConfigLoader` algorithm. It also checks DAC code boundaries 0, 600,
+and 1023, slope boundaries 0 and 1, exact threshold bit placement, and that no
+non-threshold image bit changes. The ASIC-only seven-operation plan and the
+larger aggregate plan are tested separately, along with raw Input DAC limits,
+MSB-to-LSB and active-low effects, direct-control start/load transitions, probe
+and read-register selection, big-endian pedestal/time-window data,
+selectable-logic layout, trigger width, and default trigger delays. No ODB,
+hardware readback, transport, or network operation is involved.
+
+## ODB threshold snapshot stage
+
+The frontend defines discriminator settings in
+`/Equipment/EASIROC/Settings`: `ASICSlowControl/ApplyAtBOR` (BOOL, false) and
+`ASIC1`/`ASIC2` `DiscriminatorDACCode` (INT, 600) and
+`DiscriminatorDACSlope` (INT, 1). Existing keys are preserved; defaults are
+created only for missing keys. Slope 0 means coarse and slope 1 means fine.
+
+At BOR these values are read once into `FrontendSettings`. For an enabled
+frontend, each DAC code must be 0--1023 and each slope must be 0 or 1. A
+disabled frontend skips validation of this unused hardware configuration. The
+same local values are published under `RunSnapshot/Requested`, and the
+RunSnapshot schema version is 3. Since the ECFG bank serializes the complete
+RunSnapshot subtree, those requested values are included in its JSON payload.
+
+With `ApplyAtBOR=false`, BOR does not encode an ASIC image, build a plan, or
+invoke the executor. With `ApplyAtBOR=true`, BOR overlays the requested
+thresholds on independent copies of `legacySiteDefaults()`, builds the
+ASIC-only plan, and completes all seven transactions before the
+pre-acquisition drain and DAQ ON write. Any failure aborts BOR before DAQ ON.
+
+`Variables/ASICSlowControl` publishes `ApplyAttempted`,
+`ApplySequenceSucceeded`, `LastApplyError`, `LastApplyRunNumber`, and
+`LastApplyUnixTime`. `RunSnapshot/Apply` publishes the per-BOR `Attempted`,
+`SequenceSucceeded`, and `Error` values. These fields report only executor and
+transport completion. They are not ASIC readback, and no `Readback/ASIC`
+subtree is created.
