@@ -1,5 +1,7 @@
 #include "easiroc_slow_control.h"
 
+#include "easiroc_run_settings.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -284,14 +286,58 @@ std::vector<Transaction> SlowControlPolicy::buildAsicApplyPlan(
   return plan;
 }
 
+std::array<std::uint16_t, 32> logicalDiscriminatorMask(
+    const std::array<bool, 32>& channel_enabled) {
+  std::array<std::uint16_t, 32> mask{};
+  for (std::size_t channel = 0; channel < mask.size(); ++channel)
+    mask[channel] = channel_enabled[channel] ? 0u : 1u;
+  return mask;
+}
+
 SlowControlEncoder::Image SlowControlPolicy::encodeLegacySiteAsicOverlay(
     std::uint16_t dac_code, std::uint16_t dac_slope,
-    const std::array<std::uint16_t, 32>& input_dac) {
+    const std::array<std::uint16_t, 32>& input_dac,
+    int hg_feedback_femtofarads, int lg_feedback_femtofarads,
+    int hg_shaping_nanoseconds, int lg_shaping_nanoseconds,
+    const std::array<bool, 32>& channel_enabled) {
+  if (!isValidFeedbackCapacitanceFemtofarads(hg_feedback_femtofarads) ||
+      !isValidFeedbackCapacitanceFemtofarads(lg_feedback_femtofarads))
+    throw std::invalid_argument(
+        "feedback capacitance must be 0 (NoC), 100, 200, ..., 1500 fF");
+  if (!isValidShapingTimeNanoseconds(hg_shaping_nanoseconds) ||
+      !isValidShapingTimeNanoseconds(lg_shaping_nanoseconds))
+    throw std::invalid_argument(
+        "shaping time must be one of 25, 50, 75, 100, 125, 150, 175 ns");
   auto config = EasirocSlowControlConfig::legacySiteDefaults();
   config.setScalar(SlowField::kDacCode, dac_code);
   config.setScalar(SlowField::kDacSlope, dac_slope);
   config.setChannels(SlowField::kInputDac, input_dac);
+  config.setChannels(SlowField::kDiscriminatorMask,
+                     logicalDiscriminatorMask(channel_enabled));
+  config.setScalar(
+      SlowField::kCapacitorHighGainPaFeedback,
+      feedbackCapacitanceEncoderCode(hg_feedback_femtofarads));
+  config.setScalar(
+      SlowField::kCapacitorLowGainPaFeedback,
+      feedbackCapacitanceEncoderCode(lg_feedback_femtofarads));
+  config.setScalar(SlowField::kTimeConstantHighGainShaper,
+                   shapingTimeEncoderCode(hg_shaping_nanoseconds));
+  config.setScalar(SlowField::kTimeConstantLowGainShaper,
+                   shapingTimeEncoderCode(lg_shaping_nanoseconds));
   return SlowControlEncoder::encode(config);
+}
+
+SlowControlEncoder::Image SlowControlPolicy::encodeLegacySiteAsicOverlay(
+    std::uint16_t dac_code, std::uint16_t dac_slope,
+    const std::array<std::uint16_t, 32>& input_dac,
+    int hg_feedback_femtofarads, int lg_feedback_femtofarads,
+    int hg_shaping_nanoseconds, int lg_shaping_nanoseconds) {
+  std::array<bool, 32> legacy_channel_enabled{};
+  legacy_channel_enabled.fill(true);
+  return encodeLegacySiteAsicOverlay(
+      dac_code, dac_slope, input_dac, hg_feedback_femtofarads,
+      lg_feedback_femtofarads, hg_shaping_nanoseconds,
+      lg_shaping_nanoseconds, legacy_channel_enabled);
 }
 
 AsicSlowControlImages SlowControlPolicy::encodeLegacySiteThresholdOverlay(
@@ -300,9 +346,9 @@ AsicSlowControlImages SlowControlPolicy::encodeLegacySiteThresholdOverlay(
   std::array<std::uint16_t, 32> legacy_input_dac{};
   legacy_input_dac.fill(350);
   return {encodeLegacySiteAsicOverlay(asic1_dac_code, asic1_dac_slope,
-                                      legacy_input_dac),
+                                      legacy_input_dac, 100, 100, 100, 50),
           encodeLegacySiteAsicOverlay(asic2_dac_code, asic2_dac_slope,
-                                      legacy_input_dac)};
+                                      legacy_input_dac, 100, 100, 100, 50)};
 }
 
 std::array<std::uint8_t, 20> SlowControlPolicy::encodeProbe(

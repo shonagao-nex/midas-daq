@@ -4,18 +4,31 @@
   const s = p + "Settings/";
   const v = p + "Variables/ASICSlowControl/";
   const input = Array.from({length: 32}, () => 350);
+  const channelEnabled = Array.from({length: 32}, () => true);
   const base = {
     "/Runinfo/State": 1,
     [s + "Enabled"]: true, [s + "ASICSlowControl/ApplyAtBOR"]: false,
     [s + "ASIC1/DiscriminatorDACCode"]: 600, [s + "ASIC1/DiscriminatorDACSlope"]: 1, [s + "ASIC1/InputDAC"]: input,
+    [s + "ASIC1/HGFeedbackCapacitance"]: 100, [s + "ASIC1/LGFeedbackCapacitance"]: 100,
+    [s + "ASIC1/HGShapingTime"]: 100, [s + "ASIC1/LGShapingTime"]: 50,
+    [s + "ASIC1/ChannelEnabled"]: channelEnabled,
     [s + "ASIC2/DiscriminatorDACCode"]: 600, [s + "ASIC2/DiscriminatorDACSlope"]: 1, [s + "ASIC2/InputDAC"]: input,
+    [s + "ASIC2/HGFeedbackCapacitance"]: 100, [s + "ASIC2/LGFeedbackCapacitance"]: 100,
+    [s + "ASIC2/HGShapingTime"]: 100, [s + "ASIC2/LGShapingTime"]: 50,
+    [s + "ASIC2/ChannelEnabled"]: channelEnabled,
     [p + "Commands/ASICSlowControl/ApplyRequestId"]: 9,
     [v + "ActiveRequestId"]: 0, [v + "LastHandledRequestId"]: 9, [v + "LastSuccessfulRequestId"]: 9,
     [v + "ApplyState"]: "Succeeded", [v + "ApplyInProgress"]: false, [v + "LastAttemptSucceeded"]: true, [v + "LastApplyError"]: "", [v + "LastApplyUnixTime"]: 1780000000,
     [v + "ConfigurationMatch"]: true, [v + "ConfigurationStatus"]: "Match", [v + "ConfigurationDetail"]: "", [v + "HardwareStateIndeterminate"]: false,
     [v + "LastApplied/Valid"]: true, [v + "LastApplied/RequestId"]: 9, [v + "LastApplied/ApplyUnixTime"]: 1780000000,
     [v + "LastApplied/ASIC1/DiscriminatorDACCode"]: 600, [v + "LastApplied/ASIC1/DiscriminatorDACSlope"]: 1, [v + "LastApplied/ASIC1/InputDAC"]: input,
-    [v + "LastApplied/ASIC2/DiscriminatorDACCode"]: 600, [v + "LastApplied/ASIC2/DiscriminatorDACSlope"]: 1, [v + "LastApplied/ASIC2/InputDAC"]: input
+    [v + "LastApplied/ASIC1/HGFeedbackCapacitance"]: 100, [v + "LastApplied/ASIC1/LGFeedbackCapacitance"]: 100,
+    [v + "LastApplied/ASIC1/HGShapingTime"]: 100, [v + "LastApplied/ASIC1/LGShapingTime"]: 50,
+    [v + "LastApplied/ASIC1/ChannelEnabled"]: channelEnabled,
+    [v + "LastApplied/ASIC2/DiscriminatorDACCode"]: 600, [v + "LastApplied/ASIC2/DiscriminatorDACSlope"]: 1, [v + "LastApplied/ASIC2/InputDAC"]: input,
+    [v + "LastApplied/ASIC2/HGFeedbackCapacitance"]: 100, [v + "LastApplied/ASIC2/LGFeedbackCapacitance"]: 100,
+    [v + "LastApplied/ASIC2/HGShapingTime"]: 100, [v + "LastApplied/ASIC2/LGShapingTime"]: 50,
+    [v + "LastApplied/ASIC2/ChannelEnabled"]: channelEnabled
   };
   const copy = changes => Object.freeze(Object.assign({}, base, changes));
   window.EASIROC_MOCK_SCENARIOS = Object.freeze({
@@ -27,6 +40,8 @@
     succeeded: copy({[v + "ApplyState"]: "Succeeded"}),
     failed: copy({[v + "ApplyState"]: "Failed", [v + "LastAttemptSucceeded"]: false, [v + "LastApplyError"]: "Mock RBCP write failure"}),
     rejected: copy({[v + "ApplyState"]: "Rejected", [v + "LastAttemptSucceeded"]: false, [v + "LastApplyError"]: "Manual ASIC slow-control apply requires Run state STOPPED"}),
-    unsaved: copy({})
+    unsaved: copy({}),
+    nondefault_shaping: copy({[s + "ASIC1/HGShapingTime"]: 75}),
+    masked_channel: copy({[s + "ASIC1/ChannelEnabled"]: channelEnabled.map((value, index) => index === 17 ? false : value)})
   });
 }());

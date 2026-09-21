@@ -125,7 +125,6 @@ ManualApplyBackendResult executeManualApplyBackend(
         rejectManualApplyRequest(pending, *validation_error, unix_time);
     return result;
   }
-
   ManualApplyStatus applying = pending;
   applying.state = ManualApplyState::kApplying;
   if (publish_status) publish_status(applying);
@@ -137,7 +136,9 @@ ManualApplyBackendResult executeManualApplyBackend(
       images[asic] = SlowControlPolicy::encodeLegacySiteAsicOverlay(
           static_cast<std::uint16_t>(settings.dac_code),
           static_cast<std::uint16_t>(settings.dac_slope),
-          inputDacValues(settings));
+          inputDacValues(settings), settings.hg_feedback_capacitance,
+          settings.lg_feedback_capacitance, settings.hg_shaping_time,
+          settings.lg_shaping_time, settings.channel_enabled);
     }
     static_assert(SlowControlEncoder::Image{}.size() == 57,
                   "ASIC slow-control image must be 57 bytes");

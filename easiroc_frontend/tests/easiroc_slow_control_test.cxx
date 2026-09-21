@@ -1,5 +1,7 @@
 #include "easiroc_slow_control.h"
+#include "easiroc_run_settings.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -77,13 +79,57 @@ std::array<std::uint16_t, 32> legacyInputDac() {
   return values;
 }
 
+std::array<bool, 32> allChannelsEnabled() {
+  std::array<bool, 32> values{};
+  values.fill(true);
+  return values;
+}
+
+void checkSingleActiveLowBit(
+    const easiroc::SlowControlEncoder::Image& enabled,
+    const easiroc::SlowControlEncoder::Image& disabled,
+    const std::string& message) {
+  unsigned changed_bits = 0;
+  unsigned one_to_zero_bits = 0;
+  for (std::size_t byte = 0; byte < enabled.size(); ++byte) {
+    const std::uint8_t changed = enabled[byte] ^ disabled[byte];
+    for (unsigned bit = 0; bit < 8; ++bit) {
+      const std::uint8_t bit_mask = static_cast<std::uint8_t>(1u << bit);
+      if ((changed & bit_mask) == 0) continue;
+      ++changed_bits;
+      if ((enabled[byte] & bit_mask) != 0 &&
+          (disabled[byte] & bit_mask) == 0)
+        ++one_to_zero_bits;
+    }
+  }
+  check(changed_bits == 1 && one_to_zero_bits == 1, message);
+}
+
 easiroc::SlowControlEncoder::Image expectedAsicOverlay(
     std::uint16_t dac_code, std::uint16_t dac_slope,
-    const std::array<std::uint16_t, 32>& input_dac) {
+    const std::array<std::uint16_t, 32>& input_dac,
+    int hg_feedback_femtofarads = 100,
+    int lg_feedback_femtofarads = 100,
+    int hg_shaping_nanoseconds = 100,
+    int lg_shaping_nanoseconds = 50,
+    const std::array<bool, 32>* channel_enabled = nullptr) {
   auto config = easiroc::EasirocSlowControlConfig::legacySiteDefaults();
   config.setScalar(easiroc::SlowField::kDacCode, dac_code);
   config.setScalar(easiroc::SlowField::kDacSlope, dac_slope);
   config.setChannels(easiroc::SlowField::kInputDac, input_dac);
+  config.setScalar(
+      easiroc::SlowField::kCapacitorHighGainPaFeedback,
+      easiroc::feedbackCapacitanceEncoderCode(hg_feedback_femtofarads));
+  config.setScalar(
+      easiroc::SlowField::kCapacitorLowGainPaFeedback,
+      easiroc::feedbackCapacitanceEncoderCode(lg_feedback_femtofarads));
+  config.setScalar(easiroc::SlowField::kTimeConstantHighGainShaper,
+                   easiroc::shapingTimeEncoderCode(hg_shaping_nanoseconds));
+  config.setScalar(easiroc::SlowField::kTimeConstantLowGainShaper,
+                   easiroc::shapingTimeEncoderCode(lg_shaping_nanoseconds));
+  if (channel_enabled != nullptr)
+    config.setChannels(easiroc::SlowField::kDiscriminatorMask,
+                       easiroc::logicalDiscriminatorMask(*channel_enabled));
   return easiroc::SlowControlEncoder::encode(config);
 }
 }  // namespace
@@ -123,6 +169,25 @@ int main() {
               first.values(easiroc::SlowField::kTimeConstantLowGainShaper) ==
                   std::vector<std::uint16_t>{2},
           "legacy HG/LG shaping settings were not retained");
+    check(first.values(easiroc::SlowField::kDiscriminatorMask).size() == 32 &&
+              std::all_of(
+                  first.values(easiroc::SlowField::kDiscriminatorMask).begin(),
+                  first.values(easiroc::SlowField::kDiscriminatorMask).end(),
+                  [](std::uint16_t value) { return value == 0; }),
+          "legacy discriminator mask is not logical 0 (unmasked) for every channel");
+
+    for (const std::size_t channel : {std::size_t{0}, std::size_t{16},
+                                      std::size_t{31}}) {
+      auto masked = easiroc::EasirocSlowControlConfig::legacySiteDefaults();
+      std::array<std::uint16_t, 32> values{};
+      values[channel] = 1;
+      masked.setChannels(easiroc::SlowField::kDiscriminatorMask, values);
+      check(masked.values(easiroc::SlowField::kDiscriminatorMask)[channel] ==
+                1 &&
+                easiroc::SlowControlEncoder::encode(masked) != first_image,
+            "logical discriminator mask=1 did not mask channel " +
+                std::to_string(channel));
+    }
     check(first.values(easiroc::SlowField::kEnableDiscriminator) ==
                   std::vector<std::uint16_t>{1} &&
               first.values(easiroc::SlowField::kEnableDac) ==
@@ -132,13 +197,108 @@ int main() {
           "legacy enable/control baseline was not retained");
 
     const auto baseline_input_dac = legacyInputDac();
+    const auto enabled_channels = allChannelsEnabled();
     const auto full_baseline_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-            600, 1, baseline_input_dac);
+            600, 1, baseline_input_dac, 100, 100, 100, 50,
+            enabled_channels);
     check(full_baseline_overlay.size() == 57,
           "full ASIC overlay image is not 57 bytes");
     check(full_baseline_overlay == kLegacyYamlImage,
           "full default overlay differs from legacy ConfigLoader image");
+
+    check(easiroc::logicalDiscriminatorMask(enabled_channels) ==
+              std::array<std::uint16_t, 32>{},
+          "all-enabled ChannelEnabled did not map to logical mask zero");
+    for (const std::size_t channel : {std::size_t{0}, std::size_t{16},
+                                      std::size_t{31}}) {
+      auto channel_enabled = enabled_channels;
+      channel_enabled[channel] = false;
+      const auto logical_mask =
+          easiroc::logicalDiscriminatorMask(channel_enabled);
+      check(logical_mask[channel] == 1 &&
+                std::count(logical_mask.begin(), logical_mask.end(), 1u) == 1,
+            "disabled channel did not map exclusively to logical mask one at " +
+                std::to_string(channel));
+      const auto overlay =
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, baseline_input_dac, 100, 100, 100, 50,
+              channel_enabled);
+      check(overlay == expectedAsicOverlay(600, 1, baseline_input_dac, 100,
+                                           100, 100, 50, &channel_enabled),
+            "ChannelEnabled overlay differs from existing encoder at channel " +
+                std::to_string(channel));
+      checkSingleActiveLowBit(
+          full_baseline_overlay, overlay,
+          "existing encoder did not ActiveLow-invert exactly one mask bit at " +
+              std::to_string(channel));
+    }
+    auto multiple_channels_enabled = enabled_channels;
+    multiple_channels_enabled[0] = false;
+    multiple_channels_enabled[7] = false;
+    multiple_channels_enabled[16] = false;
+    multiple_channels_enabled[31] = false;
+    const auto multiple_mask =
+        easiroc::logicalDiscriminatorMask(multiple_channels_enabled);
+    check(std::count(multiple_mask.begin(), multiple_mask.end(), 1u) == 4,
+          "multiple disabled channels did not map to four logical mask bits");
+    const auto multiple_mask_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 100, 100, 100, 50,
+            multiple_channels_enabled);
+    check(multiple_mask_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 100, 100, 100,
+                                  50, &multiple_channels_enabled),
+          "multiple-channel mask overlay differs from existing encoder");
+
+    const auto hg_feedback_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 200, 100);
+    check(hg_feedback_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 200, 100) &&
+              hg_feedback_overlay != full_baseline_overlay,
+          "HG-only feedback overlay differs from existing encoder mapping");
+    const auto lg_feedback_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 100, 300);
+    check(lg_feedback_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 100, 300) &&
+              lg_feedback_overlay != full_baseline_overlay,
+          "LG-only feedback overlay differs from existing encoder mapping");
+    const auto both_feedback_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 400, 1500);
+    check(both_feedback_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 400, 1500) &&
+              both_feedback_overlay != hg_feedback_overlay &&
+              both_feedback_overlay != lg_feedback_overlay,
+          "combined HG/LG feedback overlay was not independent");
+
+    const auto hg_shaping_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 100, 100, 75, 50);
+    check(hg_shaping_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 100, 100, 75,
+                                  50) &&
+              hg_shaping_overlay != full_baseline_overlay,
+          "HG-only shaping overlay differs from existing encoder mapping");
+    const auto lg_shaping_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 100, 100, 100, 125);
+    check(lg_shaping_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 100, 100, 100,
+                                  125) &&
+              lg_shaping_overlay != full_baseline_overlay,
+          "LG-only shaping overlay differs from existing encoder mapping");
+    const auto both_shaping_overlay =
+        easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+            600, 1, baseline_input_dac, 100, 100, 25, 175);
+    check(both_shaping_overlay ==
+              expectedAsicOverlay(600, 1, baseline_input_dac, 100, 100, 25,
+                                  175) &&
+              both_shaping_overlay != hg_shaping_overlay &&
+              both_shaping_overlay != lg_shaping_overlay,
+          "combined HG/LG shaping overlay was not independent");
 
     for (const auto channel : {std::size_t{0}, std::size_t{15},
                                std::size_t{31}}) {
@@ -146,7 +306,7 @@ int main() {
       input_dac[channel] = static_cast<std::uint16_t>(351 + channel);
       const auto overlay =
           easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-              600, 1, input_dac);
+              600, 1, input_dac, 100, 100);
       check(overlay == expectedAsicOverlay(600, 1, input_dac),
             "single-channel InputDAC overlay changed another slow-control "
             "field at channel " +
@@ -165,7 +325,7 @@ int main() {
       input_dac[16] = boundary;
       const auto overlay =
           easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-              600, 1, input_dac);
+              600, 1, input_dac, 100, 100);
       check(overlay == expectedAsicOverlay(600, 1, input_dac),
             "InputDAC boundary overlay differs from existing encoder output");
     }
@@ -173,12 +333,17 @@ int main() {
     auto combined_input_dac = baseline_input_dac;
     combined_input_dac[0] = 351;
     combined_input_dac[31] = 349;
+    auto combined_channel_enabled = enabled_channels;
+    combined_channel_enabled[5] = false;
+    combined_channel_enabled[27] = false;
     const auto combined_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-            601, 1, combined_input_dac);
+            601, 1, combined_input_dac, 700, 1200, 150, 25,
+            combined_channel_enabled);
     check(combined_overlay ==
-              expectedAsicOverlay(601, 1, combined_input_dac),
-          "combined threshold/InputDAC overlay changed a baseline-only field");
+              expectedAsicOverlay(601, 1, combined_input_dac, 700, 1200, 150,
+                                  25, &combined_channel_enabled),
+          "combined threshold/InputDAC/feedback/shaping/mask overlay differs");
     check(encodedDacCode(combined_overlay) == 601 &&
               encodedDacSlope(combined_overlay) == 1,
           "combined overlay encoded an incorrect threshold");
@@ -188,27 +353,50 @@ int main() {
     asic1_input_dac[0] = 111;
     asic2_input_dac[0] = 222;
     asic2_input_dac[31] = 333;
+    auto asic1_channel_enabled = enabled_channels;
+    auto asic2_channel_enabled = enabled_channels;
+    asic1_channel_enabled[0] = false;
+    asic2_channel_enabled[31] = false;
     const auto asic1_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-            600, 1, asic1_input_dac);
+            600, 1, asic1_input_dac, 200, 300, 75, 125,
+            asic1_channel_enabled);
     const auto asic2_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-            600, 1, asic2_input_dac);
-    check(asic1_overlay == expectedAsicOverlay(600, 1, asic1_input_dac) &&
-              asic2_overlay == expectedAsicOverlay(600, 1, asic2_input_dac) &&
+            600, 1, asic2_input_dac, 1400, 1500, 25, 175,
+            asic2_channel_enabled);
+    check(asic1_overlay ==
+              expectedAsicOverlay(600, 1, asic1_input_dac, 200, 300, 75,
+                                  125, &asic1_channel_enabled) &&
+              asic2_overlay ==
+              expectedAsicOverlay(600, 1, asic2_input_dac, 1400, 1500, 25,
+                                  175, &asic2_channel_enabled) &&
               asic1_overlay != asic2_overlay,
           "ASIC1/ASIC2 full overlays were not independent");
     check(easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-              600, 1, asic1_input_dac) == asic1_overlay,
+              600, 1, asic1_input_dac, 200, 300, 75, 125,
+              asic1_channel_enabled) == asic1_overlay,
           "ASIC2 overlay modified ASIC1 helper state");
     expectFailure(
         [baseline_input_dac] {
           auto invalid = baseline_input_dac;
           invalid[31] = 512;
           easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
-              600, 1, invalid);
+              600, 1, invalid, 100, 100);
         },
         "full ASIC overlay accepted an out-of-range InputDAC value");
+    expectFailure(
+        [baseline_input_dac] {
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, baseline_input_dac, 99, 100);
+        },
+        "full ASIC overlay accepted an invalid feedback capacitance");
+    expectFailure(
+        [baseline_input_dac] {
+          easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
+              600, 1, baseline_input_dac, 100, 100, 60, 50);
+        },
+        "full ASIC overlay accepted an invalid shaping time");
 
     const auto default_overlay =
         easiroc::SlowControlPolicy::encodeLegacySiteThresholdOverlay(

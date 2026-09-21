@@ -41,7 +41,12 @@ void expectComparison(const easiroc::HardwareConfigurationComparison& result,
 bool sameAsic(const easiroc::AsicDiscriminatorSettings& lhs,
               const easiroc::AsicDiscriminatorSettings& rhs) {
   return lhs.dac_code == rhs.dac_code && lhs.dac_slope == rhs.dac_slope &&
-         lhs.input_dac == rhs.input_dac;
+         lhs.hg_feedback_capacitance == rhs.hg_feedback_capacitance &&
+         lhs.lg_feedback_capacitance == rhs.lg_feedback_capacitance &&
+         lhs.hg_shaping_time == rhs.hg_shaping_time &&
+         lhs.lg_shaping_time == rhs.lg_shaping_time &&
+         lhs.input_dac == rhs.input_dac &&
+         lhs.channel_enabled == rhs.channel_enabled;
 }
 
 bool sameAsics(const std::array<easiroc::AsicDiscriminatorSettings, 2>& lhs,
@@ -76,6 +81,51 @@ int main() {
   expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
                    "ASIC1 DiscriminatorDACCode differs",
                    "ASIC1 threshold mismatch is diagnosed");
+
+  changed = settings;
+  changed.asic[0].hg_feedback_capacitance = 200;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC1 HGFeedbackCapacitance differs",
+                   "ASIC1 HG feedback mismatch is diagnosed");
+  changed = settings;
+  changed.asic[1].lg_feedback_capacitance = 200;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC2 LGFeedbackCapacitance differs",
+                   "ASIC2 LG feedback mismatch is diagnosed");
+
+  changed = settings;
+  changed.asic[0].hg_shaping_time = 75;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC1 HGShapingTime differs",
+                   "ASIC1 HG shaping mismatch is diagnosed");
+  changed = settings;
+  changed.asic[1].lg_shaping_time = 75;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC2 LGShapingTime differs",
+                   "ASIC2 LG shaping mismatch is diagnosed");
+
+  changed = settings;
+  changed.asic[0].channel_enabled[0] = false;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC1 ChannelEnabled[0] differs",
+                   "ASIC1 ch0 mask mismatch is diagnosed");
+  changed = settings;
+  changed.asic[1].channel_enabled[17] = false;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC2 ChannelEnabled[17] differs",
+                   "ASIC2 middle-channel mask mismatch is diagnosed");
+  changed = settings;
+  changed.asic[1].channel_enabled[31] = false;
+  result = easiroc::compareAsicSlowControlSettings(changed, applied, false);
+  expectComparison(result, easiroc::HardwareConfigurationStatus::kMismatch,
+                   "ASIC2 ChannelEnabled[31] differs",
+                   "ASIC2 ch31 mask mismatch is diagnosed");
 
   for (const std::size_t channel : {std::size_t{0}, std::size_t{17},
                                     std::size_t{31}}) {

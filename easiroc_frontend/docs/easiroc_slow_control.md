@@ -556,9 +556,12 @@ execute a transaction.
   does not mutate a shared baseline.
 - `SlowControlPolicy::encodeLegacySiteAsicOverlay()` is a pure, per-ASIC
   helper that copies `legacySiteDefaults()`, overlays the discriminator DAC
-  code/slope and all 32 9-bit Input DAC values, and returns one complete
-  57-byte image through the existing encoder. The Settings snapshot already
-  contains all of these requested values. The production frontend calls it
+  code/slope, all 32 9-bit Input DAC values, and HG/LG feedback capacitance
+  and shaping time after conversion from physical units to the confirmed
+  4-bit and 3-bit codes. It also maps each ChannelEnabled value to the logical
+  discriminator mask; the existing encoder performs the ActiveLow wire
+  conversion. It returns one complete 57-byte image through that encoder. The
+  production frontend passes the immutable request Settings snapshot to it
   only from the STOPPED-only manual-apply backend; BOR never calls it.
 - `SlowControlPolicy::buildAsicApplyPlan()` accepts two complete 57-byte images
   and emits only the seven ASIC shift/latch operations: initial direct control,
@@ -571,7 +574,7 @@ probe image/latch, read-register reset/selection, pedestal suppression,
 selectable logic, trigger width, and time window. Trigger mode/delays are added
 only when explicitly present because the legacy normal startup leaves that
 call disabled. This aggregate plan remains available for legacy/offline use;
-BOR uses only the ASIC-only plan.
+manual apply uses only the ASIC-only plan, while BOR uses neither plan.
 
 `easiroc_asic_apply` executes that seven-transaction plan through injected
 write and delay functions. The production frontend binds them to
@@ -597,17 +600,36 @@ hardware readback, transport, or network operation is involved.
 The frontend defines discriminator settings in
 `/Equipment/EASIROC/Settings`: `ASICSlowControl/ApplyAtBOR` (BOOL, false) and
 `ASIC1`/`ASIC2` `DiscriminatorDACCode` (INT, 600) and
-`DiscriminatorDACSlope` (INT, 1). Each ASIC also has `InputDAC`, a 32-element
+`DiscriminatorDACSlope` (INT, 1). Each ASIC also has
+`HGFeedbackCapacitance` and `LGFeedbackCapacitance` (INT, default 100), stored
+as physical fF rather than the non-linear ASIC code. The confirmed legacy
+mapping is `0 fF (NoC)=0`, `100=8`, `200=4`, `300=12`, `400=2`, `500=10`,
+`600=6`, `700=14`, `800=1`, `900=9`, `1000=5`, `1100=13`, `1200=3`,
+`1300=11`, `1400=7`, and `1500 fF=15`. `HGShapingTime` and `LGShapingTime`
+are physical INT times in ns, defaulting to legacy HG=100 ns and LG=50 ns;
+their confirmed mapping is `25=1`, `50=2`, `75=3`, `100=4`, `125=5`,
+`150=6`, and `175 ns=7`. Each ASIC also has `InputDAC`, a 32-element
 INT array indexed by local channel 0--31, with every missing-key default set to
 350. Existing keys are preserved and are never overwritten by initialization.
 Slope 0 means coarse and slope 1 means fine.
 
+`ChannelEnabled` is also a 32-element BOOL array per ASIC. `TRUE` means the
+operator-facing unmasked/enabled state and is the legacy default for every
+channel; `FALSE` means masked. It maps to the ASIC's one-bit-per-channel
+`Discriminator Mask` logical field, where `0` means unmasked and `1` means
+masked. This field is `ActiveLow`, so the encoder inverts the serialized bit
+while retaining the logical meaning. The channel mask is independent of the
+common discriminator threshold DAC: the DAC is shared per ASIC, while the
+mask suppresses individual channel discriminators.
+
 At BOR these values are read once into `FrontendSettings`. For an enabled
 frontend, each discriminator DAC code must be 0--1023, each slope must be 0 or
-1, and every Input DAC value must fit its confirmed 9-bit field (0--511). A
+1, each feedback and shaping-time value must be one of the confirmed physical choices above,
+and every Input DAC value must fit its confirmed 9-bit field (0--511). A
 disabled frontend skips validation of this unused hardware configuration. The
-same local values, including both 32-element Input DAC arrays, are published
-under `RunSnapshot/Requested`, and the RunSnapshot schema version is 5. Since
+same local values, including both feedback and shaping-time values, both
+32-element Input DAC arrays, and both ChannelEnabled arrays, are published
+under `RunSnapshot/Requested`, and the RunSnapshot schema version is 8. Since
 the ECFG bank serializes the complete RunSnapshot subtree, those requested
 values are included in its JSON payload without separate ECFG logic.
 
@@ -624,7 +646,14 @@ configuration: BOR only snapshots and validates them, publishes them under
 `RunSnapshot/Requested`, and records that snapshot in ECFG. Hardware apply is
 available only through the explicit manual command while the run is STOPPED.
 The encoder, ASIC-only plan builder, and transaction executor are called only
-from that manual path.
+from that manual path. Manual apply overlays both Feedback Capacitance, both
+Shaping Time values, and all ChannelEnabled values from the same immutable
+Settings snapshot used for threshold and Input DAC. Each ChannelEnabled value
+is converted to the logical `Discriminator Mask` value (`TRUE` to 0, `FALSE`
+to 1); the existing encoder alone performs the field's ActiveLow wire
+inversion. The physical shaping times are converted to their 3-bit codes
+before the complete 57-byte image is encoded. Successful LastApplied therefore
+records exactly the snapshot used to create the transmitted images.
 
 Older ODBs may retain the BOR-oriented `ApplyAttempted`,
 `ApplySequenceSucceeded`, and `LastApplyRunNumber` keys. The frontend no longer
@@ -654,24 +683,29 @@ classified as stale, acknowledged as `Indeterminate`, and never executed.
 This prevents a restart from replaying a persistent ODB command. New requests
 are accepted into `Pending` only in the normal frontend context and are
 rejected when the run is not STOPPED, the frontend is disabled, another apply
-is active, or the Settings snapshot fails validation. A safe request snapshots
-Settings once, enters `Applying`, overlays both thresholds and all Input DACs
-onto independent legacy-site baselines, and executes only the seven ASIC
-shift/latch transactions. Save to ODB and Apply are separate operations:
+is active, or the Settings snapshot fails validation. Invalid shaping times
+are therefore rejected before any hardware callback. A safe request snapshots
+Settings once, enters `Applying`, overlays threshold, all Input DACs, HG/LG
+feedback, HG/LG shaping, and all 32 ChannelEnabled values onto independent
+legacy-site baselines, and executes only the seven ASIC shift/latch
+transactions. Save to ODB and Apply are separate operations:
 editing Settings alone never writes hardware.
 
 All seven transactions must succeed before the request is acknowledged as
 `Succeeded`. The executor neither retries nor rolls back. A stale startup
 request remains acknowledgement-only and can never enter the hardware path.
-The WebGUI remains future work.
+The WebGUI permits Apply for every valid shaping-time and ChannelEnabled
+selection; its usual STOPPED, saved-settings, enabled-frontend, and
+idle-backend gates remain.
 
 ## LastApplied configuration record stage
 
 `Settings` remains the desired, current ODB configuration. In contrast,
 `Variables/ASICSlowControl/LastApplied` is a record of the **last successfully
 transmitted configuration; not ASIC readback**. It contains `Valid`,
-`RequestId`, `ApplyUnixTime`, and the discriminator threshold and 32 Input DAC
-values for both ASICs. Fresh keys are initialized with `Valid = FALSE`, zero
+`RequestId`, `ApplyUnixTime`, the discriminator threshold, HG/LG feedback
+capacitance, HG/LG shaping time, 32 Input DAC values, and ChannelEnabled for
+both ASICs. Fresh keys are initialized with `Valid = FALSE`, zero
 identifiers/timestamp, and zero-valued payload fields; existing ODB values are
 preserved.
 
@@ -685,7 +719,8 @@ new Settings values therefore never changes LastApplied.
 `Variables/ASICSlowControl/ConfigurationMatch`, `ConfigurationStatus`, and
 `ConfigurationDetail` compare desired Settings with the LastApplied record.
 The status is `Unknown` when `Valid` is false, `Match` only when every ASIC
-threshold/slope/InputDAC value agrees, and `Mismatch` with the first differing
+threshold/slope/feedback/shaping/InputDAC/ChannelEnabled value agrees, and
+`Mismatch` with the first differing
 field (for example `ASIC2 InputDAC[17] differs`) otherwise. `ApplyAtBOR` is
 not compared because it is a deprecated policy field rather than an ASIC
 hardware setting.
@@ -708,7 +743,7 @@ Variables status and never rereads either ODB subtree for that run.
 `ConfigurationMatch`, `HardwareStateIndeterminate`, `LastAppliedRequestId`,
 `LastAppliedUnixTime`, `Status`, and `Detail`. `Requested` already preserves
 the complete desired configuration, so LastApplied's 64 Input DAC values are
-not duplicated. SchemaVersion 5 causes the existing full-RunSnapshot ECFG JSON
+not duplicated. SchemaVersion 8 causes the existing full-RunSnapshot ECFG JSON
 serialization to include this subtree without ECFG-specific logic.
 
 Only a valid, non-indeterminate and exactly equal LastApplied record is

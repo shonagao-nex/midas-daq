@@ -19,7 +19,12 @@ void check(bool condition, const std::string& message) {
 bool sameAsic(const easiroc::AsicDiscriminatorSettings& lhs,
               const easiroc::AsicDiscriminatorSettings& rhs) {
   return lhs.dac_code == rhs.dac_code && lhs.dac_slope == rhs.dac_slope &&
-         lhs.input_dac == rhs.input_dac;
+         lhs.hg_feedback_capacitance == rhs.hg_feedback_capacitance &&
+         lhs.lg_feedback_capacitance == rhs.lg_feedback_capacitance &&
+         lhs.hg_shaping_time == rhs.hg_shaping_time &&
+         lhs.lg_shaping_time == rhs.lg_shaping_time &&
+         lhs.input_dac == rhs.input_dac &&
+         lhs.channel_enabled == rhs.channel_enabled;
 }
 
 bool sameApplied(const easiroc::AppliedAsicSlowControlSettings& lhs,
@@ -75,20 +80,39 @@ int main() {
     settings.asic[0].dac_code = 601;
     settings.asic[0].input_dac[0] = 351;
     settings.asic[0].input_dac[17] = 349;
+    settings.asic[0].hg_feedback_capacitance = 200;
+    settings.asic[0].hg_shaping_time = 75;
+    settings.asic[0].lg_shaping_time = 125;
+    settings.asic[0].channel_enabled[0] = false;
+    settings.asic[0].channel_enabled[16] = false;
     settings.asic[1].dac_code = 602;
     settings.asic[1].input_dac[16] = 352;
     settings.asic[1].input_dac[31] = 348;
+    settings.asic[1].lg_feedback_capacitance = 1500;
+    settings.asic[1].hg_shaping_time = 25;
+    settings.asic[1].lg_shaping_time = 175;
+    settings.asic[1].channel_enabled[31] = false;
     const auto frozen_settings = settings;
     const auto expected_asic1 =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
             frozen_settings.asic[0].dac_code,
             frozen_settings.asic[0].dac_slope,
-            inputValues(frozen_settings.asic[0]));
+            inputValues(frozen_settings.asic[0]),
+            frozen_settings.asic[0].hg_feedback_capacitance,
+            frozen_settings.asic[0].lg_feedback_capacitance,
+            frozen_settings.asic[0].hg_shaping_time,
+            frozen_settings.asic[0].lg_shaping_time,
+            frozen_settings.asic[0].channel_enabled);
     const auto expected_asic2 =
         easiroc::SlowControlPolicy::encodeLegacySiteAsicOverlay(
             frozen_settings.asic[1].dac_code,
             frozen_settings.asic[1].dac_slope,
-            inputValues(frozen_settings.asic[1]));
+            inputValues(frozen_settings.asic[1]),
+            frozen_settings.asic[1].hg_feedback_capacitance,
+            frozen_settings.asic[1].lg_feedback_capacitance,
+            frozen_settings.asic[1].hg_shaping_time,
+            frozen_settings.asic[1].lg_shaping_time,
+            frozen_settings.asic[1].channel_enabled);
 
     std::vector<std::uint32_t> addresses;
     std::vector<std::vector<std::uint8_t>> payloads;
@@ -100,7 +124,11 @@ int main() {
         [&](const easiroc::ManualApplyStatus& status) {
           published_states.push_back(status.state);
           settings.asic[0].input_dac[0] = 400;
+          settings.asic[0].hg_shaping_time = 150;
+          settings.asic[0].channel_enabled[0] = true;
           settings.asic[1].dac_code = 700;
+          settings.asic[1].lg_shaping_time = 25;
+          settings.asic[1].channel_enabled[31] = true;
         },
         [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
           addresses.push_back(address);
@@ -147,7 +175,8 @@ int main() {
                      payloads[1].begin()) &&
               std::equal(expected_asic2.begin(), expected_asic2.end(),
                          payloads[2].begin()),
-          "threshold/InputDAC values did not propagate to both ASIC images");
+          "threshold/InputDAC/feedback/shaping/mask values did not propagate "
+          "to both ASIC images");
 
     const auto duplicate =
         easiroc::beginManualApplyRequest(succeeded.terminal, 1);
@@ -203,6 +232,8 @@ int main() {
     invalid_slope.asic[0].dac_slope = 2;
     auto invalid_input = frozen_settings;
     invalid_input.asic[1].input_dac[31] = 512;
+    auto invalid_shaping = frozen_settings;
+    invalid_shaping.asic[0].hg_shaping_time = 60;
     const std::array rejection_cases{
         RejectionCase{"RUNNING",
                       {easiroc::ManualApplyRunState::kRunning, true, false},
@@ -219,6 +250,8 @@ int main() {
                       "coarse"},
         RejectionCase{"invalid InputDAC", stopped_enabled, invalid_input,
                       "InputDAC[31]"},
+        RejectionCase{"invalid shaping", stopped_enabled, invalid_shaping,
+                      "HGShapingTime=60"},
         RejectionCase{"busy",
                       {easiroc::ManualApplyRunState::kStopped, true, true},
                       frozen_settings, "already in progress"},

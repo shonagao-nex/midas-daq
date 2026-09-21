@@ -25,6 +25,12 @@ struct ObservedOperation {
 int main() {
   try {
     easiroc::AsicSlowControlSettings disabled;
+    disabled.asic[0].hg_shaping_time = 25;
+    disabled.asic[0].lg_shaping_time = 175;
+    disabled.asic[0].channel_enabled[0] = false;
+    disabled.asic[1].hg_shaping_time = 150;
+    disabled.asic[1].lg_shaping_time = 75;
+    disabled.asic[1].channel_enabled[31] = false;
     int writes = 0;
     int delays = 0;
     const auto skipped = easiroc::applyAsicSlowControlAtBor(
@@ -35,11 +41,11 @@ int main() {
               skipped.completed_transactions == 0 && skipped.error.empty(),
           "ApplyAtBOR=false did not return a clean skipped result");
     check(writes == 0 && delays == 0,
-          "ApplyAtBOR=false invoked the executor");
+          "ApplyAtBOR=false invoked the executor for non-default shaping/mask");
     check(easiroc::asicApplyPermitsDaqOn(skipped),
           "skipped apply did not permit the unchanged DAQ ON path");
 
-    auto enabled = disabled;
+    auto enabled = easiroc::AsicSlowControlSettings{};
     enabled.apply_at_bor = true;
     std::vector<ObservedOperation> operations;
     std::vector<std::vector<std::uint8_t>> baseline_write_payloads;

@@ -34,12 +34,26 @@ HardwareConfigurationComparison compareAsicSlowControlSettings(
       return mismatch(prefix + "DiscriminatorDACCode differs");
     if (desired.dac_slope != applied.dac_slope)
       return mismatch(prefix + "DiscriminatorDACSlope differs");
+    if (desired.hg_feedback_capacitance != applied.hg_feedback_capacitance)
+      return mismatch(prefix + "HGFeedbackCapacitance differs");
+    if (desired.lg_feedback_capacitance != applied.lg_feedback_capacitance)
+      return mismatch(prefix + "LGFeedbackCapacitance differs");
+    if (desired.hg_shaping_time != applied.hg_shaping_time)
+      return mismatch(prefix + "HGShapingTime differs");
+    if (desired.lg_shaping_time != applied.lg_shaping_time)
+      return mismatch(prefix + "LGShapingTime differs");
     for (std::size_t channel = 0; channel < desired.input_dac.size();
          ++channel) {
       if (desired.input_dac[channel] != applied.input_dac[channel]) {
         return mismatch(prefix + "InputDAC[" + std::to_string(channel) +
                         "] differs");
       }
+    }
+    for (std::size_t channel = 0; channel < desired.channel_enabled.size();
+         ++channel) {
+      if (desired.channel_enabled[channel] != applied.channel_enabled[channel])
+        return mismatch(prefix + "ChannelEnabled[" +
+                        std::to_string(channel) + "] differs");
     }
   }
   return {HardwareConfigurationStatus::kMatch, ""};

@@ -104,6 +104,12 @@ class SlowControlEncoder {
 
 using AsicSlowControlImages = std::array<SlowControlEncoder::Image, 2>;
 
+// Converts the operator-facing state to the ASIC field's logical value.
+// Active-low wire serialization remains the responsibility of
+// SlowControlEncoder.
+std::array<std::uint16_t, 32> logicalDiscriminatorMask(
+    const std::array<bool, 32>& channel_enabled);
+
 enum class ProbeOutput {
   kPaHighGain,
   kPaLowGain,
@@ -168,12 +174,24 @@ class SlowControlPolicy {
       const AsicSlowControlImages& images);
 
   // Copies the complete legacy-site production baseline for one ASIC,
-  // overlays only discriminator DAC code/slope and all 32 Input DAC values,
-  // then encodes one complete 57-byte image. The same pure helper is used for
-  // either ASIC; it has no chip-specific or global state.
+  // overlays discriminator DAC code/slope, all 32 Input DAC values, and the
+  // physical HG/LG feedback-capacitance and shaping-time selections, and the
+  // logical discriminator mask derived from ChannelEnabled, then encodes one
+  // complete 57-byte image. The same pure helper is used for either ASIC; it
+  // has no chip-specific or global state.
   static SlowControlEncoder::Image encodeLegacySiteAsicOverlay(
       std::uint16_t dac_code, std::uint16_t dac_slope,
-      const std::array<std::uint16_t, 32>& input_dac);
+      const std::array<std::uint16_t, 32>& input_dac,
+      int hg_feedback_femtofarads, int lg_feedback_femtofarads,
+      int hg_shaping_nanoseconds, int lg_shaping_nanoseconds,
+      const std::array<bool, 32>& channel_enabled);
+
+  // Compatibility overload for callers that need the legacy all-enabled mask.
+  static SlowControlEncoder::Image encodeLegacySiteAsicOverlay(
+      std::uint16_t dac_code, std::uint16_t dac_slope,
+      const std::array<std::uint16_t, 32>& input_dac,
+      int hg_feedback_femtofarads, int lg_feedback_femtofarads,
+      int hg_shaping_nanoseconds = 100, int lg_shaping_nanoseconds = 50);
 
   // Copies the confirmed legacy-site production baseline for both ASICs,
   // overlays only discriminator DAC code/slope, then encodes complete images.

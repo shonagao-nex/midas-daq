@@ -274,14 +274,43 @@ bool publish_run_snapshot() {
       snapshot.requested.asic_slow_control.asic[0].dac_code;
   const INT asic1_dac_slope =
       snapshot.requested.asic_slow_control.asic[0].dac_slope;
+  const INT asic1_hg_feedback =
+      snapshot.requested.asic_slow_control.asic[0].hg_feedback_capacitance;
+  const INT asic1_lg_feedback =
+      snapshot.requested.asic_slow_control.asic[0].lg_feedback_capacitance;
+  const INT asic1_hg_shaping =
+      snapshot.requested.asic_slow_control.asic[0].hg_shaping_time;
+  const INT asic1_lg_shaping =
+      snapshot.requested.asic_slow_control.asic[0].lg_shaping_time;
   const INT asic2_dac_code =
       snapshot.requested.asic_slow_control.asic[1].dac_code;
   const INT asic2_dac_slope =
       snapshot.requested.asic_slow_control.asic[1].dac_slope;
+  const INT asic2_hg_feedback =
+      snapshot.requested.asic_slow_control.asic[1].hg_feedback_capacitance;
+  const INT asic2_lg_feedback =
+      snapshot.requested.asic_slow_control.asic[1].lg_feedback_capacitance;
+  const INT asic2_hg_shaping =
+      snapshot.requested.asic_slow_control.asic[1].hg_shaping_time;
+  const INT asic2_lg_shaping =
+      snapshot.requested.asic_slow_control.asic[1].lg_shaping_time;
   const auto& asic1_input_dac =
       snapshot.requested.asic_slow_control.asic[0].input_dac;
   const auto& asic2_input_dac =
       snapshot.requested.asic_slow_control.asic[1].input_dac;
+  std::array<BOOL, easiroc::kInputDacChannelCount> asic1_channel_enabled{};
+  std::array<BOOL, easiroc::kInputDacChannelCount> asic2_channel_enabled{};
+  for (std::size_t channel = 0; channel < asic1_channel_enabled.size();
+       ++channel) {
+    asic1_channel_enabled[channel] =
+        snapshot.requested.asic_slow_control.asic[0].channel_enabled[channel]
+            ? TRUE
+            : FALSE;
+    asic2_channel_enabled[channel] =
+        snapshot.requested.asic_slow_control.asic[1].channel_enabled[channel]
+            ? TRUE
+            : FALSE;
+  }
   const BOOL apply_attempted = snapshot.apply.attempted ? TRUE : FALSE;
   const BOOL apply_succeeded =
       snapshot.apply.sequence_succeeded ? TRUE : FALSE;
@@ -340,21 +369,63 @@ bool publish_run_snapshot() {
   ok = set_odb_value(
            odb_path(requested.c_str(),
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[3]),
-           &asic2_dac_code, sizeof(asic2_dac_code), 1, TID_INT) && ok;
+           &asic1_hg_feedback, sizeof(asic1_hg_feedback), 1, TID_INT) && ok;
   ok = set_odb_value(
            odb_path(requested.c_str(),
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
-           &asic2_dac_slope, sizeof(asic2_dac_slope), 1, TID_INT) && ok;
+           &asic1_lg_feedback, sizeof(asic1_lg_feedback), 1, TID_INT) && ok;
   ok = set_odb_value(
            odb_path(requested.c_str(),
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[5]),
+           &asic1_hg_shaping, sizeof(asic1_hg_shaping), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+           &asic1_lg_shaping, sizeof(asic1_lg_shaping), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[7]),
            asic1_input_dac.data(), sizeof(asic1_input_dac),
            asic1_input_dac.size(), TID_INT) && ok;
   ok = set_odb_value(
            odb_path(requested.c_str(),
-                    easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[8]),
+           asic1_channel_enabled.data(), sizeof(asic1_channel_enabled),
+           asic1_channel_enabled.size(), TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[9]),
+           &asic2_dac_code, sizeof(asic2_dac_code), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[10]),
+           &asic2_dac_slope, sizeof(asic2_dac_slope), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[11]),
+           &asic2_hg_feedback, sizeof(asic2_hg_feedback), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[12]),
+           &asic2_lg_feedback, sizeof(asic2_lg_feedback), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[13]),
+           &asic2_hg_shaping, sizeof(asic2_hg_shaping), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[14]),
+           &asic2_lg_shaping, sizeof(asic2_lg_shaping), 1, TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[15]),
            asic2_input_dac.data(), sizeof(asic2_input_dac),
            asic2_input_dac.size(), TID_INT) && ok;
+  ok = set_odb_value(
+           odb_path(requested.c_str(),
+                    easiroc::kAsicSlowControlRequestedSnapshotPaths[16]),
+           asic2_channel_enabled.data(), sizeof(asic2_channel_enabled),
+           asic2_channel_enabled.size(), TID_BOOL) && ok;
 
   ok = set_odb_value(odb_path(apply.c_str(), "Attempted"),
                      &apply_attempted, sizeof(apply_attempted), 1,
@@ -609,6 +680,7 @@ bool initialize_last_applied_odb() {
   const std::uint64_t zero_time = 0;
   const INT zero_value = 0;
   const std::array<INT, easiroc::kInputDacChannelCount> zero_input_dac{};
+  const std::array<BOOL, easiroc::kInputDacChannelCount> zero_channel_enabled{};
   std::array<char, 32> unknown{};
   std::snprintf(unknown.data(), unknown.size(), "%s", "Unknown");
   std::array<char, 256> empty_detail{};
@@ -626,18 +698,50 @@ bool initialize_last_applied_odb() {
          ensure_odb_value(
              odb_path(last_applied.c_str(), "ASIC1/DiscriminatorDACSlope"),
              &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/HGFeedbackCapacitance"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/LGFeedbackCapacitance"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/HGShapingTime"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC1/LGShapingTime"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
          ensure_odb_value(odb_path(last_applied.c_str(), "ASIC1/InputDAC"),
                           zero_input_dac.data(), sizeof(zero_input_dac),
                           zero_input_dac.size(), TID_INT) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "ASIC1/ChannelEnabled"),
+                          zero_channel_enabled.data(),
+                          sizeof(zero_channel_enabled),
+                          zero_channel_enabled.size(), TID_BOOL) &&
          ensure_odb_value(
              odb_path(last_applied.c_str(), "ASIC2/DiscriminatorDACCode"),
              &zero_value, sizeof(zero_value), 1, TID_INT) &&
          ensure_odb_value(
              odb_path(last_applied.c_str(), "ASIC2/DiscriminatorDACSlope"),
              &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/HGFeedbackCapacitance"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/LGFeedbackCapacitance"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/HGShapingTime"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
+         ensure_odb_value(
+             odb_path(last_applied.c_str(), "ASIC2/LGShapingTime"),
+             &zero_value, sizeof(zero_value), 1, TID_INT) &&
          ensure_odb_value(odb_path(last_applied.c_str(), "ASIC2/InputDAC"),
                           zero_input_dac.data(), sizeof(zero_input_dac),
                           zero_input_dac.size(), TID_INT) &&
+         ensure_odb_value(odb_path(last_applied.c_str(), "ASIC2/ChannelEnabled"),
+                          zero_channel_enabled.data(),
+                          sizeof(zero_channel_enabled),
+                          zero_channel_enabled.size(), TID_BOOL) &&
          ensure_odb_value(odb_path(status.c_str(), "ConfigurationMatch"),
                           &no, sizeof(no), 1, TID_BOOL) &&
          ensure_odb_value(odb_path(status.c_str(), "ConfigurationStatus"),
@@ -657,7 +761,15 @@ bool initialize_odb() {
   const BOOL no = FALSE;
   const INT default_dac_code = easiroc::kDefaultDiscriminatorDacCode;
   const INT default_dac_slope = easiroc::kDefaultDiscriminatorDacSlope;
+  const INT default_feedback =
+      easiroc::kDefaultFeedbackCapacitanceFemtofarads;
+  const INT default_hg_shaping =
+      easiroc::kDefaultHighGainShapingTimeNanoseconds;
+  const INT default_lg_shaping =
+      easiroc::kDefaultLowGainShapingTimeNanoseconds;
   const auto default_input_dac = easiroc::defaultInputDacValues();
+  std::array<BOOL, easiroc::kInputDacChannelCount> default_channel_enabled{};
+  default_channel_enabled.fill(TRUE);
   if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
@@ -683,21 +795,63 @@ bool initialize_odb() {
       !ensure_odb_value(
           odb_path(kSettingsPath,
                    easiroc::kAsicSlowControlRequestedSnapshotPaths[3]),
-          &default_dac_code, sizeof(default_dac_code), 1, TID_INT) ||
+          &default_feedback, sizeof(default_feedback), 1, TID_INT) ||
       !ensure_odb_value(
           odb_path(kSettingsPath,
                    easiroc::kAsicSlowControlRequestedSnapshotPaths[4]),
-          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT) ||
+          &default_feedback, sizeof(default_feedback), 1, TID_INT) ||
       !ensure_odb_value(
           odb_path(kSettingsPath,
                    easiroc::kAsicSlowControlRequestedSnapshotPaths[5]),
+          &default_hg_shaping, sizeof(default_hg_shaping), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+          &default_lg_shaping, sizeof(default_lg_shaping), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[7]),
           default_input_dac.data(), sizeof(default_input_dac),
           default_input_dac.size(), TID_INT) ||
       !ensure_odb_value(
           odb_path(kSettingsPath,
-                   easiroc::kAsicSlowControlRequestedSnapshotPaths[6]),
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[8]),
+          default_channel_enabled.data(), sizeof(default_channel_enabled),
+          default_channel_enabled.size(), TID_BOOL) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[9]),
+          &default_dac_code, sizeof(default_dac_code), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[10]),
+          &default_dac_slope, sizeof(default_dac_slope), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[11]),
+          &default_feedback, sizeof(default_feedback), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[12]),
+          &default_feedback, sizeof(default_feedback), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[13]),
+          &default_hg_shaping, sizeof(default_hg_shaping), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[14]),
+          &default_lg_shaping, sizeof(default_lg_shaping), 1, TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[15]),
           default_input_dac.data(), sizeof(default_input_dac),
-          default_input_dac.size(), TID_INT))
+          default_input_dac.size(), TID_INT) ||
+      !ensure_odb_value(
+          odb_path(kSettingsPath,
+                   easiroc::kAsicSlowControlRequestedSnapshotPaths[16]),
+          default_channel_enabled.data(), sizeof(default_channel_enabled),
+          default_channel_enabled.size(), TID_BOOL))
     return false;
 
   const DWORD channel_count = easiroc::kAdcChannelCount;
@@ -787,6 +941,24 @@ INT read_input_dac_setting(
   return SUCCESS;
 }
 
+INT read_channel_enabled_setting(
+    const char* name,
+    std::array<bool, easiroc::kInputDacChannelCount>* values) {
+  std::array<BOOL, easiroc::kInputDacChannelCount> odb_values{};
+  INT size = sizeof(odb_values);
+  const INT status =
+      db_get_value(hDB, 0, name, odb_values.data(), &size, TID_BOOL, FALSE);
+  if (status != DB_SUCCESS || size != static_cast<INT>(sizeof(odb_values))) {
+    cm_msg(MERROR, "read_settings",
+           "Cannot read 32-element BOOL array %s (status %d, size %d)", name,
+           status, size);
+    return FE_ERR_ODB;
+  }
+  for (std::size_t channel = 0; channel < values->size(); ++channel)
+    (*values)[channel] = odb_values[channel] != FALSE;
+  return SUCCESS;
+}
+
 bool read_odb_qword(const std::string& path, std::uint64_t* value) {
   INT size = sizeof(*value);
   const INT status =
@@ -826,8 +998,29 @@ bool read_last_applied_settings(
                     prefix + "DiscriminatorDACSlope");
     if (read_int_setting(path.c_str(), &next.asic[asic].dac_slope) != SUCCESS)
       return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "HGFeedbackCapacitance");
+    if (read_int_setting(path.c_str(),
+                         &next.asic[asic].hg_feedback_capacitance) != SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "LGFeedbackCapacitance");
+    if (read_int_setting(path.c_str(),
+                         &next.asic[asic].lg_feedback_capacitance) != SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "HGShapingTime");
+    if (read_int_setting(path.c_str(), &next.asic[asic].hg_shaping_time) !=
+        SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "LGShapingTime");
+    if (read_int_setting(path.c_str(), &next.asic[asic].lg_shaping_time) !=
+        SUCCESS)
+      return false;
     path = odb_path(last_applied_path.c_str(), prefix + "InputDAC");
     if (read_input_dac_setting(path.c_str(), &next.asic[asic].input_dac) !=
+        SUCCESS)
+      return false;
+    path = odb_path(last_applied_path.c_str(), prefix + "ChannelEnabled");
+    if (read_channel_enabled_setting(path.c_str(),
+                                     &next.asic[asic].channel_enabled) !=
         SUCCESS)
       return false;
   }
@@ -863,16 +1056,36 @@ bool publish_last_applied_settings(
     const std::string prefix = "ASIC" + std::to_string(asic + 1) + "/";
     const INT dac_code = last_applied.asic[asic].dac_code;
     const INT dac_slope = last_applied.asic[asic].dac_slope;
+    const INT hg_feedback = last_applied.asic[asic].hg_feedback_capacitance;
+    const INT lg_feedback = last_applied.asic[asic].lg_feedback_capacitance;
+    const INT hg_shaping = last_applied.asic[asic].hg_shaping_time;
+    const INT lg_shaping = last_applied.asic[asic].lg_shaping_time;
+    std::array<BOOL, easiroc::kInputDacChannelCount> channel_enabled{};
+    for (std::size_t channel = 0; channel < channel_enabled.size(); ++channel)
+      channel_enabled[channel] = last_applied.asic[asic].channel_enabled[channel]
+                                     ? TRUE
+                                     : FALSE;
     ok = set_odb_value(
              odb_path(base.c_str(), prefix + "DiscriminatorDACCode"),
              &dac_code, sizeof(dac_code), 1, TID_INT) && ok;
     ok = set_odb_value(
              odb_path(base.c_str(), prefix + "DiscriminatorDACSlope"),
              &dac_slope, sizeof(dac_slope), 1, TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "HGFeedbackCapacitance"),
+                       &hg_feedback, sizeof(hg_feedback), 1, TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "LGFeedbackCapacitance"),
+                       &lg_feedback, sizeof(lg_feedback), 1, TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "HGShapingTime"),
+                       &hg_shaping, sizeof(hg_shaping), 1, TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "LGShapingTime"),
+                       &lg_shaping, sizeof(lg_shaping), 1, TID_INT) && ok;
     ok = set_odb_value(odb_path(base.c_str(), prefix + "InputDAC"),
                        last_applied.asic[asic].input_dac.data(),
                        sizeof(last_applied.asic[asic].input_dac),
                        last_applied.asic[asic].input_dac.size(), TID_INT) && ok;
+    ok = set_odb_value(odb_path(base.c_str(), prefix + "ChannelEnabled"),
+                       channel_enabled.data(), sizeof(channel_enabled),
+                       channel_enabled.size(), TID_BOOL) && ok;
   }
   if (ok)
     ok = set_odb_value(odb_path(base.c_str(), "Valid"), &valid,
@@ -918,7 +1131,7 @@ INT read_settings(FrontendSettings* settings) {
   if (status != SUCCESS) return status;
 
   for (std::size_t asic = 0; asic < next.asic_slow_control.asic.size(); ++asic) {
-    const std::size_t first_path = 1 + asic * 2;
+    const std::size_t first_path = 1 + asic * 8;
     path = odb_path(kSettingsPath,
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path]);
     status = read_int_setting(
@@ -930,12 +1143,43 @@ INT read_settings(FrontendSettings* settings) {
     status = read_int_setting(
         path.c_str(), &next.asic_slow_control.asic[asic].dac_slope);
     if (status != SUCCESS) return status;
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 2]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].hg_feedback_capacitance);
+    if (status != SUCCESS) return status;
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 3]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].lg_feedback_capacitance);
+    if (status != SUCCESS) return status;
 
     path = odb_path(
         kSettingsPath,
-        easiroc::kAsicSlowControlRequestedSnapshotPaths[5 + asic]);
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 4]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].hg_shaping_time);
+    if (status != SUCCESS) return status;
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 5]);
+    status = read_int_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].lg_shaping_time);
+    if (status != SUCCESS) return status;
+
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 6]);
     status = read_input_dac_setting(
         path.c_str(), &next.asic_slow_control.asic[asic].input_dac);
+    if (status != SUCCESS) return status;
+    path = odb_path(
+        kSettingsPath,
+        easiroc::kAsicSlowControlRequestedSnapshotPaths[first_path + 7]);
+    status = read_channel_enabled_setting(
+        path.c_str(), &next.asic_slow_control.asic[asic].channel_enabled);
     if (status != SUCCESS) return status;
   }
 

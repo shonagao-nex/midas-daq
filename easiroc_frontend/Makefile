@@ -17,6 +17,7 @@ TEST_NAMES := easiroc_test easiroc_event_test easiroc_stream_test \
 	easiroc_daq_control_test easiroc_slow_control_test \
 	easiroc_run_settings_test easiroc_asic_apply_test easiroc_manual_apply_test \
 	easiroc_last_applied_test \
+	easiroc_web_gui_contract_test \
 	easiroc_readout_test \
 	easiroc_read_one easiroc_read_many
 TEST_TARGETS := $(addprefix $(BIN_TEST_DIR)/,$(TEST_NAMES))
@@ -74,6 +75,7 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	$(BIN_TEST_DIR)/easiroc_asic_apply_test \
 	$(BIN_TEST_DIR)/easiroc_manual_apply_test \
 	$(BIN_TEST_DIR)/easiroc_last_applied_test \
+	$(BIN_TEST_DIR)/easiroc_web_gui_contract_test \
 	$(BIN_TEST_DIR)/easiroc_readout_test
 	./$(BIN_TEST_DIR)/easiroc_event_test
 	./$(BIN_TEST_DIR)/easiroc_stream_test
@@ -83,6 +85,7 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	./$(BIN_TEST_DIR)/easiroc_asic_apply_test
 	./$(BIN_TEST_DIR)/easiroc_manual_apply_test
 	./$(BIN_TEST_DIR)/easiroc_last_applied_test
+	./$(BIN_TEST_DIR)/easiroc_web_gui_contract_test
 	./$(BIN_TEST_DIR)/easiroc_readout_test
 
 $(BIN_TEST_DIR)/easiroc_test: $(OBJECTS)
@@ -118,6 +121,10 @@ $(BIN_TEST_DIR)/easiroc_manual_apply_test: $(MANUAL_APPLY_TEST_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
 $(BIN_TEST_DIR)/easiroc_last_applied_test: $(LAST_APPLIED_TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+$(BIN_TEST_DIR)/easiroc_web_gui_contract_test: $(call obj,tests/easiroc_web_gui_contract_test.cxx)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
@@ -170,6 +177,7 @@ $(BUILD_DIR)/easiroc_last_applied.o: easiroc_last_applied.cxx easiroc_last_appli
 	easiroc_run_settings.h
 $(BUILD_DIR)/tests/easiroc_last_applied_test.o: tests/easiroc_last_applied_test.cxx \
 	easiroc_last_applied.h easiroc_manual_apply.h
+$(BUILD_DIR)/tests/easiroc_web_gui_contract_test.o: tests/easiroc_web_gui_contract_test.cxx
 $(BUILD_DIR)/easiroc_readout.o: easiroc_readout.cxx easiroc_readout.h easiroc_event.h
 $(BUILD_DIR)/tests/easiroc_readout_test.o: tests/easiroc_readout_test.cxx easiroc_readout.h \
 	easiroc_event.h

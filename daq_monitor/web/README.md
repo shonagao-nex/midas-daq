@@ -102,11 +102,23 @@ requested only on a new transition into global ERROR.
 ## EASIROC slow-control page
 
 `easiroc.html` is linked from the dashboard and provides a STOPPED-only
-staging view for discriminator thresholds and both 32-channel Input DAC
-arrays. Editing does not write ODB or hardware. `Save to ODB` writes the six
+staging view for discriminator thresholds, HG/LG feedback capacitance, and both
+32-channel Input DAC arrays. Feedback is selected in physical fF (with the
+legacy ASIC code shown); the finite options are 0 fF/NoC and 100--1500 fF in
+100 fF steps. Editing does not write ODB or hardware. `Save to ODB` writes all
 Settings values and requires an ODB readback of every value before accepting
 the save. `Apply to hardware` is disabled until the staged values equal ODB,
 the run is STOPPED, EASIROC is enabled, and the frontend mailbox is idle.
+
+Valid saved HG/LG feedback settings are included in the manual ASIC image.
+They follow the same Save/readback and unsaved-change rules as threshold and
+Input DAC settings; any confirmed finite feedback selection can be applied
+while the normal STOPPED/manual-mailbox conditions are satisfied.
+
+The two 32-channel mask grids store operator-facing `ChannelEnabled` values.
+Checked means enabled/unmasked and unchecked means masked. Valid saved masks
+are included in the manual 57-byte ASIC images and may be applied under the
+same STOPPED/manual-mailbox conditions.
 
 Apply writes one new monotonic `ApplyRequestId` to the existing command
 mailbox and waits for the frontend terminal acknowledgement; it never writes
