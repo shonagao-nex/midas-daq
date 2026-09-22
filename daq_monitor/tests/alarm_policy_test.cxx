@@ -67,6 +67,8 @@ RawStatus normal_raw() {
   raw.logger_connected = true;
   raw.vme.connected = true;
   raw.vme.status_fresh = true;
+  raw.vme.acquisition_expected = true;
+  raw.vme.acquisition_running = true;
   raw.easiroc.connected = true;
   raw.easiroc.status_fresh = true;
   raw.easiroc.acquisition_running = true;
@@ -274,6 +276,130 @@ void test_policy_inputs() {
   EXPECT(daq_monitor::alarm_level_from_severity(
              severity_name(evaluated.easiroc.severity)) ==
          AlarmLevel::kError);
+
+  // A disconnected non-participant maps to OK and therefore cannot trigger a
+  // component alarm. A participant disconnect still maps to ERROR/alarm.
+  raw = normal_raw();
+  raw.easiroc.participating = false;
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  raw.easiroc.acquisition_running = false;
+  raw.easiroc.acquisition_fault = true;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.easiroc.severity == daq_monitor::Severity::kOk);
+  AlarmRuntimeState nonparticipant_state;
+  FakeAlarmApi nonparticipant_api;
+  apply_observation(
+      &nonparticipant_state, &nonparticipant_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(!nonparticipant_api.active);
+  EXPECT(nonparticipant_api.trigger_count == 0);
+
+  AlarmRuntimeState prior_error_state;
+  FakeAlarmApi prior_error_api;
+  apply_observation(
+      &prior_error_state, &prior_error_api,
+      observation("EASIROC", "ERROR", "EASIROC decode error detected"));
+  apply_observation(
+      &prior_error_state, &prior_error_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(!prior_error_api.active);
+  EXPECT(prior_error_api.reset_count == 2);
+
+  raw = normal_raw();
+  raw.vme.participating = false;
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  raw.vme.event_slip_count = 9;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == daq_monitor::Severity::kOk);
+  AlarmRuntimeState vme_nonparticipant_state;
+  FakeAlarmApi vme_nonparticipant_api;
+  apply_observation(
+      &vme_nonparticipant_state, &vme_nonparticipant_api,
+      observation("VME", severity_name(evaluated.vme.severity),
+                  evaluated.vme.reason.c_str()));
+  EXPECT(!vme_nonparticipant_api.active);
+
+  raw = normal_raw();
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.easiroc.severity == daq_monitor::Severity::kError);
+  AlarmRuntimeState participant_state;
+  FakeAlarmApi participant_api;
+  apply_observation(
+      &participant_state, &participant_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(participant_api.active);
+  EXPECT(participant_api.level == AlarmLevel::kError);
+
+  raw = normal_raw();
+  raw.vme.acquisition_running = false;
+  raw.easiroc.acquisition_running = false;
+  evaluated = evaluate_status(raw);
+  AlarmRuntimeState running_vme_acquisition_state;
+  FakeAlarmApi running_vme_acquisition_api;
+  apply_observation(
+      &running_vme_acquisition_state, &running_vme_acquisition_api,
+      observation("VME", severity_name(evaluated.vme.severity),
+                  evaluated.vme.reason.c_str()));
+  EXPECT(running_vme_acquisition_api.active);
+  EXPECT(running_vme_acquisition_api.level == AlarmLevel::kError);
+  AlarmRuntimeState running_easiroc_acquisition_state;
+  FakeAlarmApi running_easiroc_acquisition_api;
+  apply_observation(
+      &running_easiroc_acquisition_state,
+      &running_easiroc_acquisition_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(running_easiroc_acquisition_api.active);
+  EXPECT(running_easiroc_acquisition_api.level == AlarmLevel::kError);
+
+  // Acquisition stopping as part of EOR must not produce a component alarm,
+  // but disconnects during the same STOP transition must remain alarmable.
+  raw = normal_raw();
+  raw.stop_transition_in_progress = true;
+  raw.vme.acquisition_running = false;
+  raw.easiroc.acquisition_running = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == daq_monitor::Severity::kOk);
+  EXPECT(evaluated.easiroc.severity == daq_monitor::Severity::kOk);
+  AlarmRuntimeState stop_vme_state;
+  FakeAlarmApi stop_vme_api;
+  apply_observation(
+      &stop_vme_state, &stop_vme_api,
+      observation("VME", severity_name(evaluated.vme.severity),
+                  evaluated.vme.reason.c_str()));
+  EXPECT(!stop_vme_api.active);
+  AlarmRuntimeState stop_easiroc_state;
+  FakeAlarmApi stop_easiroc_api;
+  apply_observation(
+      &stop_easiroc_state, &stop_easiroc_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(!stop_easiroc_api.active);
+
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == daq_monitor::Severity::kError);
+  EXPECT(evaluated.easiroc.severity == daq_monitor::Severity::kError);
+  apply_observation(
+      &stop_vme_state, &stop_vme_api,
+      observation("VME", severity_name(evaluated.vme.severity),
+                  evaluated.vme.reason.c_str()));
+  apply_observation(
+      &stop_easiroc_state, &stop_easiroc_api,
+      observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                  evaluated.easiroc.reason.c_str()));
+  EXPECT(stop_vme_api.active);
+  EXPECT(stop_easiroc_api.active);
 }
 
 void test_unknown_and_message() {

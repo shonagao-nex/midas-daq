@@ -24,7 +24,7 @@ CXXFLAGS = $(CFLAGS)
 LIB_DIR  = $(MIDASSYS)/lib
 MIDASLIB = $(LIB_DIR)/libmidas.a
 MFEOBJ   = $(LIB_DIR)/mfe.o
-LIBS     = -lCAENVME -lm -lz -lutil -lpthread
+LIBS     = -lCAENVME -lsqlite3 -lm -lz -lutil -lpthread
 
 BUILD_DIR = build
 BIN_DIR = bin
@@ -49,20 +49,35 @@ COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
            $(BUILD_DIR)/v792.o \
            $(BUILD_DIR)/v775.o \
            $(BUILD_DIR)/v1720e.o \
-           $(BUILD_DIR)/rpv130.o
+           $(BUILD_DIR)/rpv130.o \
+           $(BUILD_DIR)/manual_buffer_clear.o
 OBJS = $(BUILD_DIR)/fevme.o $(COMMON_OBJS)
 DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(COMMON_OBJS)
 RPV130_TEST_OBJ = $(BUILD_DIR)/tests/test_rpv130_status.o
+IDLE_POLICY_TEST = $(BIN_TEST_DIR)/test_fevme_idle_policy
+MANUAL_CLEAR_TEST = $(BIN_TEST_DIR)/manual_buffer_clear_test
+MANUAL_CLEAR_CONTRACT_TEST = $(BIN_TEST_DIR)/test_manual_buffer_clear_contract
+START_ABORT_CONTRACT_TEST = $(BIN_TEST_DIR)/test_start_abort_contract
+V1720E_CLEAR_TEST = $(BIN_TEST_DIR)/test_v1720e_software_clear
 DEPS = $(OBJS:.o=.d) $(DIAG_OBJS:.o=.d) $(RPV130_TEST_OBJ:.o=.d) \
-	$(VME_C_TEST_OBJECTS:.o=.d)
+	$(VME_C_TEST_OBJECTS:.o=.d) \
+	$(BUILD_DIR)/tests/test_fevme_idle_policy.d
 
-.PHONY: all diagnostic tests rpv130-test clean fevme fevme_diagnostic \
+.PHONY: all check diagnostic tests rpv130-test clean fevme fevme_diagnostic \
 	$(VME_TEST_NAMES)
 .SECONDARY: $(VME_C_TEST_OBJECTS)
 
 all: $(TARGET)
 
 fevme: $(TARGET)
+
+check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
+	$(START_ABORT_CONTRACT_TEST) $(V1720E_CLEAR_TEST)
+	./$(IDLE_POLICY_TEST)
+	./$(MANUAL_CLEAR_TEST)
+	./$(MANUAL_CLEAR_CONTRACT_TEST)
+	./$(START_ABORT_CONTRACT_TEST)
+	./$(V1720E_CLEAR_TEST)
 
 diagnostic: $(DIAG_TARGET)
 
@@ -85,6 +100,29 @@ $(DIAG_TARGET): $(DIAG_OBJS) $(MFEOBJ) $(MIDASLIB) $(LIBS)
 $(BIN_TEST_DIR)/test_rpv130_status: $(RPV130_TEST_OBJ) $(BUILD_DIR)/rpv130.o $(BUILD_DIR)/caenvme.o
 	@mkdir -p $(dir $@)
 	$(CXX) -o $@ $^ $(LIBS)
+
+$(IDLE_POLICY_TEST): $(BUILD_DIR)/tests/test_fevme_idle_policy.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(MANUAL_CLEAR_TEST): $(BUILD_DIR)/tests/manual_buffer_clear_test.o \
+	$(BUILD_DIR)/manual_buffer_clear.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(MANUAL_CLEAR_CONTRACT_TEST): \
+	$(BUILD_DIR)/tests/test_manual_buffer_clear_contract.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(START_ABORT_CONTRACT_TEST): $(BUILD_DIR)/tests/test_start_abort_contract.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(V1720E_CLEAR_TEST): $(BUILD_DIR)/tests/test_v1720e_software_clear.o \
+	$(BUILD_DIR)/v1720e.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^
 
 $(BIN_TEST_DIR)/%: $(BUILD_DIR)/tests/%.o
 	@mkdir -p $(dir $@)
@@ -118,7 +156,36 @@ $(BUILD_DIR)/rpv130.o: rpv130.cxx rpv130.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/manual_buffer_clear.o: ../common/manual_buffer_clear.cxx \
+	../common/manual_buffer_clear.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I../common -c $< -o $@
+
+$(BUILD_DIR)/tests/manual_buffer_clear_test.o: \
+	../common/tests/manual_buffer_clear_test.cxx ../common/manual_buffer_clear.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I../common -c $< -o $@
+
+$(BUILD_DIR)/tests/test_manual_buffer_clear_contract.o: \
+	tests/test_manual_buffer_clear_contract.cxx fevme.cxx v1720e.c
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_v1720e_software_clear.o: \
+	tests/test_v1720e_software_clear.c v1720e.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Wpedantic -c $< -o $@
+
 $(BUILD_DIR)/tests/test_rpv130_status.o: tests/test_rpv130_status.cxx rpv130.h caenvme.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_fevme_idle_policy.o: tests/test_fevme_idle_policy.cxx fevme.cxx
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_start_abort_contract.o: \
+	tests/test_start_abort_contract.cxx fevme.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

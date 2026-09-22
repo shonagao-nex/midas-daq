@@ -17,6 +17,9 @@ TEST_NAMES := easiroc_test easiroc_event_test easiroc_stream_test \
 	easiroc_daq_control_test easiroc_slow_control_test \
 	easiroc_run_settings_test easiroc_asic_apply_test easiroc_manual_apply_test \
 	easiroc_last_applied_test \
+	manual_buffer_clear_test \
+	easiroc_buffer_clear_contract_test \
+	easiroc_start_abort_contract_test \
 	easiroc_web_gui_contract_test \
 	easiroc_readout_test \
 	easiroc_read_one easiroc_read_many
@@ -47,7 +50,7 @@ FEEASIROC_OBJECTS := $(call obj,feeasiroc.cxx easiroc_daq_control.cxx easiroc_ru
 	easiroc_status.cxx easiroc_stream.cxx easiroc_event.cxx \
 	easiroc_last_applied.cxx \
 	easiroc_readout.cxx rbcp.cxx \
-	tcp_probe.cxx) $(MIDASSYS)/lib/mfe.o
+	tcp_probe.cxx) $(BUILD_DIR)/manual_buffer_clear.o $(MIDASSYS)/lib/mfe.o
 READ_ONE_OBJECTS := $(call obj,tests/easiroc_read_one.cxx easiroc_daq_control.cxx easiroc_stream.cxx \
 	easiroc_event.cxx rbcp.cxx tcp_probe.cxx)
 READ_MANY_OBJECTS := $(call obj,tests/easiroc_read_many.cxx easiroc_daq_control.cxx \
@@ -75,6 +78,9 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	$(BIN_TEST_DIR)/easiroc_asic_apply_test \
 	$(BIN_TEST_DIR)/easiroc_manual_apply_test \
 	$(BIN_TEST_DIR)/easiroc_last_applied_test \
+	$(BIN_TEST_DIR)/manual_buffer_clear_test \
+	$(BIN_TEST_DIR)/easiroc_buffer_clear_contract_test \
+	$(BIN_TEST_DIR)/easiroc_start_abort_contract_test \
 	$(BIN_TEST_DIR)/easiroc_web_gui_contract_test \
 	$(BIN_TEST_DIR)/easiroc_readout_test
 	./$(BIN_TEST_DIR)/easiroc_event_test
@@ -85,6 +91,9 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	./$(BIN_TEST_DIR)/easiroc_asic_apply_test
 	./$(BIN_TEST_DIR)/easiroc_manual_apply_test
 	./$(BIN_TEST_DIR)/easiroc_last_applied_test
+	./$(BIN_TEST_DIR)/manual_buffer_clear_test
+	./$(BIN_TEST_DIR)/easiroc_buffer_clear_contract_test
+	./$(BIN_TEST_DIR)/easiroc_start_abort_contract_test
 	./$(BIN_TEST_DIR)/easiroc_web_gui_contract_test
 	./$(BIN_TEST_DIR)/easiroc_readout_test
 
@@ -124,6 +133,21 @@ $(BIN_TEST_DIR)/easiroc_last_applied_test: $(LAST_APPLIED_TEST_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
+$(BIN_TEST_DIR)/manual_buffer_clear_test: \
+	$(BUILD_DIR)/tests/manual_buffer_clear_test.o $(BUILD_DIR)/manual_buffer_clear.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+$(BIN_TEST_DIR)/easiroc_buffer_clear_contract_test: \
+	$(call obj,tests/easiroc_buffer_clear_contract_test.cxx)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+$(BIN_TEST_DIR)/easiroc_start_abort_contract_test: \
+	$(call obj,tests/easiroc_start_abort_contract_test.cxx)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
 $(BIN_TEST_DIR)/easiroc_web_gui_contract_test: $(call obj,tests/easiroc_web_gui_contract_test.cxx)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
@@ -149,6 +173,16 @@ $(BUILD_DIR)/feeasiroc.o: CPPFLAGS += $(MIDAS_CPPFLAGS)
 $(BUILD_DIR)/feeasiroc.o: feeasiroc.cxx easiroc_daq_control.h easiroc_run_settings.h \
 	easiroc_manual_apply.h easiroc_asic_apply.h easiroc_slow_control.h \
 	easiroc_last_applied.h easiroc_status.h easiroc_stream.h easiroc_readout.h rbcp.h tcp_probe.h
+
+$(BUILD_DIR)/manual_buffer_clear.o: ../common/manual_buffer_clear.cxx \
+	../common/manual_buffer_clear.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I../common -c -o $@ $<
+
+$(BUILD_DIR)/tests/manual_buffer_clear_test.o: \
+	../common/tests/manual_buffer_clear_test.cxx ../common/manual_buffer_clear.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I../common -c -o $@ $<
 
 $(BUILD_DIR)/tests/easiroc_test.o: tests/easiroc_test.cxx easiroc_status.h
 $(BUILD_DIR)/easiroc_status.o: easiroc_status.cxx easiroc_status.h rbcp.h tcp_probe.h
@@ -178,6 +212,10 @@ $(BUILD_DIR)/easiroc_last_applied.o: easiroc_last_applied.cxx easiroc_last_appli
 $(BUILD_DIR)/tests/easiroc_last_applied_test.o: tests/easiroc_last_applied_test.cxx \
 	easiroc_last_applied.h easiroc_manual_apply.h
 $(BUILD_DIR)/tests/easiroc_web_gui_contract_test.o: tests/easiroc_web_gui_contract_test.cxx
+$(BUILD_DIR)/tests/easiroc_buffer_clear_contract_test.o: \
+	tests/easiroc_buffer_clear_contract_test.cxx feeasiroc.cxx
+$(BUILD_DIR)/tests/easiroc_start_abort_contract_test.o: \
+	tests/easiroc_start_abort_contract_test.cxx feeasiroc.cxx
 $(BUILD_DIR)/easiroc_readout.o: easiroc_readout.cxx easiroc_readout.h easiroc_event.h
 $(BUILD_DIR)/tests/easiroc_readout_test.o: tests/easiroc_readout_test.cxx easiroc_readout.h \
 	easiroc_event.h

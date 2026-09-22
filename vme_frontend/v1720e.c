@@ -12,9 +12,11 @@
 #define REG_ROC_FIRMWARE         0x8124u
 #define REG_EVENT_STORED         0x812Cu
 #define REG_BOARD_INFO           0x8140u
+#define REG_SOFTWARE_CLEAR       0xEF28u
 #define REG_DC_OFFSET(ch)        (0x1098u + ((DWORD)(ch) << 8))
 
-#define ACQ_RUN                  0x00000004u
+#define ACQUISITION_CONTROL_RUN_REQUEST  0x00000004u
+#define ACQUISITION_STATUS_RUN_ACTIVE    0x00000004u
 #define STATUS_EVENT_READY       0x00000008u
 #define STATUS_EXTERNAL_CLOCK    0x00000020u
 #define STATUS_PLL_OK            0x00000080u
@@ -122,7 +124,8 @@ int v1720e_configure(MVME_INTERFACE *vme, DWORD base,
     status = read32(vme, base, REG_ACQUISITION_STATUS, &status_reg);
     if (status != MVME_SUCCESS)
         return status;
-    if ((control & ACQ_RUN) || (status_reg & ACQ_RUN) ||
+    if ((control & ACQUISITION_CONTROL_RUN_REQUEST) ||
+        (status_reg & ACQUISITION_STATUS_RUN_ACTIVE) ||
         (status_reg & STATUS_EXTERNAL_CLOCK) ||
         (status_reg & (STATUS_PLL_OK | STATUS_BOARD_READY)) !=
             (STATUS_PLL_OK | STATUS_BOARD_READY))
@@ -270,13 +273,13 @@ int v1720e_start(MVME_INTERFACE *vme, DWORD base)
     if (status != MVME_SUCCESS)
         return status;
     status = write_verify(vme, base, REG_ACQUISITION_CONTROL,
-                          control | ACQ_RUN);
+                          control | ACQUISITION_CONTROL_RUN_REQUEST);
     if (status != MVME_SUCCESS)
         return status;
     status = read32(vme, base, REG_ACQUISITION_STATUS, &status_reg);
     if (status != MVME_SUCCESS)
         return status;
-    if (!(status_reg & ACQ_RUN) ||
+    if (!(status_reg & ACQUISITION_STATUS_RUN_ACTIVE) ||
         (status_reg & (STATUS_PLL_OK | STATUS_BOARD_READY)) !=
             (STATUS_PLL_OK | STATUS_BOARD_READY))
         return MVME_ACCESS_ERROR;
@@ -298,11 +301,48 @@ int v1720e_stop(MVME_INTERFACE *vme, DWORD base)
     if (status != MVME_SUCCESS)
         return status;
     status = write_verify(vme, base, REG_ACQUISITION_CONTROL,
-                          control & ~ACQ_RUN);
+                          control & ~ACQUISITION_CONTROL_RUN_REQUEST);
     if (status != MVME_SUCCESS)
         return status;
     status = read32(vme, base, REG_ACQUISITION_STATUS, &status_reg);
     if (status != MVME_SUCCESS)
         return status;
-    return (status_reg & ACQ_RUN) == 0 ? MVME_SUCCESS : MVME_ACCESS_ERROR;
+    return (status_reg & ACQUISITION_STATUS_RUN_ACTIVE) == 0
+               ? MVME_SUCCESS
+               : MVME_ACCESS_ERROR;
+}
+
+int v1720e_software_clear(MVME_INTERFACE *vme, DWORD base,
+                          DWORD *event_stored_after,
+                          int *event_stored_after_valid)
+{
+    DWORD control = 0, status_reg = 0, stored = 0;
+    int status;
+    if (!vme)
+        return MVME_INVALID_PARAM;
+    if (event_stored_after_valid)
+        *event_stored_after_valid = 0;
+    status = read32(vme, base, REG_ACQUISITION_CONTROL, &control);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = read32(vme, base, REG_ACQUISITION_STATUS, &status_reg);
+    if (status != MVME_SUCCESS)
+        return status;
+    if ((control & ACQUISITION_CONTROL_RUN_REQUEST) ||
+        (status_reg & ACQUISITION_STATUS_RUN_ACTIVE))
+        return MVME_ACCESS_ERROR;
+
+    /* CAEN V1720 SW_CLEAR (0xEF28), documented as write-only D32. This is
+     * deliberately not SW_RESET (0xEF24) or CONFIG_RELOAD (0xEF34). */
+    status = write32(vme, base, REG_SOFTWARE_CLEAR, 0);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = read32(vme, base, REG_EVENT_STORED, &stored);
+    if (status != MVME_SUCCESS)
+        return status;
+    if (event_stored_after)
+        *event_stored_after = stored;
+    if (event_stored_after_valid)
+        *event_stored_after_valid = 1;
+    return stored == 0 ? MVME_SUCCESS : MVME_ACCESS_ERROR;
 }

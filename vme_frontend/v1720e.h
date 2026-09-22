@@ -68,6 +68,11 @@ int v1720e_read_event(MVME_INTERFACE *vme, DWORD base, DWORD *data,
                       DWORD expected_channel_mask, V1720E_EVENT_INFO *info);
 int v1720e_start(MVME_INTERFACE *vme, DWORD base);
 int v1720e_stop(MVME_INTERFACE *vme, DWORD base);
+/* Clears event memory without resetting or reloading board configuration.
+ * event_stored_after_valid is false unless Event Stored was read successfully. */
+int v1720e_software_clear(MVME_INTERFACE *vme, DWORD base,
+                          DWORD *event_stored_after,
+                          int *event_stored_after_valid);
 
 #ifdef __cplusplus
 }

@@ -43,8 +43,9 @@ set /Custom/DAQ daq.html
 
 If `/Custom/Path` already points elsewhere, do not overwrite it. Copy or
 symlink `daq.html`, `daq.css`, `daq.js`, `mock-data.js`, `easiroc.html`,
-`easiroc.css`, `easiroc.js`, and `easiroc-mock-data.js` into that existing
-directory, then set only `/Custom/DAQ` to `daq.html`.
+`easiroc.css`, `easiroc.js`, `easiroc-mock-data.js`, `buffer-clear.html`,
+`buffer-clear.css`, `buffer-clear.js`, and `buffer-clear-mock-data.js` into
+that existing directory, then set only `/Custom/DAQ` to `daq.html`.
 
 After registration the page is available from the `DAQ` side-menu entry or:
 
@@ -132,14 +133,28 @@ Open `easiroc.html?mock=1` for offline preview. Its scenario buttons cover
 Match, Mismatch, Unknown, Indeterminate, Applying, Succeeded, Failed,
 Rejected, and Unsaved changes without contacting MIDAS.
 
+## Manual buffer-clear page
+
+`buffer-clear.html` is linked from the DAQ dashboard. It checks the exact MIDAS
+client names `fevme` and `feeasiroc` before enabling each button, requires
+`/Runinfo/State` to be STOPPED, writes one monotonic request ID, and waits for
+the owning frontend's terminal acknowledgement. The frontend independently
+rechecks STOPPED. A request left in ODB while a frontend is absent is
+acknowledged without execution when that frontend next starts.
+
+VME results are reported separately for V792, V1190, V775, and V1720E. RPV130
+is deliberately excluded. NIM-EASIROC performs only a bounded host TCP receive
+drain; the authoritative controller does not document a configuration-safe
+device FIFO-clear command. Open `buffer-clear.html?mock=1` for a no-I/O preview.
+
 ## Data sources
 
 The page uses these monitor-owned records:
 
 - `/DAQ/Status/Global/{Severity,Summary,CanStart,CanStartReason}`
-- `/DAQ/Status/Run/{RunNumber,State,DurationSec}`
-- `/DAQ/Status/Frontends/VME/{Severity,Reason,Connected,EventSlipCount}`
-- `/DAQ/Status/Frontends/EASIROC/{Severity,Reason,Connected}`
+- `/DAQ/Status/Run/{RunNumber,State,DurationSec,ParticipationValid,ParticipationRunNumber,VMEParticipating,EASIROCParticipating}`
+- `/DAQ/Status/Frontends/VME/{Severity,Reason,Connected,Participating,EventSlipCount}`
+- `/DAQ/Status/Frontends/EASIROC/{Severity,Reason,Connected,Participating}`
 - `/DAQ/Status/Logger/CurrentFilename`
 - `/DAQ/Status/Disk/{Severity,Path,FreeGB,TotalGB}`
 
@@ -159,3 +174,12 @@ because they can represent correlated but non-identical event streams.
 Start and Stop call the mhttpd JSON-RPC method `cm_transition` with
 `TR_START` or `TR_STOP`. The Start button directly follows the published
 `CanStart` value; the browser does not recalculate policy or severity.
+
+At START sequence 400, the monitor records the connected frontend set with the
+target run number and publishes the validity marker last. During that run only
+those frontends contribute frontend status and alarms. A participant remains a
+participant after disconnecting, so its loss is an ERROR; a disconnected
+non-participant is shown as `Not participating` and is not alarmed. An absent,
+invalid, or mismatched run-participation record falls back to monitoring both
+frontends. Configuration and RunSnapshot records remain diagnostic BOR output
+and are not used to infer participation from a previous run.

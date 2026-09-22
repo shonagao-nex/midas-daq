@@ -46,7 +46,11 @@ ComponentStatus evaluate_logger(bool connected) {
   return status(Severity::kOk, "Logger OK");
 }
 
-ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw) {
+ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw,
+                             bool stop_transition_in_progress) {
+  if (is_run_active(run_state) && !raw.participating)
+    return status(Severity::kOk, "VME not participating in current run");
+
   // Data-integrity failures take precedence over connectivity. Their ordering
   // is fixed here and is also the ordering used for the VME Reason key.
   if (is_run_active(run_state) && raw.event_slip_count > 0)
@@ -64,6 +68,14 @@ ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw) {
   if (is_run_active(run_state) && raw.counter_discontinuity_count > 0)
     return status(Severity::kError, "VME counter discontinuity detected");
 
+  // During a normal STOP, EOR turns acquisition off before MIDAS changes
+  // /Runinfo/State from RUNNING to STOPPED. Suppress only this expected state
+  // change; connectivity and integrity checks below/above remain active.
+  if (is_run_active(run_state) && raw.connected && raw.status_fresh &&
+      raw.acquisition_expected && !raw.acquisition_running &&
+      !stop_transition_in_progress)
+    return status(Severity::kError, "VME acquisition not running");
+
   if (raw.connected && raw.status_fresh)
     return status(Severity::kOk, "VME OK");
   if (raw.connected)
@@ -78,13 +90,19 @@ ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw) {
 }
 
 ComponentStatus evaluate_easiroc(RunState run_state,
-                                 const EasirocRawStatus& raw) {
+                                 const EasirocRawStatus& raw,
+                                 bool stop_transition_in_progress) {
+  if (is_run_active(run_state) && !raw.participating)
+    return status(Severity::kOk,
+                  "EASIROC not participating in current run");
+
   // Fault and acquisition-state failures precede data-integrity failures;
   // this makes the most immediate readout failure the published reason.
   if (raw.acquisition_fault)
     return status(Severity::kError, "EASIROC acquisition fault");
   if (is_run_active(run_state) && raw.connected && raw.status_fresh &&
-      !raw.acquisition_running)
+      raw.acquisition_expected && !raw.acquisition_running &&
+      !stop_transition_in_progress)
     return status(Severity::kError, "EASIROC acquisition not running");
   if (is_run_active(run_state) && raw.decode_error_count > 0)
     return status(Severity::kError, "EASIROC decode error detected");
@@ -113,13 +131,11 @@ ComponentStatus evaluate_easiroc(RunState run_state,
 CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   if (!raw.monitor_status_fresh)
     return {false, "Monitor status stale"};
-  if (!raw.vme.connected)
-    return {false, "VME frontend disconnected"};
-  if (!raw.easiroc.connected)
-    return {false, "EASIROC frontend disconnected"};
-  if (!raw.vme.status_fresh)
+  if (!raw.vme.connected && !raw.easiroc.connected)
+    return {false, "No DAQ frontend running"};
+  if (raw.vme.connected && !raw.vme.status_fresh)
     return {false, "VME frontend status stale"};
-  if (!raw.easiroc.status_fresh)
+  if (raw.easiroc.connected && !raw.easiroc.status_fresh)
     return {false, "EASIROC frontend status stale"};
   if (raw.disk_free_gb < 0.0)
     return {false, "Disk free unavailable"};
@@ -128,38 +144,28 @@ CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   return {true, {}};
 }
 
-ConfigurationEvaluation evaluate_bor_configuration(
-    std::int32_t target_run_number,
-    const ConfigurationRawStatus& vme,
-    const ConfigurationRawStatus& easiroc) {
-  if (!vme.ok || vme.run_number != target_run_number)
-    return {false, "VME configuration not valid for run " +
-                       std::to_string(target_run_number)};
-  if (!easiroc.ok || easiroc.run_number != target_run_number)
-    return {false, "EASIROC configuration not valid for run " +
-                       std::to_string(target_run_number)};
-  return {true, {}};
-}
+ActiveParticipation resolve_run_participation(
+    RunState run_state, std::int32_t current_run_number,
+    const RunParticipation& recorded) {
+  if (!is_run_active(run_state))
+    return {true, false, false};
+  if (recorded.valid && recorded.run_number == current_run_number)
+    return {true, recorded.vme, recorded.easiroc};
 
-StartEvaluation evaluate_start(
-    std::int32_t target_run_number,
-    const CanStartEvaluation& pre_start,
-    const ConfigurationRawStatus& vme,
-    const ConfigurationRawStatus& easiroc) {
-  if (!pre_start.allowed)
-    return {false, pre_start.reason};
-
-  const ConfigurationEvaluation configuration =
-      evaluate_bor_configuration(target_run_number, vme, easiroc);
-  return {configuration.ready, configuration.reason};
+  // Missing or stale participation metadata must never make a frontend
+  // disappear from monitoring. Monitoring both is the fail-safe fallback;
+  // only an exact current-run record is allowed to suppress a frontend.
+  return {false, true, true};
 }
 
 StatusEvaluation evaluate_status(const RawStatus& raw) {
   StatusEvaluation evaluation;
   evaluation.disk = evaluate_disk(raw.disk_free_gb);
   evaluation.logger = evaluate_logger(raw.logger_connected);
-  evaluation.vme = evaluate_vme(raw.run_state, raw.vme);
-  evaluation.easiroc = evaluate_easiroc(raw.run_state, raw.easiroc);
+  evaluation.vme = evaluate_vme(raw.run_state, raw.vme,
+                                raw.stop_transition_in_progress);
+  evaluation.easiroc = evaluate_easiroc(
+      raw.run_state, raw.easiroc, raw.stop_transition_in_progress);
 
   // For equal severities, the operational priority is VME, EASIROC, Disk,
   // then Logger. The selected component supplies the short GUI summary.

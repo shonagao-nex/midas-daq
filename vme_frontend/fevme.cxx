@@ -3,10 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <string>
 
 #include "midas.h"
 #include "mfe.h"
 #include "mvmestd.h"
+#include "../common/manual_buffer_clear.h"
 #include "vme/v792.h"
 #include "v775.h"
 #include "v1720e.h"
@@ -115,7 +117,7 @@ static const WORD V1190_RUN_DEAD_TIME = 0;  // approximately 5 ns
 static const WORD V1190_RUN_MAX_HITS = 9;   // unlimited
 static const size_t V1190_CHANNEL_MASK_WORDS = 8;
 
-const char *frontend_name = "fe_vme_test";      // MIDAS frontend name
+const char *frontend_name = "fevme";            // MIDAS frontend/client name
 const char *frontend_file_name = __FILE__;      // Frontend source file name
 
 BOOL frontend_call_loop = TRUE;                 // Enable periodic read-only status monitoring
@@ -128,6 +130,7 @@ INT event_buffer_size = 10 * 1024 * 1024;       // MIDAS event buffer size [byte
 static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
+static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
 static DWORD gRpv130LastPoll = 0;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
@@ -143,6 +146,10 @@ static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
 static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
 static const char *V1720E_READBACK_PATH = "/Equipment/VME/Readback/V1720E";
 static const char *V1720E_VARIABLES_PATH = "/Equipment/VME/Variables/V1720E";
+static const char *BUFFER_CLEAR_COMMAND_PATH =
+    "/Equipment/VME/Commands/BufferClearRequestId";
+static const char *BUFFER_CLEAR_STATUS_PATH =
+    "/Equipment/VME/Variables/BufferClear";
 
 static const DWORD V1720E_TRIGGER_SOFTWARE = 0x80000000u;
 static const DWORD V1720E_TRIGGER_EXTERNAL = 0x40000000u;
@@ -522,6 +529,118 @@ static V7xxRuntimeState gV775Runtime = {};
 static DWORD gV792LastVariablesPublish = 0;
 static DWORD gV1190LastVariablesPublish = 0;
 static DWORD gV775LastVariablesPublish = 0;
+
+struct VmeBufferClearResults {
+    std::string v792 = "Not requested";
+    std::string v1190 = "Not requested";
+    std::string v775 = "Not requested";
+    std::string v1720e = "Not requested";
+};
+
+static daq::BufferClearStatus gBufferClearStatus;
+static VmeBufferClearResults gBufferClearResults;
+
+static bool set_buffer_clear_string(const char *name, const std::string &value)
+{
+    char path[256];
+    if (!make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name))
+        return false;
+    char buffer[256] = {};
+    snprintf(buffer, sizeof(buffer), "%s", value.c_str());
+    return set_absolute_odb_value(path, buffer, sizeof(buffer), 1, TID_STRING);
+}
+
+static bool publish_buffer_clear_status()
+{
+    char path[256];
+    bool ok = true;
+    const DWORD active = gBufferClearStatus.active_request_id;
+    const DWORD handled = gBufferClearStatus.last_handled_request_id;
+    const DWORD successful = gBufferClearStatus.last_successful_request_id;
+    const BOOL in_progress = gBufferClearStatus.in_progress ? TRUE : FALSE;
+    const BOOL last_succeeded =
+        gBufferClearStatus.last_attempt_succeeded ? TRUE : FALSE;
+#define PUBLISH_CLEAR_VALUE(name, value, type) \
+    do { \
+        ok = make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name) && \
+             set_absolute_odb_value(path, &(value), sizeof(value), 1, type) && ok; \
+    } while (0)
+    PUBLISH_CLEAR_VALUE("ActiveRequestId", active, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("LastHandledRequestId", handled, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("LastSuccessfulRequestId", successful, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("InProgress", in_progress, TID_BOOL);
+    PUBLISH_CLEAR_VALUE("LastAttemptSucceeded", last_succeeded, TID_BOOL);
+    PUBLISH_CLEAR_VALUE("LastClearUnixTime",
+                        gBufferClearStatus.last_clear_unix_time, TID_QWORD);
+#undef PUBLISH_CLEAR_VALUE
+    ok = set_buffer_clear_string(
+             "State", daq::bufferClearStateName(gBufferClearStatus.state)) && ok;
+    ok = set_buffer_clear_string("LastError", gBufferClearStatus.last_error) && ok;
+    ok = set_buffer_clear_string("V792Result", gBufferClearResults.v792) && ok;
+    ok = set_buffer_clear_string("V1190Result", gBufferClearResults.v1190) && ok;
+    ok = set_buffer_clear_string("V775Result", gBufferClearResults.v775) && ok;
+    ok = set_buffer_clear_string("V1720EResult", gBufferClearResults.v1720e) && ok;
+    return ok;
+}
+
+static bool initialize_buffer_clear_mailbox()
+{
+    const DWORD zero = 0;
+    const BOOL no = FALSE;
+    const uint64_t zero_time = 0;
+    char path[256];
+    char idle[32] = "Idle";
+    char empty[256] = {};
+#define ENSURE_CLEAR_VALUE(name, value, count, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name) || \
+            !ensure_odb_value(path, &(value), sizeof(value), count, type)) \
+            return false; \
+    } while (0)
+    if (!ensure_odb_value(BUFFER_CLEAR_COMMAND_PATH, &zero, sizeof(zero), 1,
+                          TID_DWORD))
+        return false;
+    ENSURE_CLEAR_VALUE("ActiveRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("LastHandledRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("LastSuccessfulRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("InProgress", no, 1, TID_BOOL);
+    ENSURE_CLEAR_VALUE("LastAttemptSucceeded", no, 1, TID_BOOL);
+    ENSURE_CLEAR_VALUE("LastClearUnixTime", zero_time, 1, TID_QWORD);
+    ENSURE_CLEAR_VALUE("State", idle, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("LastError", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V792Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V1190Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V775Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V1720EResult", empty, 1, TID_STRING);
+#undef ENSURE_CLEAR_VALUE
+
+    DWORD request_id = 0, handled = 0, successful = 0;
+    if (!get_absolute_odb_value(BUFFER_CLEAR_COMMAND_PATH, &request_id,
+                                sizeof(request_id), TID_DWORD) ||
+        !make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH,
+                       "LastHandledRequestId") ||
+        !get_absolute_odb_value(path, &handled, sizeof(handled), TID_DWORD) ||
+        !make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH,
+                       "LastSuccessfulRequestId") ||
+        !get_absolute_odb_value(path, &successful, sizeof(successful), TID_DWORD))
+        return false;
+    gBufferClearStatus = {};
+    gBufferClearStatus.last_handled_request_id = handled;
+    gBufferClearStatus.last_successful_request_id = successful;
+    if (request_id > handled) {
+        const time_t now = time(NULL);
+        gBufferClearStatus = daq::acknowledgeStaleBufferClearRequest(
+            gBufferClearStatus, request_id,
+            now < 0 ? 0 : static_cast<uint64_t>(now));
+        gBufferClearResults = {};
+        gBufferClearResults.v792 = gBufferClearResults.v1190 =
+            gBufferClearResults.v775 = gBufferClearResults.v1720e =
+                "Not executed: stale startup request";
+        cm_msg(MINFO, frontend_name, "WARNING: %s (request %u)",
+               gBufferClearStatus.last_error.c_str(), request_id);
+    }
+    return publish_buffer_clear_status();
+}
 
 static bool set_module_output(const char *base, const char *name,
                               const void *value, INT size, INT count,
@@ -1411,6 +1530,12 @@ struct V775EventInfo {
 };
 
 static bool gV1720Started = false;
+/*
+ * Set before issuing the V1720E RUN request. A failed start can mean that the
+ * write reached the module but a subsequent verification read failed, so an
+ * attempted start must be rolled back even when gV1720Started is still false.
+ */
+static bool gV1720StartAttempted = false;
 
 static void invalidate_v1720e_current_state()
 {
@@ -1428,8 +1553,17 @@ static void invalidate_v1720e_current_state()
 
 static bool stop_v1720e_and_publish_state(const char *context)
 {
-    if (!gV1720Started)
+    if (!gV1720StartAttempted && !gV1720Started)
         return true;
+
+    if (!gVme) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot stop V1720E during %s: VME interface is unavailable",
+               context);
+        invalidate_v1720e_current_state();
+        publish_v1720e_variables();
+        return false;
+    }
 
     const int stop_status = v1720e_stop(gVme, V1720E_BASE);
     if (stop_status != MVME_SUCCESS) {
@@ -1440,6 +1574,7 @@ static bool stop_v1720e_and_publish_state(const char *context)
         publish_v1720e_variables();
         return false;
     }
+    gV1720StartAttempted = false;
     gV1720Started = false;
 
     if (!gV1720RunSettings.enabled || !gV1720Runtime.communication_ok) {
@@ -2935,6 +3070,183 @@ static bool clear_module_buffers()
     return true;
 }
 
+static void set_vme_clear_results(const std::string &value)
+{
+    gBufferClearResults.v792 = value;
+    gBufferClearResults.v1190 = value;
+    gBufferClearResults.v775 = value;
+    gBufferClearResults.v1720e = value;
+}
+
+static void process_manual_buffer_clear_request()
+{
+    DWORD request_id = 0;
+    if (!get_absolute_odb_value(BUFFER_CLEAR_COMMAND_PATH, &request_id,
+                                sizeof(request_id), TID_DWORD) ||
+        request_id <= gBufferClearStatus.last_handled_request_id)
+        return;
+
+    const daq::BufferClearTransition transition =
+        daq::beginBufferClearRequest(gBufferClearStatus, request_id);
+    if (!transition.handled)
+        return;
+    gBufferClearStatus = transition.pending;
+    set_vme_clear_results("Not attempted");
+    publish_buffer_clear_status();
+
+    const time_t now = time(NULL);
+    const uint64_t unix_time =
+        now < 0 ? 0 : static_cast<uint64_t>(now);
+    INT current_run_state = 0;
+    if (!get_absolute_odb_value("/Runinfo/State", &current_run_state,
+                                sizeof(current_run_state), TID_INT)) {
+        gBufferClearStatus = daq::rejectBufferClearRequest(
+            gBufferClearStatus, "Cannot verify MIDAS Run state", unix_time);
+        set_vme_clear_results("Not attempted: Run state unavailable");
+        publish_buffer_clear_status();
+        return;
+    }
+    if (current_run_state != STATE_STOPPED) {
+        const daq::BufferClearRunState state =
+            current_run_state == STATE_RUNNING
+                ? daq::BufferClearRunState::kRunning
+                : (current_run_state == STATE_PAUSED
+                       ? daq::BufferClearRunState::kPaused
+                       : daq::BufferClearRunState::kUnknown);
+        const std::string error =
+            daq::bufferClearRunStateRejection(state, "VME");
+        gBufferClearStatus = daq::rejectBufferClearRequest(
+            gBufferClearStatus, error, unix_time);
+        set_vme_clear_results("Not attempted: " + error);
+        publish_buffer_clear_status();
+        cm_msg(MINFO, frontend_name, "Request %u rejected: %s", request_id,
+               error.c_str());
+        return;
+    }
+    if (!gVme) {
+        gBufferClearStatus = daq::rejectBufferClearRequest(
+            gBufferClearStatus, "VME interface is not open", unix_time);
+        set_vme_clear_results("Not attempted: VME interface unavailable");
+        publish_buffer_clear_status();
+        return;
+    }
+
+    V792Settings v792 = {};
+    V1190Settings v1190 = {};
+    V775Settings v775 = {};
+    V1720ESettings v1720 = {};
+    if (!read_v792_settings(v792) || !read_v1190_settings(v1190) ||
+        !read_v775_settings(v775) || !read_v1720e_settings(v1720)) {
+        gBufferClearStatus = daq::rejectBufferClearRequest(
+            gBufferClearStatus, "Cannot snapshot VME module Enabled settings",
+            unix_time);
+        set_vme_clear_results("Not attempted: ODB Settings unavailable");
+        publish_buffer_clear_status();
+        return;
+    }
+
+    gBufferClearStatus =
+        daq::markBufferClearExecuting(gBufferClearStatus);
+    publish_buffer_clear_status();
+    bool all_ok = true;
+    std::string errors;
+    const auto fail = [&](const char *module, std::string &result,
+                          const std::string &detail) {
+        result = "Failed: " + detail;
+        if (!errors.empty()) errors += "; ";
+        errors += module;
+        errors += ": ";
+        errors += detail;
+        all_ok = false;
+    };
+
+    if (!v792.enabled) {
+        gBufferClearResults.v792 = "Skipped: disabled in ODB";
+    } else if (!vme_write16(V792_BASE + V792_BIT_SET2_RW, 0x0004,
+                            "V792 manual Data Clear set") ||
+               !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO, 0x0004,
+                            "V792 manual Data Clear clear")) {
+        fail("V792", gBufferClearResults.v792, "Data Clear write failed");
+    } else if (v792_DataReady(gVme, V792_BASE)) {
+        fail("V792", gBufferClearResults.v792,
+             "DataReady remains asserted after Data Clear");
+    } else {
+        gBufferClearResults.v792 = "Succeeded: Data Clear";
+    }
+
+    WORD v1190_status = 0;
+    if (!v1190.enabled) {
+        gBufferClearResults.v1190 = "Skipped: disabled in ODB";
+    } else if (!vme_write16(V1190_BASE + V1190_SOFT_CLEAR, 0,
+                            "V1190 manual Software Clear")) {
+        fail("V1190", gBufferClearResults.v1190,
+             "Software Clear write failed");
+    } else if (!vme_read16(V1190_BASE + V1190_STATUS, v1190_status,
+                           "V1190 Status after manual Software Clear")) {
+        fail("V1190", gBufferClearResults.v1190,
+             "status verification read failed");
+    } else if (v1190_status & V1190_STATUS_DATA_READY) {
+        fail("V1190", gBufferClearResults.v1190,
+             "DataReady remains asserted after Software Clear");
+    } else {
+        gBufferClearResults.v1190 = "Succeeded: Software Clear";
+    }
+
+    if (!v775.enabled) {
+        gBufferClearResults.v775 = "Skipped: disabled in ODB";
+    } else if (!vme_write16(V775_BASE + V775_BIT_SET2,
+                            V775_BIT2_CLEAR_DATA,
+                            "V775 manual Data Clear set") ||
+               !vme_write16(V775_BASE + V775_BIT_CLEAR2,
+                            V775_BIT2_CLEAR_DATA,
+                            "V775 manual Data Clear clear")) {
+        fail("V775", gBufferClearResults.v775, "Data Clear write failed");
+    } else if (v775_DataReady(gVme, V775_BASE)) {
+        fail("V775", gBufferClearResults.v775,
+             "DataReady remains asserted after Data Clear");
+    } else {
+        gBufferClearResults.v775 = "Succeeded: Data Clear";
+    }
+
+    if (!v1720.enabled) {
+        gBufferClearResults.v1720e = "Skipped: disabled in ODB";
+    } else {
+        DWORD stored = 0;
+        int stored_valid = 0;
+        const int status =
+            v1720e_software_clear(gVme, V1720E_BASE, &stored, &stored_valid);
+        if (status != MVME_SUCCESS) {
+            const std::string stored_text = stored_valid
+                ? std::to_string(stored)
+                : "unavailable";
+            fail("V1720E", gBufferClearResults.v1720e,
+                 std::string("Software Clear failed (status ") +
+                     std::to_string(status) + ", EventStored=" +
+                     stored_text + ")");
+        } else {
+            gBufferClearResults.v1720e =
+                "Succeeded: Software Clear; EventStored=0";
+        }
+    }
+
+    gBufferClearStatus = daq::finishBufferClearRequest(
+        gBufferClearStatus, all_ok, errors, unix_time);
+    publish_buffer_clear_status();
+    if (all_ok) {
+        cm_msg(MINFO, frontend_name,
+               "Request %u VME buffer clear succeeded: V792=%s; V1190=%s; "
+               "V775=%s; V1720E=%s; RPV130 untouched",
+               request_id, gBufferClearResults.v792.c_str(),
+               gBufferClearResults.v1190.c_str(),
+               gBufferClearResults.v775.c_str(),
+               gBufferClearResults.v1720e.c_str());
+    } else {
+        cm_msg(MERROR, frontend_name,
+               "Request %u VME buffer clear failed: %s; RPV130 untouched",
+               request_id, errors.c_str());
+    }
+}
+
 static bool reset_module_event_counters()
 {
     /*
@@ -2986,9 +3298,11 @@ static bool prepare_modules_for_run()
         !verify_run_start_state())
         return false;
     if (!gV1720RunSettings.enabled) {
+        gV1720StartAttempted = false;
         gV1720Started = false;
         return true;
     }
+    gV1720StartAttempted = true;
     const int start_status = v1720e_start(gVme, V1720E_BASE);
     if (start_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
@@ -3007,8 +3321,7 @@ static bool prepare_modules_for_run()
                "V1720E post-start buffer verification failed: status %d "
                "ready=%d Event Stored=%u",
                ready_status, v1720_ready, v1720_events);
-        v1720e_stop(gVme, V1720E_BASE);
-        gV1720Started = false;
+        stop_v1720e_and_publish_state("BOR post-start verification failure");
         return false;
     }
     printf("  V1720E Acquisition STARTED; Event Stored after RUN memory reset=%u\n",
@@ -3114,6 +3427,8 @@ static void refresh_enabled_module_variables()
 
 
 /* Open VME and verify both modules without changing their configuration. */
+static INT start_abort(INT run_number, char *error);
+
 INT frontend_init()
 {
 #if ENABLE_V792_SW_TRIGGER_TEST || ENABLE_V1190_SOFT_TRIGGER_TEST || ENABLE_V775_SW_TRIGGER_TEST
@@ -3128,7 +3443,8 @@ INT frontend_init()
 #endif
 
     if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
-        !initialize_v1720e_odb() || !initialize_run_counters_odb()) {
+        !initialize_v1720e_odb() || !initialize_run_counters_odb() ||
+        !initialize_buffer_clear_mailbox()) {
         cm_msg(MERROR, frontend_name,
                "Cannot initialize VME module ODB schema/settings");
         return FE_ERR_ODB;
@@ -3143,6 +3459,14 @@ INT frontend_init()
         cm_msg(MERROR, frontend_name,
                "Cannot initialize VME RunSnapshot ODB schema");
         return FE_ERR_ODB;
+    }
+    const INT transition_status =
+        cm_register_transition(TR_STARTABORT, start_abort, 500);
+    if (transition_status != CM_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot register TR_STARTABORT callback: status %d",
+               transition_status);
+        return transition_status;
     }
 
     printf("Opening VME interface...\n");
@@ -3235,6 +3559,7 @@ INT begin_of_run(INT run_number, char *error)
     set_v1720e_readback_valid(false);
 
     if (!prepare_modules_for_run()) {
+        stop_v1720e_and_publish_state("BOR failure");
         cm_msg(MERROR, frontend_name,
                "BOR configuration failed; refusing to start run %d", run_number);
         snprintf(error, 256, "Normal BOR module preparation failed");
@@ -3250,10 +3575,7 @@ INT begin_of_run(INT run_number, char *error)
         !setup_v1190_soft_trigger_test())) {
         snprintf(error, 256, "V1190 soft-trigger diagnostic setup failed");
         restore_v1190_diagnostic_settings();
-        if (gV1720Started) {
-            v1720e_stop(gVme, V1720E_BASE);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("BOR diagnostic setup failure");
         mark_configuration_failed(run_number);
         return FE_ERR_HW;
     }
@@ -3263,10 +3585,7 @@ INT begin_of_run(INT run_number, char *error)
         !setup_v775_sw_trigger_test())) {
         snprintf(error, 256, "V775 SW trigger diagnostic setup failed");
         restore_v775_diagnostic_settings();
-        if (gV1720Started) {
-            v1720e_stop(gVme, V1720E_BASE);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("BOR diagnostic setup failure");
         mark_configuration_failed(run_number);
         return FE_ERR_HW;
     }
@@ -3274,10 +3593,7 @@ INT begin_of_run(INT run_number, char *error)
     gVmeRunSnapshot.frontend_bor_complete = TRUE;
     if (!vme_configuration_ready()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
-        if (gV1720Started) {
-            v1720e_stop(gVme, V1720E_BASE);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("BOR readiness failure");
         cm_msg(MERROR, frontend_name,
                "VME BOR completed without all enabled modules ready");
         snprintf(error, 256, "VME configuration readiness check failed");
@@ -3286,10 +3602,7 @@ INT begin_of_run(INT run_number, char *error)
     }
     if (!publish_vme_run_snapshot()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
-        if (gV1720Started) {
-            v1720e_stop(gVme, V1720E_BASE);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("BOR RunSnapshot publish failure");
         cm_msg(MERROR, frontend_name,
                "Cannot publish completed VME RunSnapshot for run %d",
                run_number);
@@ -3300,10 +3613,7 @@ INT begin_of_run(INT run_number, char *error)
     if (!publish_configuration_status(true, run_number)) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
         publish_vme_run_snapshot();
-        if (gV1720Started) {
-            v1720e_stop(gVme, V1720E_BASE);
-            gV1720Started = false;
-        }
+        stop_v1720e_and_publish_state("BOR status publish failure");
         cm_msg(MERROR, frontend_name,
                "Cannot publish successful VME configuration status for run %d",
                run_number);
@@ -3349,6 +3659,36 @@ INT end_of_run(INT run_number, char *error)
 }
 
 
+/* Roll back hardware and framework state after any failed START transition. */
+static INT start_abort(INT run_number, char *error)
+{
+    if (error)
+        error[0] = '\0';
+
+    /* A successful BOR enables the legacy MFE readout before another client
+     * can fail the common START. Stop software readout before hardware. */
+    readout_enable(FALSE);
+    const bool stopped =
+        stop_v1720e_and_publish_state("STARTABORT rollback");
+
+    gVmeRunSnapshot.frontend_bor_complete = FALSE;
+    publish_vme_run_snapshot();
+    mark_configuration_failed(run_number);
+
+    run_state = STATE_STOPPED;
+    cm_set_client_run_state(run_state);
+    if (!stopped) {
+        if (error)
+            snprintf(error, 256,
+                     "V1720E Acquisition Stop failed during STARTABORT");
+        return FE_ERR_HW;
+    }
+    cm_msg(MINFO, frontend_name,
+           "STARTABORT rollback completed for run %d", run_number);
+    return SUCCESS;
+}
+
+
 /* Handle a MIDAS run pause. */
 INT pause_run(INT run_number, char *error)
 {
@@ -3366,6 +3706,7 @@ INT resume_run(INT run_number, char *error)
 /* Poll RPV130 status outside the DAQ event readout path. */
 INT frontend_loop()
 {
+    process_manual_buffer_clear_request();
     publish_rpv130_status(false);
     const DWORD now = ss_millitime();
     const auto due=[](DWORD now,DWORD last,bool dirty) {
@@ -3402,6 +3743,12 @@ INT frontend_loop()
           elapsed >= V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS) ||
          elapsed >= V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS))
         publish_v1720e_variables();
+
+    // EQ_POLLED/RO_RUNNING keeps poll_event() out of STOPPED and PAUSED.
+    // frontend_call_loop remains enabled for status housekeeping, so yield
+    // CPU here when trigger-latency-sensitive readout is inactive.
+    if (run_state != STATE_RUNNING)
+        ss_sleep(FRONTEND_IDLE_SLEEP_MS);
     return SUCCESS;
 }
 

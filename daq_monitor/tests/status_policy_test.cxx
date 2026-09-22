@@ -20,12 +20,11 @@ void expect(bool condition, const char* expression, int line) {
 #define EXPECT(expression) expect((expression), #expression, __LINE__)
 
 using daq_monitor::ComponentStatus;
-using daq_monitor::ConfigurationRawStatus;
 using daq_monitor::EasirocRawStatus;
 using daq_monitor::RawStatus;
+using daq_monitor::RunParticipation;
 using daq_monitor::RunState;
 using daq_monitor::Severity;
-using daq_monitor::StartEvaluation;
 using daq_monitor::VmeRawStatus;
 
 void expect_severity(const ComponentStatus& result, Severity expected) {
@@ -40,6 +39,8 @@ RawStatus normal_raw(RunState run_state = RunState::kRunning) {
   raw.logger_connected = true;
   raw.vme.connected = true;
   raw.vme.status_fresh = true;
+  raw.vme.acquisition_expected = true;
+  raw.vme.acquisition_running = true;
   raw.easiroc.connected = true;
   raw.easiroc.status_fresh = true;
   raw.easiroc.acquisition_running = true;
@@ -184,20 +185,93 @@ void test_easiroc_integrity() {
   expect_severity(evaluate_easiroc(RunState::kRunning, raw), Severity::kError);
 }
 
+void test_stop_transition_acquisition_policy() {
+  using daq_monitor::evaluate_status;
+
+  // A participating frontend that unexpectedly stops acquisition during an
+  // ordinary RUNNING interval remains an ERROR for both detector systems.
+  RawStatus raw = normal_raw();
+  raw.vme.acquisition_running = false;
+  raw.easiroc.acquisition_running = false;
+  auto evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kError);
+  EXPECT(evaluated.vme.reason == "VME acquisition not running");
+  EXPECT(evaluated.easiroc.severity == Severity::kError);
+  EXPECT(evaluated.easiroc.reason ==
+         "EASIROC acquisition not running");
+
+  // EOR is allowed to turn acquisition off while Runinfo still says RUNNING.
+  raw.stop_transition_in_progress = true;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kOk);
+  EXPECT(evaluated.easiroc.severity == Severity::kOk);
+  EXPECT(evaluated.global_severity == Severity::kOk);
+
+  // The STOP exception is deliberately narrow: disconnect, hardware fault,
+  // and data-integrity failures are still visible.
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kError);
+  EXPECT(evaluated.vme.reason == "VME disconnected while running");
+  raw = normal_raw();
+  raw.stop_transition_in_progress = true;
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.easiroc.severity == Severity::kError);
+  EXPECT(evaluated.easiroc.reason ==
+         "EASIROC disconnected while running");
+
+  raw = normal_raw();
+  raw.stop_transition_in_progress = true;
+  raw.vme.acquisition_running = false;
+  raw.vme.event_slip_count = 1;
+  raw.easiroc.acquisition_running = false;
+  raw.easiroc.acquisition_fault = true;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kError);
+  EXPECT(evaluated.vme.reason == "VME event slip detected");
+  EXPECT(evaluated.easiroc.severity == Severity::kError);
+  EXPECT(evaluated.easiroc.reason == "EASIROC acquisition fault");
+
+  // Once STOPPED, the normal STOPPED connectivity/acquisition policy applies.
+  raw = normal_raw(RunState::kStopped);
+  raw.stop_transition_in_progress = false;
+  raw.vme.acquisition_running = false;
+  raw.easiroc.acquisition_running = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kOk);
+  EXPECT(evaluated.easiroc.severity == Severity::kOk);
+  raw.vme.connected = false;
+  raw.easiroc.connected = false;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.vme.severity == Severity::kWarning);
+  EXPECT(evaluated.easiroc.severity == Severity::kWarning);
+}
+
 void test_can_start() {
   using daq_monitor::evaluate_can_start;
   RawStatus raw = normal_raw(RunState::kStopped);
   EXPECT(evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason.empty());
 
+  // A single connected, fresh frontend is a valid DAQ configuration.
   raw.vme.connected = false;
-  EXPECT(!evaluate_can_start(raw).allowed);
-  EXPECT(evaluate_can_start(raw).reason == "VME frontend disconnected");
+  raw.vme.status_fresh = false;
+  EXPECT(evaluate_can_start(raw).allowed);
   raw = normal_raw(RunState::kStopped);
   raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  EXPECT(evaluate_can_start(raw).allowed);
+
+  raw = normal_raw(RunState::kStopped);
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
   EXPECT(!evaluate_can_start(raw).allowed);
-  EXPECT(evaluate_can_start(raw).reason ==
-         "EASIROC frontend disconnected");
+  EXPECT(evaluate_can_start(raw).reason == "No DAQ frontend running");
 
   raw = normal_raw(RunState::kStopped);
   raw.disk_free_gb = 10.0;
@@ -205,6 +279,9 @@ void test_can_start() {
   raw.disk_free_gb = 9.9;
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason == "Disk free below 10 GB");
+  raw.disk_free_gb = -1.0;
+  EXPECT(!evaluate_can_start(raw).allowed);
+  EXPECT(evaluate_can_start(raw).reason == "Disk free unavailable");
 
   raw = normal_raw(RunState::kStopped);
   raw.logger_connected = false;
@@ -222,104 +299,109 @@ void test_can_start() {
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason == "Monitor status stale");
   raw = normal_raw(RunState::kStopped);
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
   raw.vme.status_fresh = false;
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason == "VME frontend status stale");
   raw = normal_raw(RunState::kStopped);
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
   raw.easiroc.status_fresh = false;
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason ==
          "EASIROC frontend status stale");
 
-  // Configuration is established inside BOR, so an unconfirmed previous
-  // configuration must not make the pre-start gate reject every new run.
+  // Stale or failed configuration metadata is diagnostic only. Each connected
+  // frontend establishes the current run's configuration in its own BOR.
+  raw = normal_raw(RunState::kStopped);
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  raw.vme_configuration = {true, 41, 999};
+  raw.easiroc_configuration = {false, 41, 999};
+  EXPECT(evaluate_can_start(raw).allowed);
+
   raw = normal_raw(RunState::kStopped);
   raw.vme_configuration = {};
   raw.easiroc_configuration = {};
   EXPECT(evaluate_can_start(raw).allowed);
 }
 
-void test_bor_configuration() {
-  using daq_monitor::evaluate_bor_configuration;
-  ConfigurationRawStatus vme{true, 43, 1001};
-  ConfigurationRawStatus easiroc{true, 43, 1002};
-  EXPECT(evaluate_bor_configuration(43, vme, easiroc).ready);
+void test_run_participation() {
+  using daq_monitor::evaluate_status;
+  using daq_monitor::resolve_run_participation;
 
-  vme.ok = false;
-  EXPECT(!evaluate_bor_configuration(43, vme, easiroc).ready);
-  EXPECT(evaluate_bor_configuration(43, vme, easiroc).reason ==
-         "VME configuration not valid for run 43");
-  vme = {true, 42, 1001};
-  EXPECT(!evaluate_bor_configuration(43, vme, easiroc).ready);
-  vme = {true, 43, 0};
-  easiroc.ok = false;
-  EXPECT(!evaluate_bor_configuration(43, vme, easiroc).ready);
-  EXPECT(evaluate_bor_configuration(43, vme, easiroc).reason ==
-         "EASIROC configuration not valid for run 43");
-  easiroc = {true, 42, 1002};
-  EXPECT(!evaluate_bor_configuration(43, vme, easiroc).ready);
+  // VME-only: stale state and old errors from the non-participant are ignored.
+  RawStatus raw = normal_raw();
+  raw.easiroc.participating = false;
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  raw.easiroc.acquisition_running = false;
+  raw.easiroc.acquisition_fault = true;
+  raw.easiroc.decode_error_count = 3;
+  EXPECT(evaluate_status(raw).vme.severity == Severity::kOk);
+  EXPECT(evaluate_status(raw).easiroc.severity == Severity::kOk);
+  EXPECT(evaluate_status(raw).easiroc.reason ==
+         "EASIROC not participating in current run");
+  EXPECT(evaluate_status(raw).global_severity == Severity::kOk);
 
-  // CheckedUnix is diagnostic metadata. The run-number match prevents a
-  // previous run's successful configuration from passing this gate.
-  easiroc = {true, 43, 0};
-  EXPECT(evaluate_bor_configuration(43, vme, easiroc).ready);
+  // EASIROC-only: stale VME counters from a previous run are ignored.
+  raw = normal_raw();
+  raw.vme.participating = false;
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  raw.vme.event_slip_count = 4;
+  raw.vme.timeout_count = 2;
+  EXPECT(evaluate_status(raw).vme.severity == Severity::kOk);
+  EXPECT(evaluate_status(raw).vme.reason ==
+         "VME not participating in current run");
+  EXPECT(evaluate_status(raw).easiroc.severity == Severity::kOk);
+  EXPECT(evaluate_status(raw).global_severity == Severity::kOk);
+
+  // A participant remains monitored after disconnecting.
+  raw = normal_raw();
+  raw.vme.connected = false;
+  raw.vme.status_fresh = false;
+  EXPECT(evaluate_status(raw).vme.severity == Severity::kError);
+  EXPECT(evaluate_status(raw).vme.reason ==
+         "VME disconnected while running");
+  EXPECT(evaluate_status(raw).global_severity == Severity::kError);
+
+  raw = normal_raw();
+  raw.easiroc.connected = false;
+  raw.easiroc.status_fresh = false;
+  EXPECT(evaluate_status(raw).easiroc.severity == Severity::kError);
+  EXPECT(evaluate_status(raw).easiroc.reason ==
+         "EASIROC disconnected while running");
+  EXPECT(evaluate_status(raw).global_severity == Severity::kError);
+
+  // Exact run-number matching is mandatory. A previous run's participant
+  // record cannot suppress monitoring in the current run.
+  RunParticipation recorded{true, 52, true, false};
+  auto active = resolve_run_participation(RunState::kRunning, 52, recorded);
+  EXPECT(active.known);
+  EXPECT(active.vme);
+  EXPECT(!active.easiroc);
+
+  active = resolve_run_participation(RunState::kRunning, 53, recorded);
+  EXPECT(!active.known);
+  EXPECT(active.vme);
+  EXPECT(active.easiroc);
+
+  recorded.valid = false;
+  active = resolve_run_participation(RunState::kRunning, 52, recorded);
+  EXPECT(!active.known);
+  EXPECT(active.vme);
+  EXPECT(active.easiroc);
+
+  active = resolve_run_participation(RunState::kStopped, 52, recorded);
+  EXPECT(active.known);
+  EXPECT(!active.vme);
+  EXPECT(!active.easiroc);
 }
 
-void test_start_evaluation() {
-  using daq_monitor::evaluate_can_start;
-  using daq_monitor::evaluate_start;
-
-  RawStatus raw = normal_raw(RunState::kStopped);
-  const ConfigurationRawStatus valid{true, 42, 1000};
-  StartEvaluation result =
-      evaluate_start(42, evaluate_can_start(raw), valid, valid);
-  EXPECT(result.allowed);
-  EXPECT(result.reason.empty());
-
-  raw.monitor_status_fresh = false;
-  result = evaluate_start(
-      42, evaluate_can_start(raw),
-      ConfigurationRawStatus{false, 41, 0},
-      ConfigurationRawStatus{false, 41, 0});
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "Monitor status stale");
-
-  raw = normal_raw(RunState::kStopped);
-  result = evaluate_start(42, evaluate_can_start(raw),
-                          ConfigurationRawStatus{false, 42, 1000}, valid);
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "VME configuration not valid for run 42");
-  result = evaluate_start(42, evaluate_can_start(raw), valid,
-                          ConfigurationRawStatus{false, 42, 1000});
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "EASIROC configuration not valid for run 42");
-  result = evaluate_start(42, evaluate_can_start(raw),
-                          ConfigurationRawStatus{true, 41, 1000}, valid);
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "VME configuration not valid for run 42");
-  result = evaluate_start(42, evaluate_can_start(raw), valid,
-                          ConfigurationRawStatus{true, 41, 1000});
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "EASIROC configuration not valid for run 42");
-
-  result = evaluate_start(
-      42, evaluate_can_start(raw),
-      ConfigurationRawStatus{false, 42, 1000},
-      ConfigurationRawStatus{false, 42, 1000});
-  EXPECT(result.reason == "VME configuration not valid for run 42");
-
-  raw.logger_connected = false;
-  raw.vme.event_slip_count = 1;
-  raw.easiroc.decode_error_count = 1;
-  result = evaluate_start(42, evaluate_can_start(raw), valid, valid);
-  EXPECT(result.allowed);
-
-  raw.disk_free_gb = 10.0;
-  EXPECT(evaluate_start(42, evaluate_can_start(raw), valid, valid).allowed);
-  raw.disk_free_gb = 9.9;
-  result = evaluate_start(42, evaluate_can_start(raw), valid, valid);
-  EXPECT(!result.allowed);
-  EXPECT(result.reason == "Disk free below 10 GB");
+void test_transition_sequence() {
+  EXPECT(daq_monitor::kStartTransitionSequence == 400);
 }
 
 void test_global() {
@@ -349,10 +431,11 @@ int main() {
   test_frontend_connectivity();
   test_vme_integrity();
   test_easiroc_integrity();
+  test_stop_transition_acquisition_policy();
   test_global();
+  test_run_participation();
   test_can_start();
-  test_bor_configuration();
-  test_start_evaluation();
+  test_transition_sequence();
 
   if (gFailures != 0) {
     std::fprintf(stderr, "status_policy_test: %d of %d checks failed\n",

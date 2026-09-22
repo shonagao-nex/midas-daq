@@ -25,8 +25,14 @@ std::string readFile(const char* path) {
 int main() {
   const std::string javascript = readFile("../daq_monitor/web/easiroc.js");
   const std::string html = readFile("../daq_monitor/web/easiroc.html");
+  const std::string clear_js =
+      readFile("../daq_monitor/web/buffer-clear.js");
+  const std::string clear_html =
+      readFile("../daq_monitor/web/buffer-clear.html");
   expect(!javascript.empty(), "cannot read EASIROC WebGUI JavaScript");
   expect(!html.empty(), "cannot read EASIROC WebGUI HTML");
+  expect(!clear_js.empty() && !clear_html.empty(),
+         "cannot read buffer-clear WebGUI");
   for (const char* field : {"HGShapingTime", "LGShapingTime",
                             "ChannelEnabled"}) {
     expect(javascript.find(field) != std::string::npos,
@@ -74,6 +80,19 @@ int main() {
                  std::string::npos &&
              javascript.find("saved valid Settings") != std::string::npos,
          "WebGUI still suppresses Apply for a valid non-default channel mask");
+  expect(clear_js.find("mjsonrpc_cm_exist(\"fevme\",true)") !=
+                 std::string::npos &&
+             clear_js.find("mjsonrpc_cm_exist(\"feeasiroc\",true)") !=
+                 std::string::npos,
+         "buffer-clear WebGUI does not check exact frontend clients");
+  expect(clear_js.find("Number(state.values[PATHS.run])!==STOPPED") !=
+                 std::string::npos &&
+             clear_js.find("BufferClearRequestId") != std::string::npos,
+         "buffer-clear WebGUI lacks STOPPED check or request mailbox");
+  expect(clear_html.find("Clear VME event buffers") != std::string::npos &&
+             clear_html.find("Clear EASIROC receive/event buffer") !=
+                 std::string::npos,
+         "buffer-clear controls are missing");
   std::cout << "easiroc_web_gui_contract_test: " << checks
             << " checks passed\n";
 }

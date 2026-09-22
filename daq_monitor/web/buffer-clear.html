@@ -1,0 +1,38 @@
+<!doctype html>
+<html class="mcss" lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Manual Event Buffer Clear</title>
+  <link rel="stylesheet" href="midas.css">
+  <link rel="stylesheet" href="buffer-clear.css">
+  <script src="midas.js"></script>
+  <script src="mhttpd.js"></script>
+  <script src="buffer-clear-mock-data.js"></script>
+  <script src="buffer-clear.js" defer></script>
+</head>
+<body class="mcss" onload="initializeBufferClearPage()">
+  <div id="mheader"></div><div id="msidenav"></div>
+  <main id="mmain" class="clear-main">
+    <header><div><h1>Manual Event Buffer Clear</h1><p>Available only while MIDAS is STOPPED. This discards buffered event data; it does not reset module configuration.</p></div><div class="run-state"><span>Run state</span><strong id="run-state">—</strong></div></header>
+    <div id="message" class="message" role="alert" hidden></div>
+    <section id="mock-panel" class="mock-panel" hidden><strong>MOCK PREVIEW</strong><span>No MIDAS or hardware access is performed.</span></section>
+    <section class="warning"><strong>Before clearing:</strong> stop external triggers when practical. Cleared event data cannot be recovered.</section>
+    <div class="cards">
+      <section class="card">
+        <h2>VME event buffers</h2>
+        <p>V792 Data Clear, V1190 Software Clear, V775 Data Clear, and V1720E Software Clear. Disabled modules are skipped. RPV130 is never modified.</p>
+        <dl><div><dt>Frontend</dt><dd id="vme-frontend">—</dd></div><div><dt>State</dt><dd id="vme-state">—</dd></div><div><dt>Last request</dt><dd id="vme-request">—</dd></div><div><dt>Time</dt><dd id="vme-time">—</dd></div><div><dt>V792</dt><dd id="vme-v792">—</dd></div><div><dt>V1190</dt><dd id="vme-v1190">—</dd></div><div><dt>V775</dt><dd id="vme-v775">—</dd></div><div><dt>V1720E</dt><dd id="vme-v1720e">—</dd></div><div class="wide"><dt>Error</dt><dd id="vme-error">—</dd></div></dl>
+        <button id="clear-vme" type="button" disabled>Clear VME event buffers</button>
+      </section>
+      <section class="card">
+        <h2>NIM-EASIROC receive/event buffer</h2>
+        <p>Connects to TCP port 24 and performs a bounded receive drain. No device FIFO-clear command is issued because none is confirmed by the authoritative controller.</p>
+        <dl><div><dt>Frontend</dt><dd id="eas-frontend">—</dd></div><div><dt>State</dt><dd id="eas-state">—</dd></div><div><dt>Last request</dt><dd id="eas-request">—</dd></div><div><dt>Time</dt><dd id="eas-time">—</dd></div><div><dt>Drained bytes</dt><dd id="eas-bytes">—</dd></div><div class="wide"><dt>NIM-EASIROC</dt><dd id="eas-result">—</dd></div><div class="wide"><dt>Error</dt><dd id="eas-error">—</dd></div></dl>
+        <button id="clear-eas" type="button" disabled>Clear EASIROC receive/event buffer</button>
+      </section>
+    </div>
+    <footer><span id="availability">Loading status…</span><nav><a href="daq.html">DAQ dashboard</a><a href="/?cmd=Programs">Programs</a><a href="/?cmd=Messages">MIDAS Messages</a></nav></footer>
+  </main>
+</body>
+</html>

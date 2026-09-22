@@ -21,10 +21,9 @@ constexpr DWORD kUpdatePeriodMs = 1000;
 constexpr DWORD kDiskUpdatePeriodMs = 10000;
 constexpr std::size_t kStringCapacity = 512;
 constexpr double kBytesPerGB = 1000.0 * 1000.0 * 1000.0;
-constexpr INT kStartTransitionSequence = 600;
 constexpr std::size_t kTransitionErrorCapacity = 256;
 
-constexpr char kVmeClientName[] = "fe_vme_test";
+constexpr char kVmeClientName[] = "fevme";
 constexpr char kEasirocClientName[] = "feeasiroc";
 constexpr char kLoggerClientName[] = "Logger";
 
@@ -182,6 +181,44 @@ bool read_string(const std::string& path, std::string* value) {
   buffer[sizeof(buffer) - 1] = '\0';
   *value = buffer;
   return true;
+}
+
+daq_monitor::RunParticipation read_run_participation() {
+  BOOL valid = FALSE;
+  INT run_number = 0;
+  BOOL vme = FALSE;
+  BOOL easiroc = FALSE;
+  if (!read_value("/DAQ/Status/Run/ParticipationValid", TID_BOOL, &valid) ||
+      !read_value("/DAQ/Status/Run/ParticipationRunNumber", TID_INT32,
+                  &run_number) ||
+      !read_value("/DAQ/Status/Run/VMEParticipating", TID_BOOL, &vme) ||
+      !read_value("/DAQ/Status/Run/EASIROCParticipating", TID_BOOL,
+                  &easiroc))
+    return {};
+  return {valid != FALSE, run_number, vme != FALSE, easiroc != FALSE};
+}
+
+bool record_run_participation(INT run_number, bool vme, bool easiroc) {
+  const BOOL invalid = FALSE;
+  const BOOL valid = TRUE;
+  const BOOL vme_participating = vme ? TRUE : FALSE;
+  const BOOL easiroc_participating = easiroc ? TRUE : FALSE;
+
+  // Invalidate first and publish Valid last so a partial write can never be
+  // mistaken for the authoritative participant set of this run.
+  bool ok = write_value("/DAQ/Status/Run/ParticipationValid", &invalid,
+                        sizeof(invalid), TID_BOOL);
+  ok = write_value("/DAQ/Status/Run/ParticipationRunNumber", &run_number,
+                   sizeof(run_number), TID_INT32) && ok;
+  ok = write_value("/DAQ/Status/Run/VMEParticipating", &vme_participating,
+                   sizeof(vme_participating), TID_BOOL) && ok;
+  ok = write_value("/DAQ/Status/Run/EASIROCParticipating",
+                   &easiroc_participating,
+                   sizeof(easiroc_participating), TID_BOOL) && ok;
+  if (!ok)
+    return false;
+  return write_value("/DAQ/Status/Run/ParticipationValid", &valid,
+                     sizeof(valid), TID_BOOL);
 }
 
 bool validate_global_alarm_class() {
@@ -544,6 +581,7 @@ void update_disk_cache(const LoggerSource& source, DWORD now_ms) {
 bool publish_status(bool synchronous_start_check = false) {
   INT run_number = 0;
   INT run_state = 0;
+  INT transition_in_progress = 0;
   DWORD start_time = 0;
   std::uint64_t previous_update_unix = 0;
   bool collection_ok = true;
@@ -552,6 +590,11 @@ bool publish_status(bool synchronous_start_check = false) {
       collection_ok;
   collection_ok = read_value("/Runinfo/State", TID_INT32, &run_state) &&
                   collection_ok;
+  // MIDAS writes the transition number before invoking callbacks and clears
+  // it only after updating Runinfo/State. If this read fails, remain fail-safe
+  // and do not suppress any acquisition-state error.
+  read_value("/Runinfo/Transition in progress", TID_INT32,
+             &transition_in_progress);
   collection_ok = read_value("/Runinfo/Start time binary", TID_DWORD,
                              &start_time) && collection_ok;
   read_value("/DAQ/Status/Global/LastUpdateUnix", TID_QWORD,
@@ -581,9 +624,10 @@ bool publish_status(bool synchronous_start_check = false) {
   BOOL easiroc_configuration_ok = FALSE;
   INT easiroc_configuration_run_number = 0;
   std::uint64_t easiroc_configuration_checked_unix = 0;
-  // Configuration is a BOR result, not an input to the pre-start policy.
-  // Missing values remain false/zero for status display and are handled by
-  // the final transition validation independently of CanStart.
+  // Configuration is a BOR result, not an input to the sequence-400
+  // pre-start policy. Missing or old values remain false/zero for monitoring;
+  // each participating frontend reports BOR failure through its own
+  // sequence-500 transition callback.
   read_value("/Equipment/VME/Variables/Frontend/ConfigurationOK", TID_BOOL,
              &vme_configuration_ok);
   read_value("/Equipment/VME/Variables/Frontend/ConfigurationRunNumber",
@@ -605,6 +649,12 @@ bool publish_status(bool synchronous_start_check = false) {
   std::uint64_t counter_discontinuity_count = 0;
   std::uint64_t size_error_count = 0;
   std::uint64_t channel_mask_error_count = 0;
+  BOOL v1720_enabled = TRUE;
+  BOOL v1720_running = FALSE;
+  read_value("/Equipment/VME/Variables/V1720E/EnabledForRun", TID_BOOL,
+             &v1720_enabled);
+  read_value("/Equipment/VME/Variables/V1720E/Running", TID_BOOL,
+             &v1720_running);
   read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
              TID_QWORD, &event_slip_count);
   read_value(
@@ -624,12 +674,15 @@ bool publish_status(bool synchronous_start_check = false) {
       add_saturating(size_error_count, channel_mask_error_count);
 
   BOOL easiroc_running = FALSE;
+  BOOL easiroc_enabled = TRUE;
   BOOL easiroc_fault = FALSE;
   std::uint64_t easiroc_event_counter = 0;
   std::uint64_t decode_error_count = 0;
   std::uint64_t easiroc_timeout_count = 0;
   std::uint64_t overflow_count = 0;
   std::uint64_t easiroc_event_content_error_count = 0;
+  read_value("/Equipment/EASIROC/Variables/EnabledForRun", TID_BOOL,
+             &easiroc_enabled);
   read_value("/Equipment/EASIROC/Variables/AcquisitionRunning", TID_BOOL,
              &easiroc_running);
   read_value("/Equipment/EASIROC/Variables/AcquisitionFault", TID_BOOL,
@@ -651,14 +704,22 @@ bool publish_status(bool synchronous_start_check = false) {
 
   daq_monitor::RawStatus raw_status;
   raw_status.run_state = policy_run_state(run_state);
+  raw_status.stop_transition_in_progress =
+      transition_in_progress == TR_STOP;
   raw_status.monitor_status_fresh =
       collection_ok &&
       (synchronous_start_check ||
        timestamp_is_fresh(now_unix, previous_update_unix));
   raw_status.disk_free_gb = gDiskCache.free_gb;
   raw_status.logger_connected = logger_connected != FALSE;
+  const daq_monitor::ActiveParticipation participation =
+      daq_monitor::resolve_run_participation(
+          raw_status.run_state, run_number, read_run_participation());
+  raw_status.vme.participating = participation.vme;
   raw_status.vme.connected = vme_connected != FALSE;
   raw_status.vme.status_fresh = vme_status_fresh != FALSE;
+  raw_status.vme.acquisition_expected = v1720_enabled != FALSE;
+  raw_status.vme.acquisition_running = v1720_running != FALSE;
   raw_status.vme.event_slip_count = event_slip_count;
   raw_status.vme.malformed_event_count = malformed_event_count;
   raw_status.vme.timeout_count = vme_timeout_count;
@@ -666,8 +727,10 @@ bool publish_status(bool synchronous_start_check = false) {
   raw_status.vme.size_error_count = size_error_count;
   raw_status.vme.channel_mask_error_count = channel_mask_error_count;
   raw_status.vme.counter_discontinuity_count = counter_discontinuity_count;
+  raw_status.easiroc.participating = participation.easiroc;
   raw_status.easiroc.connected = easiroc_connected != FALSE;
   raw_status.easiroc.status_fresh = easiroc_status_fresh != FALSE;
+  raw_status.easiroc.acquisition_expected = easiroc_enabled != FALSE;
   raw_status.easiroc.acquisition_running = easiroc_running != FALSE;
   raw_status.easiroc.acquisition_fault = easiroc_fault != FALSE;
   raw_status.easiroc.decode_error_count = decode_error_count;
@@ -709,6 +772,9 @@ bool publish_status(bool synchronous_start_check = false) {
        ok;
 
   PUBLISH("/DAQ/Status/Frontends/VME/Connected", vme_connected, TID_BOOL);
+  const BOOL vme_participating = participation.vme ? TRUE : FALSE;
+  PUBLISH("/DAQ/Status/Frontends/VME/Participating", vme_participating,
+          TID_BOOL);
   PUBLISH("/DAQ/Status/Frontends/VME/StatusFresh", vme_status_fresh,
           TID_BOOL);
   PUBLISH("/DAQ/Status/Frontends/VME/ConfigurationOK",
@@ -739,6 +805,10 @@ bool publish_status(bool synchronous_start_check = false) {
 
   PUBLISH("/DAQ/Status/Frontends/EASIROC/Connected", easiroc_connected,
           TID_BOOL);
+  const BOOL easiroc_participating =
+      participation.easiroc ? TRUE : FALSE;
+  PUBLISH("/DAQ/Status/Frontends/EASIROC/Participating",
+          easiroc_participating, TID_BOOL);
   PUBLISH("/DAQ/Status/Frontends/EASIROC/StatusFresh",
           easiroc_status_fresh, TID_BOOL);
   PUBLISH("/DAQ/Status/Frontends/EASIROC/ConfigurationOK",
@@ -776,56 +846,37 @@ bool publish_status(bool synchronous_start_check = false) {
   return publish_can_start(can_start) && ok;
 }
 
-bool read_configuration_status(
-    const char* root, daq_monitor::ConfigurationRawStatus* configuration) {
-  BOOL ok = FALSE;
-  INT run_number = 0;
-  std::uint64_t checked_unix = 0;
-  const std::string base = std::string(root) + "/Variables/Frontend/";
-  const bool read_ok =
-      read_value((base + "ConfigurationOK").c_str(), TID_BOOL, &ok) &&
-      read_value((base + "ConfigurationRunNumber").c_str(), TID_INT,
-                 &run_number) &&
-      read_value((base + "ConfigurationCheckedUnix").c_str(), TID_QWORD,
-                 &checked_unix);
-  *configuration = {ok != FALSE, run_number, checked_unix};
-  return read_ok;
-}
-
 INT validate_start_transition(INT run_number, char* error) {
-  daq_monitor::CanStartEvaluation pre_start;
+  daq_monitor::CanStartEvaluation evaluation;
   BOOL can_start = FALSE;
+  BOOL vme_connected = FALSE;
+  BOOL easiroc_connected = FALSE;
 
   // A successful synchronous collection makes freshness explicit without
   // sleeping or polling while this transition callback is running.
   if (!publish_status(true) ||
       !read_value("/DAQ/Status/Global/CanStart", TID_BOOL, &can_start) ||
-      !read_string("/DAQ/Status/Global/CanStartReason", &pre_start.reason)) {
-    pre_start = {false, "Monitor status unavailable"};
+      !read_string("/DAQ/Status/Global/CanStartReason", &evaluation.reason) ||
+      !read_value("/DAQ/Status/Frontends/VME/Connected", TID_BOOL,
+                  &vme_connected) ||
+      !read_value("/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
+                  &easiroc_connected)) {
+    evaluation = {false, "Monitor status unavailable"};
   } else {
-    pre_start.allowed = can_start != FALSE;
+    evaluation.allowed = can_start != FALSE;
   }
 
-  daq_monitor::ConfigurationRawStatus vme;
-  daq_monitor::ConfigurationRawStatus easiroc;
-  const bool vme_configuration_read_ok =
-      read_configuration_status("/Equipment/VME", &vme);
-  const bool easiroc_configuration_read_ok =
-      read_configuration_status("/Equipment/EASIROC", &easiroc);
-
-  daq_monitor::StartEvaluation evaluation;
-  if (!pre_start.allowed) {
-    evaluation = {false, pre_start.reason};
-  } else if (!vme_configuration_read_ok) {
-    evaluation = {false, "VME configuration status unavailable"};
-  } else if (!easiroc_configuration_read_ok) {
-    evaluation = {false, "EASIROC configuration status unavailable"};
-  } else {
-    evaluation = daq_monitor::evaluate_start(run_number, pre_start, vme,
-                                             easiroc);
+  if (evaluation.allowed &&
+      !record_run_participation(run_number, vme_connected != FALSE,
+                                easiroc_connected != FALSE)) {
+    evaluation = {false, "Cannot record frontend participation"};
   }
 
   if (evaluation.allowed) {
+    cm_msg(MINFO, kClientName,
+           "Run %d participants: VME=%s EASIROC=%s", run_number,
+           vme_connected != FALSE ? "yes" : "no",
+           easiroc_connected != FALSE ? "yes" : "no");
     if (error != nullptr)
       error[0] = '\0';
     return CM_SUCCESS;
@@ -894,12 +945,13 @@ int main(int argc, char** argv) {
     return 1;
   }
   const INT transition_status = cm_register_transition(
-      TR_START, validate_start_transition, kStartTransitionSequence);
+      TR_START, validate_start_transition,
+      daq_monitor::kStartTransitionSequence);
   if (transition_status != CM_SUCCESS) {
     std::fprintf(stderr,
                  "Cannot register START validation at sequence %d: status "
                  "%d\n",
-                 kStartTransitionSequence, transition_status);
+                 daq_monitor::kStartTransitionSequence, transition_status);
     cm_disconnect_experiment();
     return 1;
   }

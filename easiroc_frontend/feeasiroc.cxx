@@ -10,6 +10,7 @@
 #include "easiroc_stream.h"
 #include "rbcp.h"
 #include "tcp_probe.h"
+#include "../common/manual_buffer_clear.h"
 
 #include <algorithm>
 #include <array>
@@ -125,6 +126,9 @@ struct FrontendState {
   bool daq_start_attempted = false;
   RuntimeState runtime;
   easiroc::ManualApplyStatus asic_apply;
+  daq::BufferClearStatus buffer_clear;
+  std::string buffer_clear_result = "Not requested";
+  std::uint64_t buffer_clear_drained_bytes = 0;
   easiroc::AppliedAsicSlowControlSettings last_applied;
   bool hardware_state_indeterminate = false;
   FirmwareObservation firmware_observation;
@@ -608,6 +612,43 @@ bool publish_runtime_variables() {
            &hardware_state_indeterminate,
            sizeof(hardware_state_indeterminate), 1, TID_BOOL) &&
        ok;
+  const std::string buffer_clear = odb_path(kVariablesPath, "BufferClear");
+  const DWORD clear_active = g_state.buffer_clear.active_request_id;
+  const DWORD clear_handled = g_state.buffer_clear.last_handled_request_id;
+  const DWORD clear_successful =
+      g_state.buffer_clear.last_successful_request_id;
+  const BOOL clear_in_progress =
+      g_state.buffer_clear.in_progress ? TRUE : FALSE;
+  const BOOL clear_succeeded =
+      g_state.buffer_clear.last_attempt_succeeded ? TRUE : FALSE;
+  ok = set_odb_value(odb_path(buffer_clear.c_str(), "ActiveRequestId"),
+                     &clear_active, sizeof(clear_active), 1, TID_DWORD) && ok;
+  ok = set_odb_value(odb_path(buffer_clear.c_str(), "LastHandledRequestId"),
+                     &clear_handled, sizeof(clear_handled), 1, TID_DWORD) && ok;
+  ok = set_odb_value(
+           odb_path(buffer_clear.c_str(), "LastSuccessfulRequestId"),
+           &clear_successful, sizeof(clear_successful), 1, TID_DWORD) && ok;
+  ok = set_odb_string(odb_path(buffer_clear.c_str(), "State"),
+                      daq::bufferClearStateName(g_state.buffer_clear.state),
+                      32) && ok;
+  ok = set_odb_value(odb_path(buffer_clear.c_str(), "InProgress"),
+                     &clear_in_progress, sizeof(clear_in_progress), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_value(
+           odb_path(buffer_clear.c_str(), "LastAttemptSucceeded"),
+           &clear_succeeded, sizeof(clear_succeeded), 1, TID_BOOL) && ok;
+  ok = set_odb_string(odb_path(buffer_clear.c_str(), "LastError"),
+                      g_state.buffer_clear.last_error, 256) && ok;
+  ok = set_odb_value(odb_path(buffer_clear.c_str(), "LastClearUnixTime"),
+                     &g_state.buffer_clear.last_clear_unix_time,
+                     sizeof(g_state.buffer_clear.last_clear_unix_time), 1,
+                     TID_QWORD) && ok;
+  ok = set_odb_string(odb_path(buffer_clear.c_str(), "NIMEASIROCResult"),
+                      g_state.buffer_clear_result, 256) && ok;
+  ok = set_odb_value(odb_path(buffer_clear.c_str(), "DrainedBytes"),
+                     &g_state.buffer_clear_drained_bytes,
+                     sizeof(g_state.buffer_clear_drained_bytes), 1,
+                     TID_QWORD) && ok;
 #undef PUBLISH_QWORD
 #undef PUBLISH_BOOL
   return ok;
@@ -667,6 +708,65 @@ bool initialize_manual_apply_mailbox() {
         g_state.asic_apply, request_id, unix_time);
     cm_msg(MINFO, "frontend_init", "WARNING: %s (request %u)",
            g_state.asic_apply.last_apply_error.c_str(),
+           static_cast<unsigned>(request_id));
+  }
+  return true;
+}
+
+bool initialize_buffer_clear_mailbox() {
+  const DWORD zero = 0;
+  const BOOL no = FALSE;
+  const std::uint64_t zero_time = 0;
+  std::array<char, 32> idle{};
+  std::snprintf(idle.data(), idle.size(), "%s", "Idle");
+  std::array<char, 256> empty{};
+  const std::string command =
+      odb_path(kCommandsPath, "BufferClearRequestId");
+  const std::string status = odb_path(kVariablesPath, "BufferClear");
+  if (!ensure_odb_value(command, &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "ActiveRequestId"), &zero,
+                        sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastHandledRequestId"),
+                        &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastSuccessfulRequestId"),
+                        &zero, sizeof(zero), 1, TID_DWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "State"), idle.data(),
+                        idle.size(), 1, TID_STRING) ||
+      !ensure_odb_value(odb_path(status.c_str(), "InProgress"), &no,
+                        sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastAttemptSucceeded"), &no,
+                        sizeof(no), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastError"), empty.data(),
+                        empty.size(), 1, TID_STRING) ||
+      !ensure_odb_value(odb_path(status.c_str(), "LastClearUnixTime"),
+                        &zero_time, sizeof(zero_time), 1, TID_QWORD) ||
+      !ensure_odb_value(odb_path(status.c_str(), "NIMEASIROCResult"),
+                        empty.data(), empty.size(), 1, TID_STRING) ||
+      !ensure_odb_value(odb_path(status.c_str(), "DrainedBytes"), &zero_time,
+                        sizeof(zero_time), 1, TID_QWORD))
+    return false;
+
+  DWORD request_id = 0;
+  DWORD handled = 0;
+  DWORD successful = 0;
+  if (!read_odb_dword(command, &request_id) ||
+      !read_odb_dword(odb_path(status.c_str(), "LastHandledRequestId"),
+                      &handled) ||
+      !read_odb_dword(odb_path(status.c_str(), "LastSuccessfulRequestId"),
+                      &successful))
+    return false;
+  g_state.buffer_clear = {};
+  g_state.buffer_clear.last_handled_request_id = handled;
+  g_state.buffer_clear.last_successful_request_id = successful;
+  if (request_id > handled) {
+    const std::time_t now = std::time(nullptr);
+    g_state.buffer_clear = daq::acknowledgeStaleBufferClearRequest(
+        g_state.buffer_clear, request_id,
+        now < 0 ? 0 : static_cast<std::uint64_t>(now));
+    g_state.buffer_clear_result =
+        "Not executed: stale startup request";
+    cm_msg(MINFO, "frontend_init", "WARNING: %s (request %u)",
+           g_state.buffer_clear.last_error.c_str(),
            static_cast<unsigned>(request_id));
   }
   return true;
@@ -889,7 +989,8 @@ bool initialize_odb() {
       !set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"), empty_raw.data(),
                      empty_raw.size(), empty_raw.size(), TID_BYTE))
     return false;
-  if (!initialize_manual_apply_mailbox() || !initialize_last_applied_odb())
+  if (!initialize_manual_apply_mailbox() ||
+      !initialize_buffer_clear_mailbox() || !initialize_last_applied_odb())
     return false;
   reset_run_snapshot(0);
   return publish_configuration_status(false, 0) &&
@@ -1315,6 +1416,105 @@ void process_manual_apply_request() {
   }
 }
 
+void process_manual_buffer_clear_request() {
+  const std::string request_path =
+      odb_path(kCommandsPath, "BufferClearRequestId");
+  DWORD request_id = 0;
+  if (!read_odb_dword(request_path, &request_id) ||
+      request_id <= g_state.buffer_clear.last_handled_request_id)
+    return;
+
+  const auto transition =
+      daq::beginBufferClearRequest(g_state.buffer_clear, request_id);
+  if (!transition.handled) return;
+  g_state.buffer_clear = transition.pending;
+  g_state.buffer_clear_result = "Not attempted";
+  g_state.buffer_clear_drained_bytes = 0;
+  publish_runtime_variables();
+
+  const std::time_t now = std::time(nullptr);
+  const std::uint64_t unix_time =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  bool run_state_ok = false;
+  const auto run_state = read_manual_apply_run_state(&run_state_ok);
+  if (!run_state_ok || run_state != easiroc::ManualApplyRunState::kStopped) {
+    const daq::BufferClearRunState clear_run_state =
+        !run_state_ok
+            ? daq::BufferClearRunState::kUnknown
+            : (run_state == easiroc::ManualApplyRunState::kRunning
+                   ? daq::BufferClearRunState::kRunning
+                   : (run_state == easiroc::ManualApplyRunState::kPaused
+                          ? daq::BufferClearRunState::kPaused
+                          : daq::BufferClearRunState::kUnknown));
+    const std::string error = daq::bufferClearRunStateRejection(
+        clear_run_state, "EASIROC receive");
+    g_state.buffer_clear = daq::rejectBufferClearRequest(
+        g_state.buffer_clear, error, unix_time);
+    g_state.buffer_clear_result = "Not attempted: " + error;
+    publish_runtime_variables();
+    cm_msg(MINFO, "manual_buffer_clear", "Request %u rejected: %s",
+           static_cast<unsigned>(request_id), error.c_str());
+    return;
+  }
+  if (g_state.run_active || g_state.runtime.acquisition_running ||
+      g_state.tcp) {
+    const std::string error =
+        "Frontend acquisition state is active despite MIDAS STOPPED";
+    g_state.buffer_clear = daq::rejectBufferClearRequest(
+        g_state.buffer_clear, error, unix_time);
+    g_state.buffer_clear_result = "Not attempted: " + error;
+    publish_runtime_variables();
+    return;
+  }
+
+  FrontendSettings settings;
+  if (read_settings(&settings) != SUCCESS) {
+    const std::string error =
+        "Cannot snapshot EASIROC network settings";
+    g_state.buffer_clear = daq::rejectBufferClearRequest(
+        g_state.buffer_clear, error, unix_time);
+    g_state.buffer_clear_result = "Not attempted: " + error;
+    publish_runtime_variables();
+    return;
+  }
+  if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
+  publish_completed_diagnostic();
+
+  g_state.buffer_clear =
+      daq::markBufferClearExecuting(g_state.buffer_clear);
+  publish_runtime_variables();
+  try {
+    TcpConnection connection(settings.ip_address, easiroc::kTcpDataPort,
+                             kReceiveTimeoutMs);
+    const std::size_t drained =
+        connection.drain(kDrainQuietMs, kDrainMaximumMs);
+    g_state.pending_events.clear();
+    g_state.parser.reset();
+    g_state.buffer_clear_drained_bytes = drained;
+    g_state.runtime.statistics.last_drain_bytes = drained;
+    g_state.runtime.statistics.total_drain_bytes += drained;
+    g_state.buffer_clear_result =
+        "Succeeded: host TCP receive drain; no device FIFO-clear command "
+        "issued; discarded " +
+        std::to_string(drained) + " byte(s)";
+    g_state.buffer_clear = daq::finishBufferClearRequest(
+        g_state.buffer_clear, true, "", unix_time);
+    cm_msg(MINFO, "manual_buffer_clear",
+           "Request %u EASIROC TCP drain succeeded: discarded %zu byte(s); "
+           "no device FIFO-clear, reset, or configuration command issued",
+           static_cast<unsigned>(request_id), drained);
+  } catch (const std::exception& exception) {
+    const std::string error =
+        std::string("EASIROC TCP receive drain failed: ") + exception.what();
+    g_state.buffer_clear_result = "Failed: " + error;
+    g_state.buffer_clear = daq::finishBufferClearRequest(
+        g_state.buffer_clear, false, error, unix_time);
+    cm_msg(MERROR, "manual_buffer_clear", "Request %u failed: %s",
+           static_cast<unsigned>(request_id), error.c_str());
+  }
+  publish_runtime_variables();
+}
+
 void set_firmware_readback_valid(bool valid) {
   const BOOL value = valid ? TRUE : FALSE;
   set_odb_value(odb_path(kReadbackPath, "Firmware/Valid"), &value,
@@ -1578,6 +1778,7 @@ INT read_physics_event(char*, INT);
 INT read_status_event(char*, INT);
 INT read_configuration_event(char*, INT);
 INT poll_event(INT source, INT count, BOOL test);
+static INT start_abort(INT run_number, char* error);
 
 BOOL equipment_common_overwrite = TRUE;
 
@@ -1606,6 +1807,15 @@ EQUIPMENT equipment[] = {
 
 INT frontend_init() {
   if (!initialize_odb()) return FE_ERR_ODB;
+
+  const INT transition_status =
+      cm_register_transition(TR_STARTABORT, start_abort, 500);
+  if (transition_status != CM_SUCCESS) {
+    cm_msg(MERROR, "frontend_init",
+           "Cannot register TR_STARTABORT callback: status %d",
+           transition_status);
+    return transition_status;
+  }
 
   const INT settings_status = read_settings(&g_state.settings);
   if (settings_status != SUCCESS) return settings_status;
@@ -1904,6 +2114,35 @@ INT end_of_run(INT run_number, char* error) {
   return SUCCESS;
 }
 
+static INT start_abort(INT run_number, char* error) {
+  if (error != nullptr) error[0] = '\0';
+
+  // A successful BOR enables legacy MFE readout before a peer frontend can
+  // fail the common START. Quiesce software readout before sending DAQ OFF.
+  readout_enable(FALSE);
+  const CleanupResult cleanup =
+      stop_acquisition("start_abort", false);
+  g_state.run_active = false;
+  g_state.run_snapshot.frontend_bor_complete = false;
+  publish_run_snapshot();
+  mark_configuration_failed(run_number);
+
+  if (!cleanup.error.empty()) g_state.runtime.last_error = cleanup.error;
+  g_state.runtime.acquisition_fault = !cleanup.daq_off_succeeded;
+  publish_runtime_variables();
+
+  run_state = STATE_STOPPED;
+  cm_set_client_run_state(run_state);
+  if (!cleanup.daq_off_succeeded) {
+    if (error != nullptr)
+      std::snprintf(error, 256, "%s", cleanup.error.c_str());
+    return FE_ERR_HW;
+  }
+  cm_msg(MINFO, "start_abort",
+         "STARTABORT rollback completed for run %d", run_number);
+  return SUCCESS;
+}
+
 INT pause_run(INT, char* error) {
   if (error != nullptr) error[0] = '\0';
   return SUCCESS;
@@ -2013,6 +2252,7 @@ INT read_physics_event(char* pevent, INT) {
 
 INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
+  process_manual_buffer_clear_request();
   process_manual_apply_request();
   publish_runtime_variables();
 

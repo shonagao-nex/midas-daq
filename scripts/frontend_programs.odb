@@ -1,0 +1,21 @@
+[/Programs/fevme]
+Required = BOOL : y
+Watchdog timeout = INT32 : 10000
+Check interval = DWORD : 180000
+Start command = STRING : [256] /home/daq/midas/midas/online/scripts/start_fevme.sh
+Auto start = BOOL : n
+Auto stop = BOOL : n
+Auto restart = BOOL : n
+Alarm class = STRING : [32]
+First failed = DWORD : 0
+
+[/Programs/feeasiroc]
+Required = BOOL : y
+Watchdog timeout = INT32 : 10000
+Check interval = DWORD : 180000
+Start command = STRING : [256] /home/daq/midas/midas/online/scripts/start_feeasiroc.sh
+Auto start = BOOL : n
+Auto stop = BOOL : n
+Auto restart = BOOL : n
+Alarm class = STRING : [32]
+First failed = DWORD : 0
