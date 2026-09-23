@@ -2,6 +2,7 @@
 #define ANA_EVENT_INSPECTOR_H
 
 #include "EventBuilder.h"
+#include "RootTreeWriter.h"
 #include "manalyzer.h"
 
 #include <cstddef>
@@ -48,10 +49,10 @@ class EventInspector : public TARunObject {
   std::map<std::uint16_t, std::size_t> event_ids_;
   SourceStatistics vme_;
   SourceStatistics easiroc_;
+  RootTreeWriter tree_writer_;
   EventBuilder builder_;
 };
 
 }  // namespace ana
 
 #endif
-

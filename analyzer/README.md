@@ -5,10 +5,9 @@ the VME and NIM-EASIROC frontends. `EventInspector` classifies physics events
 by bank composition (not event ID), reports the raw MIDAS structure, and feeds
 `EventBuilder`. `EventBuilder` joins equal frontend serial numbers without
 dropping one-sided events. Hardware decoders write only to `DecodedEvent`.
-
-No live ODB access or hardware access is performed when an input file is
-specified. Histogram, TTree, and ODB snapshot writers are intentionally not
-implemented yet.
+`RootTreeWriter` stores each built `DecodedEvent` as one entry in the `Events`
+TTree. No live ODB access or hardware access is performed when an input file is
+specified. Histogram and ODB snapshot writers are not implemented yet.
 
 ## Data flow
 
@@ -18,7 +17,8 @@ TMEvent
   -> EventBuilder (join by frontend serial)
   -> module decoders
   -> DecodedEvent
-  -> future histogram / TTree consumers
+  -> RootTreeWriter
+  -> ROOT file / Events TTree
 ```
 
 VME physics events are recognized by `ADC0`, `TDC0`, `TDC1`, or `FADC`.
@@ -52,20 +52,21 @@ manalyzer:
 ```sh
 source /home/daq/root/current/bin/thisroot.sh
 cd /home/daq/midas/midas/online/analyzer
-./build/midas_analyzer --no-profiler \
+./build/midas_analyzer --no-profiler -O/tmp/run00062.root \
   /home/daq/midas/midas/data/run00062.mid.lz4
 ```
 
-The first few records are printed in detail. The end-of-run summary contains
+Use manalyzer's `-O` option for an explicit ROOT filename or `-D` for its
+standard per-run output directory and filename. The first few records are
+printed in detail. The end-of-run summary contains
 event counts, serial ranges and gaps, per-bank type/length distributions, and
 builder pairing statistics. Missing counterparts produce `WARNING` messages
 and are still delivered as one-sided `DecodedEvent` objects.
 
 ## Extension points
 
-- Attach histogram and TTree writers through `EventBuilder::Consumer`.
+- Attach additional output modules through `EventBuilder::Consumer`.
 - Add a run-level `RunInfo`/ODB snapshot object without changing event data.
 - Keep expression-facing names in `DecodedEvent`: `qdc0`, `tdc0`, `tle0`,
   `ttr0`, `fadc0`, `eadc0`, `etle0`, and `ettr0`.
 - Add new raw-bank interpretation only inside the corresponding decoder.
-

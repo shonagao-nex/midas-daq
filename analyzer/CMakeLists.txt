@@ -13,6 +13,8 @@ endif()
 
 set(ROOTANA_DIR "/home/daq/midas/rootana" CACHE PATH "ROOTANA installation prefix")
 
+find_package(ROOT REQUIRED COMPONENTS Core RIO Tree)
+
 if(NOT EXISTS "${MIDASSYS}/lib/midas-targets.cmake")
   message(FATAL_ERROR "MIDAS CMake targets not found below MIDASSYS=${MIDASSYS}")
 endif()
@@ -32,10 +34,17 @@ set_target_properties(rootana::rootana PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${ROOTANA_DIR}/include"
 )
 
+ROOT_GENERATE_DICTIONARY(G__RootTreeTypes
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/RootTreeTypes.h"
+  LINKDEF "${CMAKE_CURRENT_SOURCE_DIR}/include/RootTreeLinkDef.h"
+)
+
 add_executable(midas_analyzer
   src/analyzer_main.cxx
   src/EventInspector.cxx
   src/EventBuilder.cxx
+  src/RootTreeWriter.cxx
+  "${CMAKE_CURRENT_BINARY_DIR}/G__RootTreeTypes.cxx"
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
   decoder/V1190Decoder.cxx
@@ -58,4 +67,3 @@ target_link_libraries(midas_analyzer PRIVATE
   manalyzer_main
   rootana::rootana
 )
-

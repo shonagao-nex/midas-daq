@@ -9,9 +9,8 @@
 namespace ana {
 
 EventInspector::EventInspector(TARunInfo* runinfo)
-    : TARunObject(runinfo), builder_([](const DecodedEvent&) {
-        // Future histogram and TTree modules attach at this common boundary.
-      }) {
+    : TARunObject(runinfo),
+      builder_([this](const DecodedEvent& event) { tree_writer_.Fill(event); }) {
   fModuleName = "EventInspector";
 }
 
@@ -21,6 +20,7 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
   vme_ = SourceStatistics{};
   easiroc_ = SourceStatistics{};
   builder_.Clear();
+  tree_writer_.BeginRun(runinfo->fRoot ? runinfo->fRoot->fOutputFile : nullptr);
   std::printf("EventInspector: begin run %d, file %s\n", runinfo->fRunNo,
               runinfo->fFileName.c_str());
 }
@@ -171,7 +171,11 @@ void EventInspector::PrintSourceSummary(
 
 void EventInspector::EndRun(TARunInfo* runinfo) {
   builder_.Finish();
+  const auto tree_entries = tree_writer_.Entries();
+  tree_writer_.EndRun();
   std::printf("\nRun %d summary\n", runinfo->fRunNo);
+  std::printf("ROOT Events entries : %lld\n",
+              static_cast<long long>(tree_entries));
   PrintSourceSummary("EASIROC", easiroc_);
   PrintSourceSummary("VME", vme_);
 
