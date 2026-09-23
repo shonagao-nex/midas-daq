@@ -104,6 +104,41 @@ The normal online poll applies a successful change to histogram booking.
 The page does not edit titles, page layouts, or other histogram fields.
 External access also requires the host firewall to permit the selected port.
 
+## systemd operation (online only)
+
+The repository's `../systemd/midas-analyzer.service` follows the existing
+MIDAS services: it runs as `daq` in the foreground, uses the local shared-memory
+experiment, starts after `network-online.target`, and restarts only on failure.
+It has no hard dependency on mhttpd. It runs `build/midas_analyzer
+--no-profiler` with the normal online ROOT Web port 8082; it does not select
+offline input or create an online ROOT file. Build the analyzer before enabling
+the service. From the actual DAQ host shell, install and start it with:
+
+```sh
+sudo install -m 0644 /home/daq/midas/midas/online/systemd/midas-analyzer.service \
+  /etc/systemd/system/midas-analyzer.service
+sudo systemctl daemon-reload
+sudo systemctl enable midas-analyzer.service
+sudo systemctl start midas-analyzer.service
+```
+
+Check and operate the service with:
+
+```sh
+systemctl status midas-analyzer
+journalctl -u midas-analyzer -n 100 --no-pager
+journalctl -u midas-analyzer -f
+ss -ltnp | grep ':8082'
+sudo systemctl restart midas-analyzer
+```
+
+Expect `active (running)` and `0.0.0.0:8082` owned by `midas_analyzer`.
+While Run is STOPPED, the process remains connected and the previous run's
+histograms and Pages remain visible. A new BOR reloads ODB configuration and
+resets/rebooks for the new run. Restarting the service ends the analyzer
+process and discards its in-memory histograms; it does not start or stop a DAQ
+run. Do not start a second manual analyzer on port 8082 alongside this service.
+
 For offline analysis, load ROOT and use:
 
 ```sh

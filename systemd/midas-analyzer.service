@@ -1,0 +1,31 @@
+[Unit]
+Description=MIDAS Online Analyzer for daq
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=simple
+User=daq
+Group=daq
+WorkingDirectory=/home/daq/midas/midas/online
+
+Environment=HOME=/home/daq
+Environment=MIDASSYS=/home/daq/midas/midas_src
+Environment=MIDAS_EXPTAB=/home/daq/midas/midas/exptab
+Environment=MIDAS_EXPT_NAME=daq
+Environment=ROOTSYS=/home/daq/root/current
+Environment=PATH=/home/daq/midas/midas_src/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+UnsetEnvironment=MIDAS_SERVER_HOST MIDAS_SERVER_PORT MIDAS_DIR
+
+ExecStart=/home/daq/midas/midas/online/analyzer/build/midas_analyzer --no-profiler
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
