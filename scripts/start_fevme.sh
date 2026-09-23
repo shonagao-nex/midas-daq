@@ -1,17 +1,20 @@
 #!/bin/sh
 set -eu
 
-export MIDASSYS=/home/daq/midas/midas_src
-export MIDAS_EXPTAB=/home/daq/midas/midas/exptab
-export MIDAS_EXPT_NAME=daq
+MIDAS_BASE=$HOME/midas
+MIDASSYS=$MIDAS_BASE/midas_src
+MIDAS_RUNTIME=$MIDAS_BASE/midas
+MIDAS_EXPTAB=$MIDAS_RUNTIME/exptab
+MIDAS_EXPT_NAME=${MIDAS_EXPT_NAME:-daq}
+export MIDASSYS MIDAS_EXPTAB MIDAS_EXPT_NAME
 unset MIDAS_SERVER_HOST
 unset MIDAS_SERVER_PORT
 unset MIDAS_DIR
 
-frontend=/home/daq/midas/midas/online/vme_frontend/bin/fevme
+frontend=$MIDAS_RUNTIME/online/vme_frontend/bin/fevme
 if [ ! -x "$frontend" ]; then
   echo "fevme executable is missing or not executable: $frontend" >&2
   exit 1
 fi
 
-exec "$frontend" -e daq
+exec "$frontend" -e "$MIDAS_EXPT_NAME"
