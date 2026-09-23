@@ -78,12 +78,23 @@ void EventBuilder::AddEvent(TMEvent& event, RawEventSource source) {
 
 void EventBuilder::Emit(std::map<std::uint32_t, PendingEvent>::iterator position) {
   PendingEvent& pending = position->second;
-  if (pending.has_vme && pending.has_easiroc)
+  if (pending.has_vme && pending.has_easiroc) {
     ++statistics_.paired;
-  else if (pending.has_vme)
+    if (pending.decoded.counters.vme != pending.decoded.counters.easiroc) {
+      ++statistics_.counter_mismatches;
+      std::fprintf(stderr,
+                   "WARNING: frontend counter mismatch: VME=%lld "
+                   "EASIROC=%lld\n",
+                   static_cast<long long>(pending.decoded.counters.vme),
+                   static_cast<long long>(pending.decoded.counters.easiroc));
+    }
+  } else if (pending.has_vme) {
     ++statistics_.vme_only;
-  else
+    statistics_.vme_only_counters.insert(position->first);
+  } else {
     ++statistics_.easiroc_only;
+    statistics_.easiroc_only_counters.insert(position->first);
+  }
 
   const auto record = [](Statistics::RawCounters& statistics,
                          std::int64_t value) {
@@ -102,21 +113,6 @@ void EventBuilder::Emit(std::map<std::uint32_t, PendingEvent>::iterator position
 void EventBuilder::Finish() {
   while (!pending_.empty()) {
     auto position = pending_.begin();
-    const auto counter = position->first;
-    const PendingEvent& pending = position->second;
-    if (!pending.has_vme || !pending.has_easiroc) {
-      if (pending.has_vme) {
-        std::fprintf(stderr,
-                     "WARNING: frontend counter mismatch: VME=%u "
-                     "EASIROC=missing (event retained)\n",
-                     counter);
-      } else {
-        std::fprintf(stderr,
-                     "WARNING: frontend counter mismatch: VME=missing "
-                     "EASIROC=%u (event retained)\n",
-                     counter);
-      }
-    }
     Emit(position);
   }
 }

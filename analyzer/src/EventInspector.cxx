@@ -10,17 +10,30 @@ namespace ana {
 
 EventInspector::EventInspector(TARunInfo* runinfo)
     : TARunObject(runinfo),
-      builder_([this](const DecodedEvent& event) { tree_writer_.Fill(event); }) {
+      builder_([this](const DecodedEvent& event) {
+        tree_writer_.Fill(event);
+        histogram_manager_.Fill(event);
+      }) {
   fModuleName = "EventInspector";
 }
 
 void EventInspector::BeginRun(TARunInfo* runinfo) {
   detailed_printed_ = 0;
+  malformed_events_ = 0;
   event_ids_.clear();
   vme_ = SourceStatistics{};
   easiroc_ = SourceStatistics{};
   builder_.Clear();
-  tree_writer_.BeginRun(runinfo->fRoot ? runinfo->fRoot->fOutputFile : nullptr);
+  const bool online = runinfo->fFileName.empty();
+  auto histogram_configs =
+      histogram_config_loader_.Load(runinfo->fOdb, online);
+  histogram_manager_.SetConfigs(std::move(histogram_configs.configs));
+  std::printf("HistogramConfigLoader: using %s configuration%s\n",
+              histogram_configs.loaded_from_odb ? "ODB" : "default",
+              histogram_configs.created_defaults ? " (newly created)" : "");
+  TFile* output_file = runinfo->fRoot ? runinfo->fRoot->fOutputFile : nullptr;
+  tree_writer_.BeginRun(output_file);
+  histogram_manager_.BeginRun(output_file);
   std::printf("EventInspector: begin run %d, file %s\n", runinfo->fRunNo,
               runinfo->fFileName.c_str());
 }
@@ -109,6 +122,7 @@ void EventInspector::PrintDetailedEvent(TMEvent& event) const {
 void EventInspector::InspectEvent(TMEvent& event) {
   ++event_ids_[event.event_id];
   if (event.error) {
+    ++malformed_events_;
     std::fprintf(stderr,
                  "WARNING: malformed MIDAS event id=0x%04x serial=%u\n",
                  event.event_id, event.serial_number);
@@ -172,7 +186,15 @@ void EventInspector::PrintSourceSummary(
 void EventInspector::EndRun(TARunInfo* runinfo) {
   builder_.Finish();
   const auto tree_entries = tree_writer_.Entries();
+  const auto event_hist_entries = histogram_manager_.Entries("h_event");
+  const auto qdc_hist_entries = histogram_manager_.Entries("h_qdc0_ch0");
+  const auto eadc_hist_entries = histogram_manager_.Entries("h_eadc0_ch0");
+  const auto tle_hist_entries =
+      histogram_manager_.Entries("h_tle0_ch0_hit0");
+  const auto fadc_hist_entries =
+      histogram_manager_.Entries("h_fadc0_ch0_sample0");
   tree_writer_.EndRun();
+  histogram_manager_.EndRun();
   std::printf("\nRun %d summary\n", runinfo->fRunNo);
   std::printf("ROOT Events entries : %lld\n",
               static_cast<long long>(tree_entries));
@@ -188,8 +210,54 @@ void EventInspector::EndRun(TARunInfo* runinfo) {
   std::printf("  paired            : %zu\n", stats.paired);
   std::printf("  VME only          : %zu\n", stats.vme_only);
   std::printf("  EASIROC only      : %zu\n", stats.easiroc_only);
+  std::printf("  counter mismatches: %zu\n", stats.counter_mismatches);
   std::printf("  duplicate source  : %zu\n", stats.duplicate_source);
   std::printf("  decoder errors    : %zu\n", stats.decoder_errors);
+  std::printf("  malformed events  : %zu\n", malformed_events_);
+
+  const auto print_ranges = [](const char* name,
+                               const std::set<std::uint32_t>& counters) {
+    std::printf("  %-17s:", name);
+    if (counters.empty()) {
+      std::printf(" none\n");
+      return;
+    }
+    auto position = counters.begin();
+    std::uint32_t first = *position;
+    std::uint32_t last = first;
+    for (++position; position != counters.end(); ++position) {
+      if (*position == last + 1) {
+        last = *position;
+        continue;
+      }
+      if (first == last)
+        std::printf(" %u", first);
+      else
+        std::printf(" %u-%u", first, last);
+      first = last = *position;
+    }
+    if (first == last)
+      std::printf(" %u\n", first);
+    else
+      std::printf(" %u-%u\n", first, last);
+  };
+  std::printf("\nUnpaired frontend events\n");
+  std::printf("  VME only          : %zu\n", stats.vme_only);
+  print_ranges("range", stats.vme_only_counters);
+  std::printf("  EASIROC only      : %zu\n", stats.easiroc_only);
+  print_ranges("range", stats.easiroc_only_counters);
+
+  std::printf("\nHistograms (entries)\n");
+  std::printf("  h_event                : %lld\n",
+              static_cast<long long>(event_hist_entries));
+  std::printf("  h_qdc0_ch0             : %lld\n",
+              static_cast<long long>(qdc_hist_entries));
+  std::printf("  h_eadc0_ch0            : %lld\n",
+              static_cast<long long>(eadc_hist_entries));
+  std::printf("  h_tle0_ch0_hit0        : %lld\n",
+              static_cast<long long>(tle_hist_entries));
+  std::printf("  h_fadc0_ch0_sample0    : %lld\n",
+              static_cast<long long>(fadc_hist_entries));
 
   const auto print_raw_counter = [](const char* name,
                                     const EventBuilder::Statistics::RawCounters& counter) {

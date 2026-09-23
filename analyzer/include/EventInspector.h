@@ -2,6 +2,8 @@
 #define ANA_EVENT_INSPECTOR_H
 
 #include "EventBuilder.h"
+#include "HistogramConfigLoader.h"
+#include "HistogramManager.h"
 #include "RootTreeWriter.h"
 #include "manalyzer.h"
 
@@ -46,10 +48,13 @@ class EventInspector : public TARunObject {
 
   std::size_t detailed_limit_ = 8;
   std::size_t detailed_printed_ = 0;
+  std::size_t malformed_events_ = 0;
   std::map<std::uint16_t, std::size_t> event_ids_;
   SourceStatistics vme_;
   SourceStatistics easiroc_;
   RootTreeWriter tree_writer_;
+  HistogramConfigLoader histogram_config_loader_;
+  HistogramManager histogram_manager_;
   EventBuilder builder_;
 };
 

@@ -13,7 +13,7 @@ endif()
 
 set(ROOTANA_DIR "/home/daq/midas/rootana" CACHE PATH "ROOTANA installation prefix")
 
-find_package(ROOT REQUIRED COMPONENTS Core RIO Tree)
+find_package(ROOT REQUIRED COMPONENTS Core RIO Tree Hist)
 
 if(NOT EXISTS "${MIDASSYS}/lib/midas-targets.cmake")
   message(FATAL_ERROR "MIDAS CMake targets not found below MIDASSYS=${MIDASSYS}")
@@ -44,6 +44,10 @@ add_executable(midas_analyzer
   src/EventInspector.cxx
   src/EventBuilder.cxx
   src/RootTreeWriter.cxx
+  src/ExpressionResolver.cxx
+  src/HistogramConfig.cxx
+  src/HistogramConfigLoader.cxx
+  src/HistogramManager.cxx
   "${CMAKE_CURRENT_BINARY_DIR}/G__RootTreeTypes.cxx"
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
@@ -67,3 +71,56 @@ target_link_libraries(midas_analyzer PRIVATE
   manalyzer_main
   rootana::rootana
 )
+
+enable_testing()
+add_executable(expression_resolver_test
+  tests/ExpressionResolverTest.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(expression_resolver_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(expression_resolver_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+add_test(NAME expression_resolver_test COMMAND expression_resolver_test)
+
+add_executable(histogram_config_validation_test
+  tests/HistogramConfigValidationTest.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(histogram_config_validation_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(histogram_config_validation_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+add_test(NAME histogram_config_validation_test
+  COMMAND histogram_config_validation_test
+)
+
+add_executable(histogram_manager_test
+  tests/HistogramManagerTest.cxx
+  src/HistogramManager.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(histogram_manager_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(histogram_manager_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_link_libraries(histogram_manager_test PRIVATE
+  ROOT::Core
+  ROOT::RIO
+  ROOT::Hist
+)
+add_test(NAME histogram_manager_test COMMAND histogram_manager_test)
