@@ -28,8 +28,61 @@ int main() {
   okay &= Check(online.okay &&
                     online.inspector_options.mode == ana::AnalyzerMode::kOnline,
                 "no -f should select online mode");
-  okay &= Check(Contains(online.manalyzer_arguments, "-R8081"),
+  okay &= Check(Contains(online.manalyzer_arguments, "-R8082"),
                 "online mode should enable the standard ROOT web server");
+
+  const auto explicit_port =
+      ana::ParseAnalyzerCli({"midas_analyzer", "-R9090"});
+  okay &= Check(explicit_port.okay &&
+                    Contains(explicit_port.manalyzer_arguments, "-R9090"),
+                "an explicit ROOT web port should be preserved");
+  okay &= Check(!Contains(explicit_port.manalyzer_arguments, "-R8082"),
+                "the default port must not override an explicit ROOT web port");
+
+  const auto normal_online =
+      ana::ParseAnalyzerCli({"midas_analyzer", "--no-profiler"});
+  okay &= Check(normal_online.okay && !normal_online.init_hist_odb &&
+                    Contains(normal_online.manalyzer_arguments,
+                             "--no-profiler"),
+                "normal online startup must remain separate from init mode");
+
+  const auto initialize =
+      ana::ParseAnalyzerCli({"midas_analyzer", "--init-hist-odb"});
+  okay &= Check(initialize.okay && initialize.init_hist_odb,
+                "--init-hist-odb should select management mode");
+  okay &= Check(!Contains(initialize.manalyzer_arguments, "-R8082"),
+                "management mode must not start the ROOT web server");
+
+  const auto initialize_with_connection = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-Hdaqhost", "-Edaq",
+       "--midas-progname", "hist_init"});
+  okay &= Check(initialize_with_connection.okay &&
+                    initialize_with_connection.midas_hostname == "daqhost" &&
+                    initialize_with_connection.midas_experiment == "daq" &&
+                    initialize_with_connection.midas_program_name ==
+                        "hist_init",
+                "management mode should retain MIDAS connection options");
+
+  const auto initialize_with_input = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-f", "run.mid"});
+  okay &= Check(!initialize_with_input.okay,
+                "management mode must reject offline input");
+  const auto initialize_with_output = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-w", "run.root"});
+  okay &= Check(!initialize_with_output.okay,
+                "management mode must reject offline output");
+  const auto initialize_with_limit = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-n", "1"});
+  okay &= Check(!initialize_with_limit.okay,
+                "management mode must reject event limits");
+  const auto initialize_with_legacy_output = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-Olegacy.root"});
+  okay &= Check(!initialize_with_legacy_output.okay,
+                "management mode must reject legacy ROOT output");
+  const auto initialize_with_web = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-hist-odb", "-R9090"});
+  okay &= Check(!initialize_with_web.okay,
+                "management mode must reject ROOT web server options");
 
   const auto offline = ana::ParseAnalyzerCli(
       {"midas_analyzer", "-f", "/data/run00062.mid.lz4", "-n", "100"});

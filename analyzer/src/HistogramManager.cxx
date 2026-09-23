@@ -76,9 +76,26 @@ bool HistogramManager::BookLocked() {
     }
 
     auto object = std::make_unique<TH1D>(
-        config.hist_name.c_str(), config.hist_name.c_str(), config.bins,
+        config.hist_name.c_str(), config.title.c_str(), config.bins,
         config.min, config.max);
-    object->SetDirectory(directory_);
+    object->SetTitle(config.title.c_str());
+    object->GetXaxis()->SetTitle(config.x_title.c_str());
+    object->GetYaxis()->SetTitle(config.y_title.c_str());
+
+    TDirectory* group_directory = directory_;
+    if (!config.group.empty()) {
+      group_directory = directory_->GetDirectory(config.group.c_str());
+      if (!group_directory)
+        group_directory = directory_->mkdir(config.group.c_str());
+    }
+    if (!group_directory) {
+      std::fprintf(stderr,
+                   "ERROR: cannot create ROOT histogram group directory %s\n",
+                   config.group.c_str());
+      all_valid = false;
+      continue;
+    }
+    object->SetDirectory(group_directory);
     histograms_.push_back(
         {config, std::move(expression), std::move(object)});
   }
@@ -109,6 +126,22 @@ std::int64_t HistogramManager::Entries(const std::string& hist_name) const {
   return 0;
 }
 
+TH1* HistogramManager::FindHistogram(const std::string& path) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto separator = path.find('/');
+  const std::string group = separator == std::string::npos
+                                ? std::string{}
+                                : path.substr(0, separator);
+  const std::string name = separator == std::string::npos
+                               ? path
+                               : path.substr(separator + 1);
+  for (const auto& histogram : histograms_) {
+    if (histogram.config.hist_name != name) continue;
+    if (histogram.config.group == group) return histogram.object.get();
+  }
+  return nullptr;
+}
+
 std::vector<std::unique_ptr<TH1>> HistogramManager::Snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::unique_ptr<TH1>> snapshots;
@@ -129,10 +162,12 @@ std::size_t HistogramManager::ActiveCount() const {
 
 void HistogramManager::ClearHistogramsLocked(bool write) {
   if (write && directory_) {
-    directory_->cd();
-    for (const auto& histogram : histograms_)
+    for (const auto& histogram : histograms_) {
+      if (histogram.object->GetDirectory())
+        histogram.object->GetDirectory()->cd();
       histogram.object->Write(histogram.config.hist_name.c_str(),
                               TObject::kOverwrite);
+    }
   }
   for (auto& histogram : histograms_)
     histogram.object->SetDirectory(nullptr);

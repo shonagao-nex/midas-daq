@@ -14,7 +14,7 @@ bool Check(bool condition, const std::string& message) {
 
 ana::HistogramConfig Valid(std::string name) {
   return {std::move(name), "TH1D", "qdc0[0]", 4096, 0.0, 4096.0, "",
-          true};
+          true, "", "", "", "", ""};
 }
 
 }  // namespace

@@ -42,14 +42,19 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
   builder_.Clear();
   const bool online = options_.mode == AnalyzerMode::kOnline;
   auto histogram_configs = online
-                               ? histogram_config_loader_.Load(runinfo->fOdb,
-                                                               true)
+                               ? histogram_config_loader_.Load(runinfo->fOdb)
                                : HistogramConfigLoader::Result{
                                      DefaultHistogramConfigs(), false, false};
   histogram_manager_.SetConfigs(std::move(histogram_configs.configs));
-  std::printf("HistogramConfigLoader: using %s configuration%s\n",
-              histogram_configs.loaded_from_odb ? "ODB" : "default",
-              histogram_configs.created_defaults ? " (newly created)" : "");
+  if (online && !histogram_configs.odb_path_found) {
+    std::fprintf(stderr,
+                 "WARNING: %s not found; using in-memory default histogram "
+                 "configuration; ODB was not modified.\n",
+                 HistogramConfigLoader::kOdbPath);
+  } else {
+    std::printf("HistogramConfigLoader: using %s configuration\n",
+                histogram_configs.loaded_from_odb ? "ODB" : "default");
+  }
   TDirectory* histogram_parent = nullptr;
   if (online) {
     histogram_parent = TARootHelper::fgDir;
@@ -59,6 +64,11 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
     if (tree_writer_) tree_writer_->BeginRun(output_file);
   }
   histogram_manager_.BeginRun(histogram_parent, !online);
+  if (online) {
+    page_manager_.BeginRun(TARootHelper::fgDir, &histogram_manager_);
+    auto pages = page_config_loader_.Load(runinfo->fOdb);
+    page_manager_.ApplyConfigs(std::move(pages.pages), &histogram_manager_);
+  }
   next_online_poll_ = std::chrono::steady_clock::now() +
                       std::chrono::seconds(1);
   std::printf("EventInspector: begin run %d, file %s\n", runinfo->fRunNo,
@@ -90,11 +100,21 @@ void EventInspector::PollOnlineControls(TARunInfo* runinfo) {
   if (now < next_online_poll_) return;
   next_online_poll_ = now + std::chrono::seconds(1);
 
-  auto loaded = histogram_config_loader_.Load(runinfo->fOdb, false);
-  if (loaded.loaded_from_odb &&
-      histogram_manager_.ApplyConfigs(std::move(loaded.configs))) {
+  auto loaded = histogram_config_loader_.Load(runinfo->fOdb);
+  const bool histogram_changed =
+      loaded.loaded_from_odb &&
+      histogram_manager_.ApplyConfigs(std::move(loaded.configs));
+  if (histogram_changed) {
+    page_manager_.ClearCanvases();
+    page_manager_.Rebuild(&histogram_manager_);
     std::printf("HistogramConfigLoader: applied live ODB update (%zu active)\n",
                 histogram_manager_.ActiveCount());
+  }
+  auto pages = page_config_loader_.Load(runinfo->fOdb);
+  if (page_manager_.ApplyConfigs(std::move(pages.pages),
+                                 &histogram_manager_)) {
+    std::printf("PageConfigLoader: applied live page update (%zu pages)\n",
+                page_manager_.ActiveCount());
   }
   PollPdfRequest(runinfo);
 }
@@ -297,6 +317,7 @@ void EventInspector::EndRun(TARunInfo* runinfo) {
   const auto fadc_hist_entries =
       histogram_manager_.Entries("h_fadc0_ch0_sample0");
   if (tree_writer_) tree_writer_->EndRun();
+  page_manager_.Clear();
   histogram_manager_.EndRun();
   std::printf("\nRun %d summary\n", runinfo->fRunNo);
   if (options_.mode == AnalyzerMode::kOffline) {

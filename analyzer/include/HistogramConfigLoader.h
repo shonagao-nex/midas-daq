@@ -13,16 +13,19 @@ class HistogramConfigLoader {
  public:
   struct Result {
     std::vector<HistogramConfig> configs;
+    bool odb_path_found = false;
     bool loaded_from_odb = false;
-    bool created_defaults = false;
   };
 
-  Result Load(MVOdb* odb, bool create_defaults_if_missing) const;
+  // Read-only with respect to ODB. A missing tree falls back to in-memory
+  // defaults and is never created as a side effect of loading.
+  Result Load(MVOdb* odb) const;
+
+  // Reserved for a future explicit administrative initialization action.
+  // Normal online startup and live reload do not call this method.
+  bool CreateDefaults(MVOdb* odb) const;
 
   static constexpr const char* kOdbPath = "/Analyzer/Histograms";
-
- private:
-  bool CreateDefaults(MVOdb* odb) const;
 };
 
 }  // namespace ana

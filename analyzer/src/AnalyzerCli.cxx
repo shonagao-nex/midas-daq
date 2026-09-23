@@ -61,6 +61,8 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   std::vector<std::string> positional_inputs;
   bool has_legacy_root_output = false;
   bool has_http_port = false;
+  bool has_limit = false;
+  std::string management_incompatible_option;
   bool after_separator = false;
 
   const auto insert_manalyzer_option = [&](const std::string& option) {
@@ -78,11 +80,15 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   for (std::size_t i = 1; i < arguments.size(); ++i) {
     const std::string& argument = arguments[i];
     if (after_separator) {
+      if (management_incompatible_option.empty())
+        management_incompatible_option = "module arguments after --";
       result.manalyzer_arguments.push_back(argument);
       continue;
     }
     if (argument == "--") {
       after_separator = true;
+      if (management_incompatible_option.empty())
+        management_incompatible_option = "--";
       result.manalyzer_arguments.push_back(argument);
       continue;
     }
@@ -90,6 +96,10 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
       result.show_help = true;
       result.okay = true;
       return result;
+    }
+    if (argument == "--init-hist-odb") {
+      result.init_hist_odb = true;
+      continue;
     }
     if (argument == "-f" || argument == "-w" || argument == "-n") {
       if (i + 1 >= arguments.size()) {
@@ -113,6 +123,8 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
                              &result.inspector_options.decoded_event_limit)) {
         result.error = "-n requires a non-negative integer";
         return result;
+      } else {
+        has_limit = true;
       }
       continue;
     }
@@ -126,13 +138,30 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
         result.error = argument + " requires a value";
         return result;
       }
+      const std::string value = arguments[++i];
+      if (argument == "--midas-progname")
+        result.midas_program_name = value;
+      else if (argument == "--midas-hostname")
+        result.midas_hostname = value;
+      else if (argument == "--midas-exptname")
+        result.midas_experiment = value;
+      else if (management_incompatible_option.empty())
+        management_incompatible_option = argument;
       result.manalyzer_arguments.push_back(argument);
-      result.manalyzer_arguments.push_back(arguments[++i]);
+      result.manalyzer_arguments.push_back(value);
       continue;
     }
     if (StartsWith(argument, "-O") || StartsWith(argument, "-D"))
       has_legacy_root_output = true;
     if (StartsWith(argument, "-R")) has_http_port = true;
+    if (StartsWith(argument, "-H"))
+      result.midas_hostname = argument.substr(2);
+    else if (StartsWith(argument, "-E"))
+      result.midas_experiment = argument.substr(2);
+    else if (!StartsWith(argument, "-O") && !StartsWith(argument, "-D") &&
+             !StartsWith(argument, "-R") &&
+             management_incompatible_option.empty())
+      management_incompatible_option = argument;
 
     if (!argument.empty() && argument.front() != '-')
       positional_inputs.push_back(argument);
@@ -154,13 +183,25 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   result.inspector_options.mode =
       offline ? AnalyzerMode::kOffline : AnalyzerMode::kOnline;
 
+  if (result.init_hist_odb) {
+    if (!requested_input.empty() || !positional_inputs.empty() ||
+        !requested_output.empty() || has_limit || has_legacy_root_output ||
+        has_http_port || !management_incompatible_option.empty()) {
+      result.error = "--init-hist-odb cannot be combined with analysis, "
+                     "event-loop, or ROOT output options";
+      return result;
+    }
+    result.okay = true;
+    return result;
+  }
+
   if (!offline) {
     if (!requested_output.empty() || has_legacy_root_output) {
       result.error = "ROOT output options (-w, -O, -D) are invalid in online "
                      "mode";
       return result;
     }
-    if (!has_http_port) insert_manalyzer_option("-R8081");
+    if (!has_http_port) insert_manalyzer_option("-R8082");
   } else {
     if (!requested_output.empty() && has_legacy_root_output) {
       result.error = "do not combine -w with legacy -O/-D options";
@@ -183,16 +224,21 @@ std::string AnalyzerHelp(const std::string& program_name) {
   std::ostringstream help;
   help << "Usage:\n"
        << "  " << program_name << " [online options]\n"
-       << "  " << program_name << " -f INPUT [offline options]\n\n"
+       << "  " << program_name << " -f INPUT [offline options]\n"
+       << "  " << program_name << " --init-hist-odb [connection options]\n\n"
        << "Options:\n"
        << "  -f FILE    Input MIDAS file for offline analysis\n"
        << "  -w FILE    Offline ROOT output filename\n"
        << "             Default: /home/daq/midas/midas/rootfiles/<input>.root\n"
        << "  -n N       Process at most N decoded events (0 = unlimited)\n"
        << "  -h         Show this help\n\n"
+       << "Management option:\n"
+       << "  --init-hist-odb\n"
+       << "      Create default histogram configuration in MIDAS ODB and exit.\n"
+       << "      Existing configuration is never overwritten.\n\n"
        << "Online defaults:\n"
        << "  No -f selects live MIDAS mode and enables ROOT THttpServer on "
-          "127.0.0.1:8081. No ROOT file is created.\n\n"
+          "127.0.0.1:8082. No ROOT file is created.\n\n"
        << "Selected manalyzer options remain available:\n"
        << "  -RPORT, -Hhost, -Eexperiment, --midas-*, --no-profiler\n"
        << "  -O/-D remain legacy offline ROOT output options; -e counts raw "

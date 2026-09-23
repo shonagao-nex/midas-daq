@@ -48,8 +48,12 @@ add_executable(midas_analyzer
   src/ExpressionResolver.cxx
   src/HistogramConfig.cxx
   src/HistogramConfigLoader.cxx
+  src/HistogramOdbInitializer.cxx
   src/HistogramManager.cxx
   src/HistogramPdfWriter.cxx
+  src/PageConfig.cxx
+  src/PageConfigLoader.cxx
+  src/PageManager.cxx
   "${CMAKE_CURRENT_BINARY_DIR}/G__RootTreeTypes.cxx"
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
@@ -141,6 +145,28 @@ target_compile_options(analyzer_cli_test PRIVATE
 )
 add_test(NAME analyzer_cli_test COMMAND analyzer_cli_test)
 
+add_executable(histogram_config_loader_test
+  tests/HistogramConfigLoaderTest.cxx
+  src/HistogramConfigLoader.cxx
+  src/HistogramOdbInitializer.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(histogram_config_loader_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(histogram_config_loader_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_link_libraries(histogram_config_loader_test PRIVATE
+  midas::midas
+)
+add_test(NAME histogram_config_loader_test
+  COMMAND histogram_config_loader_test
+)
+
 add_executable(histogram_pdf_writer_test
   tests/HistogramPdfWriterTest.cxx
   src/HistogramPdfWriter.cxx
@@ -164,3 +190,28 @@ target_link_libraries(histogram_pdf_writer_test PRIVATE
   ROOT::Gpad
 )
 add_test(NAME histogram_pdf_writer_test COMMAND histogram_pdf_writer_test)
+
+add_executable(page_manager_test
+  tests/PageManagerTest.cxx
+  src/PageConfig.cxx
+  src/PageManager.cxx
+  src/HistogramManager.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(page_manager_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(page_manager_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_link_libraries(page_manager_test PRIVATE
+  ROOT::Core
+  ROOT::RIO
+  ROOT::Hist
+  ROOT::Graf
+  ROOT::Gpad
+)
+add_test(NAME page_manager_test COMMAND page_manager_test)

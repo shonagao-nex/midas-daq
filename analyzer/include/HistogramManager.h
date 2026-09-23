@@ -30,6 +30,9 @@ class HistogramManager {
   void EndRun();
 
   std::int64_t Entries(const std::string& hist_name) const;
+  // Returns the booked histogram object without cloning it. The caller must
+  // not delete or modify the returned object.
+  TH1* FindHistogram(const std::string& path) const;
   std::vector<std::unique_ptr<TH1>> Snapshot() const;
   std::size_t ActiveCount() const;
 

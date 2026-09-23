@@ -22,9 +22,12 @@ bool Check(bool condition, const std::string& message) {
 
 int main() {
   const std::vector<ana::HistogramConfig> configs{
-      {"filled", "TH1D", "event", 10, 0.0, 10.0, "", true},
-      {"empty", "TH1D", "qdc0[0]", 10, 0.0, 10.0, "", true},
-      {"disabled", "TH1D", "event", 10, 0.0, 10.0, "", false},
+      {"filled", "TH1D", "event", 10, 0.0, 10.0, "", true, "Filled",
+       "Event", "Counts", "Event", "Ch00"},
+      {"empty", "TH1D", "qdc0[0]", 10, 0.0, 10.0, "", true, "Empty",
+       "QDC raw", "Counts", "QDC0", "Ch00"},
+      {"disabled", "TH1D", "event", 10, 0.0, 10.0, "", false,
+       "Disabled", "Event", "Counts", "Event", "Ch01"},
   };
 
   TMemFile parent("histogram_pdf_writer_test.root", "RECREATE");

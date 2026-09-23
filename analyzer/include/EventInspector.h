@@ -6,6 +6,8 @@
 #include "HistogramConfigLoader.h"
 #include "HistogramManager.h"
 #include "HistogramPdfWriter.h"
+#include "PageConfigLoader.h"
+#include "PageManager.h"
 #include "RootTreeWriter.h"
 #include "manalyzer.h"
 
@@ -65,6 +67,8 @@ class EventInspector : public TARunObject {
   HistogramConfigLoader histogram_config_loader_;
   HistogramManager histogram_manager_;
   HistogramPdfWriter histogram_pdf_writer_;
+  PageConfigLoader page_config_loader_;
+  PageManager page_manager_;
   EventBuilder builder_;
   std::chrono::steady_clock::time_point next_online_poll_{};
 };

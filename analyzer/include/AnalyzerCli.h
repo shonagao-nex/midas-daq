@@ -12,8 +12,12 @@ namespace ana {
 struct AnalyzerCliResult {
   bool okay = false;
   bool show_help = false;
+  bool init_hist_odb = false;
   EventInspectorOptions inspector_options;
   std::vector<std::string> manalyzer_arguments;
+  std::string midas_program_name = "ana_hist_odb_init";
+  std::string midas_hostname;
+  std::string midas_experiment;
   std::string input_file;
   std::string output_file;
   std::string error;

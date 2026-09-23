@@ -1,6 +1,7 @@
 #include "HistogramManager.h"
 
 #include "TDirectory.h"
+#include "TH1.h"
 #include "TMemFile.h"
 
 #include <cstdio>
@@ -19,10 +20,12 @@ bool Check(bool condition, const std::string& message) {
 
 int main() {
   const std::vector<ana::HistogramConfig> configs{
-      {"enabled", "TH1D", "qdc0[0]", 100, 0.0, 1000.0, "", true},
-      {"disabled", "TH1D", "event", 100, 0.0, 1000.0, "", false},
+      {"enabled", "TH1D", "qdc0[0]", 100, 0.0, 1000.0, "", true,
+       "QDC title", "QDC raw", "Counts", "QDC0", "Ch00"},
+      {"disabled", "TH1D", "event", 100, 0.0, 1000.0, "", false,
+       "Disabled", "x", "y", "QDC0", "Ch01"},
       {"missing_nested", "TH1D", "tle0[0][0]", 100, 0.0, 1000.0, "",
-       true},
+       true, "", "", "", "", ""},
   };
 
   TMemFile output("histogram_manager_test.root", "RECREATE");
@@ -47,14 +50,28 @@ int main() {
                 "-999 sentinel should not fill");
 
   TDirectory* directory = output.GetDirectory("Histograms");
-  okay &= Check(directory && directory->Get("enabled"),
+  TDirectory* qdc_directory =
+      directory ? directory->GetDirectory("QDC0") : nullptr;
+  okay &= Check(qdc_directory && qdc_directory->Get("enabled"),
                 "enabled histogram should be booked");
-  okay &= Check(directory && !directory->Get("disabled"),
+  okay &= Check(qdc_directory && !qdc_directory->Get("disabled"),
                 "disabled histogram should not be booked");
+  if (qdc_directory && qdc_directory->Get("enabled")) {
+    auto* histogram = dynamic_cast<TH1*>(qdc_directory->Get("enabled"));
+    okay &= Check(histogram && std::string(histogram->GetTitle()) ==
+                              "QDC title" &&
+                      std::string(histogram->GetXaxis()->GetTitle()) ==
+                          "QDC raw" &&
+                      std::string(histogram->GetYaxis()->GetTitle()) ==
+                          "Counts",
+                  "histogram titles should be applied");
+  }
 
   const std::vector<ana::HistogramConfig> reloaded{
-      {"enabled", "TH1D", "qdc0[1]", 20, 0.0, 2000.0, "", true},
-      {"added", "TH1D", "event", 10, 0.0, 10.0, "", true},
+      {"enabled", "TH1D", "qdc0[1]", 20, 0.0, 2000.0, "", true,
+       "Reloaded", "raw", "Counts", "QDC0", "Ch00"},
+      {"added", "TH1D", "event", 10, 0.0, 10.0, "", true,
+       "Added", "raw", "Counts", "Event", "Ch00"},
   };
   okay &= Check(manager.ApplyConfigs(reloaded),
                 "changed configuration should be applied");
@@ -62,8 +79,10 @@ int main() {
                 "reload should add and remove histograms");
   okay &= Check(manager.Entries("enabled") == 0,
                 "expression/binning change should reset contents");
-  okay &= Check(directory && !directory->Get("missing_nested") &&
-                    directory->Get("added"),
+  TDirectory* event_directory =
+      directory ? directory->GetDirectory("Event") : nullptr;
+  okay &= Check(qdc_directory && !qdc_directory->Get("missing_nested") &&
+                    event_directory && event_directory->Get("added"),
                 "reload should remove stale object and book new object");
 
   auto disabled_reload = reloaded;
@@ -71,7 +90,7 @@ int main() {
   okay &= Check(manager.ApplyConfigs(disabled_reload),
                 "Enabled change should be applied");
   okay &= Check(manager.ActiveCount() == 1 &&
-                    directory && !directory->Get("enabled"),
+                    qdc_directory && !qdc_directory->Get("enabled"),
                 "disabled object should be deleted");
   manager.EndRun();
 

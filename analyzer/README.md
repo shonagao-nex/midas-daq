@@ -57,15 +57,20 @@ event type, expression resolver, and histogram manager are used in both modes.
 Usage:
   midas_analyzer [online options]
   midas_analyzer -f INPUT [offline options]
+  midas_analyzer --init-hist-odb [connection options]
 
   -f FILE    offline MIDAS input
   -w FILE    offline ROOT output
   -n N       maximum emitted DecodedEvent count (0 means unlimited)
   -h         help
+
+  --init-hist-odb
+      create default histogram configuration in MIDAS ODB and exit;
+      existing configuration is never overwritten
 ```
 
-Online monitoring starts the standard ROOT `THttpServer` on localhost port
-8081 by default:
+The MIDAS `mhttpd` default port is 8081. Online monitoring starts the standard
+ROOT `THttpServer` on localhost port 8082 by default, avoiding that port:
 
 ```sh
 ./build/midas_analyzer --no-profiler
@@ -75,10 +80,11 @@ No online ROOT file is opened. `RootTreeWriter` is not constructed, and live
 histograms are placed in manalyzer's in-memory `TARootHelper::fgDir`. The
 process remains in the foreground and manalyzer keeps it connected while the
 run is stopped; BOR creates a run object and EOR destroys it without exiting
-the process. Use `-RPORT` to select another ROOT web port. To expose the
-standard JSROOT page through mhttpd, configure the documented proxy entries,
-for example `/WebServer/Proxy/rootana = http://localhost:8081` and an
-appropriate `/Alias/rootana` entry.
+the process. Use `-RPORT` to select another ROOT web port; an explicit value,
+for example `-R9090`, takes precedence over the 8082 wrapper default. No mhttpd
+proxy or alias change is required for direct validation of the analyzer server.
+Proxy configuration should be performed only after the standalone server has
+been verified on 8082.
 
 For offline analysis, load ROOT and use:
 
@@ -105,14 +111,17 @@ events whose two frontend counters disagree.
 
 ## Histogram configuration
 
-At begin-of-run, `HistogramConfigLoader` reads one subdirectory per histogram
-below `/Analyzer/Histograms`. It uses the `MVOdb` supplied by
+At begin-of-run, `HistogramConfigLoader` reads group and channel-slot
+subdirectories below `/Analyzer/Histograms`. It uses the `MVOdb` supplied by
 `TARunInfo::fOdb`; `HistogramManager` and `ExpressionResolver` do not know an
 ODB path or use an ODB API. A typical entry is:
 
 ```text
-/Analyzer/Histograms/h_qdc0_ch0/
-    HistName    = "h_qdc0_ch0"
+/Analyzer/Histograms/QDC0/Ch00/
+    HistName    = "h_qdc0_ch00"
+    Title       = "QDC0 Ch.0"
+    XTitle      = "QDC raw value"
+    YTitle      = "Counts"
     Type        = "TH1D"
     Expression  = "qdc0[0]"
     Bins        = 4096
@@ -131,6 +140,14 @@ The fields mean:
 - `Bins`, `Min`, `Max`: axis bin count and limits (`Bins > 0`, `Min < Max`).
 - `Cut`: selection expression; currently only the empty string is supported.
 - `Enabled`: a false value keeps the definition but does not book or fill it.
+- `Title`, `XTitle`, and `YTitle` are copied to the ROOT histogram and axes.
+
+The default schema has 521 slots in these groups: `Event` (1), `QDC0` (32),
+`TDC0` (32), `TLE0` (128), `TTR0` (128), `EADC0` (64), `ETLE0` (64),
+`ETTR0` (64), and `FADC0` (8). Every slot is created by the shared
+`DefaultHistogramConfigs()` generator. `Event/Ch00` is enabled by default;
+all channel slots are disabled until explicitly enabled in ODB. TLE/TTR and
+ETLE/ETTR defaults use the first hit (`[0]`), and FADC uses the first sample.
 
 Each definition is validated before `HistogramManager` sees it. An unsupported
 type or cut, an empty name, invalid binning, or an invalid expression produces
@@ -139,22 +156,73 @@ a warning and skips only that histogram. If several subkeys contain the same
 later definitions are warned and skipped. This avoids a silent overwrite and
 makes the selected definition deterministic for a given ODB layout.
 
-If `/Analyzer/Histograms` is absent in writable online ODB, the analyzer creates
-the default definitions at begin-of-run. Offline input falls back to the same
-static defaults and does not require or contact an ODB server. (The installed
-XML/JSON `MVOdb` snapshot backends do not implement directory enumeration, so
-ODB histogram subkeys are loaded from the live `MidasOdb` backend only.) The
-defaults are `h_event`,
-`h_qdc0_ch0`, `h_eadc0_ch0`, `h_tle0_ch0_hit0`, and
-`h_fadc0_ch0_sample0`; the first three are the baseline regression histograms.
+Online analyzer startup does not create `/Analyzer/Histograms` automatically.
+If the tree is absent, this is a non-fatal state: the analyzer logs that it is
+using the in-memory defaults and that ODB was not modified. ODB writability does
+not grant permission to initialize the schema. Default-schema creation is a
+separate explicit administrative command; normal startup and live reload never
+invoke it. Offline input uses the
+same static defaults and does not require or contact an ODB server. The initial
+read-only check runs after MIDAS connects even when the run is stopped. (The
+installed XML/JSON `MVOdb` snapshot backends do not implement directory
+enumeration, so ODB histogram subkeys are loaded from the live `MidasOdb`
+backend only.) The ROOT output mirrors this grouping below `Histograms/`, for
+example `Histograms/QDC0/h_qdc0_ch05`. Disabled slots have no ROOT object;
+enabling a slot books and fills it, including during live reload. The ROOT web
+server is only the standard THttpServer and does not create custom pages or
+canvases unless page definitions are present under `/Analyzer/Pages`.
+
+## ROOT Web pages
+
+Page layouts are independent of histogram definitions and Enabled flags. A
+page is stored read-only from ODB as:
+
+```text
+/Analyzer/Pages/TriggerMonitor/
+    Rows    = 3
+    Columns = 3
+    Pad01   = "QDC0/h_qdc0_ch00"
+    Pad02   = "TDC0/h_tdc0_ch00"
+    Pad03   = "TLE0/h_tle0_ch05"
+```
+
+The supported layouts are 3x3, 4x4, and 4x5. At runtime the analyzer exposes
+the canvases below the ROOT `Pages/` directory (for example,
+`Pages/TriggerMonitor`). A pad containing an empty or missing histogram path
+is left blank; histogram objects are drawn directly, without cloning or
+resetting their contents. Page settings are polled with the other online ODB
+controls and are rebuilt when the page definition changes. Removing a
+histogram or a page therefore only leaves an empty/removed canvas and does not
+stop the analyzer. No drag-and-drop or custom HTML editor is provided.
 At BOR, configuration is loaded, validated, and freshly booked. During an
 online run, the event loop polls at most once per second and reloads the ODB
-directory. It does not read ODB once per event. If raw configuration changes,
-all enabled valid histograms are safely rebooked under a mutex; contents reset
-at that point. This implements add, delete, HistName change, binning/expression
-change, and Enabled toggling without stale objects. EOR clears pending builder
-state and deletes live histogram objects. The standard mhttpd ODB editor can be
-used to edit the schema; there is no custom HTML page.
+directory using only `create=false` reads. A missing path is never created by
+polling; if an administrator later creates it explicitly, the next poll
+switches to the ODB configuration. It does not read ODB once per event. If raw
+configuration changes, all enabled valid histograms are safely rebooked under
+a mutex; contents reset at that point. This implements add, delete, HistName
+change, binning/expression change, and Enabled toggling without stale objects.
+EOR clears pending builder state and deletes live histogram objects. The
+standard mhttpd ODB editor can be used to edit the schema; there is no custom
+HTML page.
+
+To initialize the tree explicitly, run the following only from the real DAQ
+host environment:
+
+```sh
+./build/midas_analyzer --init-hist-odb
+```
+
+This management command connects to MIDAS/ODB, creates definitions from the
+same `DefaultHistogramConfigs()` used by offline and in-memory fallback, reads
+them back, validates every definition, disconnects, and exits. It does not
+enter manalyzer, subscribe to the SYSTEM buffer, install run-transition
+handling, create an event builder or ROOT writer, or start `THttpServer`.
+If `/Analyzer/Histograms` already exists, including a partial tree, the command
+returns an error without creating, repairing, or overwriting anything. After a
+successful initialization, each histogram and its `HistName`, `Type`,
+`Expression`, `Bins`, `Min`, `Max`, `Cut`, and `Enabled` fields can be edited
+with the standard mhttpd ODB editor.
 
 Expressions are parsed during validation/booking, not once per event. Missing
 values (`-999`), absent hits, and absent waveform samples are not filled.

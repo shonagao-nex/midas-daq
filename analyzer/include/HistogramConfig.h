@@ -16,6 +16,11 @@ struct HistogramConfig {
   double max = 0.0;
   std::string cut;
   bool enabled = true;
+  std::string title;
+  std::string x_title;
+  std::string y_title;
+  std::string group;
+  std::string slot;
 };
 
 bool operator==(const HistogramConfig& left, const HistogramConfig& right);
