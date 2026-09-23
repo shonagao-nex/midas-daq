@@ -13,6 +13,7 @@ struct AnalyzerCliResult {
   bool okay = false;
   bool show_help = false;
   bool init_hist_odb = false;
+  int root_web_port = 0;  // Online only; zero means no ROOT HTTP server.
   EventInspectorOptions inspector_options;
   std::vector<std::string> manalyzer_arguments;
   std::string midas_program_name = "ana_hist_odb_init";

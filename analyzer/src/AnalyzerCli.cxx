@@ -30,6 +30,18 @@ bool ParseLimit(const std::string& text, std::size_t* value) {
   return parsed == *value;
 }
 
+bool ParseWebPort(const std::string& text, int* port) {
+  if (text.empty()) return false;
+  int parsed = 0;
+  const auto result =
+      std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+      parsed < 1 || parsed > 65535)
+    return false;
+  *port = parsed;
+  return true;
+}
+
 std::string DefaultOutputName(const std::string& input) {
   std::string name = std::filesystem::path(input).filename().string();
   if (name.size() >= 8 && name.compare(name.size() - 8, 8, ".mid.lz4") == 0)
@@ -153,13 +165,21 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
     }
     if (StartsWith(argument, "-O") || StartsWith(argument, "-D"))
       has_legacy_root_output = true;
-    if (StartsWith(argument, "-R")) has_http_port = true;
+    if (StartsWith(argument, "-R")) {
+      if (!ParseWebPort(argument.substr(2), &result.root_web_port)) {
+        result.error = "-R requires a TCP port from 1 to 65535";
+        return result;
+      }
+      has_http_port = true;
+      // This analyzer owns the ROOT server so it can bind to all interfaces.
+      // Passing -R to manalyzer would start its hard-coded loopback listener.
+      continue;
+    }
     if (StartsWith(argument, "-H"))
       result.midas_hostname = argument.substr(2);
     else if (StartsWith(argument, "-E"))
       result.midas_experiment = argument.substr(2);
     else if (!StartsWith(argument, "-O") && !StartsWith(argument, "-D") &&
-             !StartsWith(argument, "-R") &&
              management_incompatible_option.empty())
       management_incompatible_option = argument;
 
@@ -201,8 +221,12 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
                      "mode";
       return result;
     }
-    if (!has_http_port) insert_manalyzer_option("-R8082");
+    if (!has_http_port) result.root_web_port = 8082;
   } else {
+    if (has_http_port) {
+      result.error = "-R is available only in online mode";
+      return result;
+    }
     if (!requested_output.empty() && has_legacy_root_output) {
       result.error = "do not combine -w with legacy -O/-D options";
       return result;
@@ -238,7 +262,8 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "      Existing configuration is never overwritten.\n\n"
        << "Online defaults:\n"
        << "  No -f selects live MIDAS mode and enables ROOT THttpServer on "
-          "127.0.0.1:8082. No ROOT file is created.\n\n"
+          "0.0.0.0:8082. No ROOT file is created.\n"
+       << "  -RPORT overrides 8082 and binds to all interfaces.\n\n"
        << "Selected manalyzer options remain available:\n"
        << "  -RPORT, -Hhost, -Eexperiment, --midas-*, --no-profiler\n"
        << "  -O/-D remain legacy offline ROOT output options; -e counts raw "

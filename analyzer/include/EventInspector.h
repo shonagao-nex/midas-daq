@@ -5,9 +5,9 @@
 #include "EventBuilder.h"
 #include "HistogramConfigLoader.h"
 #include "HistogramManager.h"
-#include "HistogramPdfWriter.h"
 #include "PageConfigLoader.h"
 #include "PageManager.h"
+#include "OnlineHistogramState.h"
 #include "RootTreeWriter.h"
 #include "manalyzer.h"
 
@@ -22,7 +22,8 @@ namespace ana {
 
 class EventInspector : public TARunObject {
  public:
-  EventInspector(TARunInfo* runinfo, EventInspectorOptions options);
+  EventInspector(TARunInfo* runinfo, EventInspectorOptions options,
+                 OnlineHistogramState* online_state = nullptr);
 
   void BeginRun(TARunInfo* runinfo) override;
   void EndRun(TARunInfo* runinfo) override;
@@ -64,11 +65,13 @@ class EventInspector : public TARunObject {
   SourceStatistics vme_;
   SourceStatistics easiroc_;
   std::unique_ptr<RootTreeWriter> tree_writer_;
+  OnlineHistogramState* online_state_ = nullptr;  // Factory-owned; online only.
   HistogramConfigLoader histogram_config_loader_;
   HistogramManager histogram_manager_;
-  HistogramPdfWriter histogram_pdf_writer_;
   PageConfigLoader page_config_loader_;
   PageManager page_manager_;
+  HistogramManager& Histograms();
+  PageManager& Pages();
   EventBuilder builder_;
   std::chrono::steady_clock::time_point next_online_poll_{};
 };

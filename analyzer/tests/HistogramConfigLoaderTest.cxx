@@ -1,8 +1,10 @@
 #include "HistogramConfigLoader.h"
+#include "HistogramEnableControl.h"
 #include "HistogramOdbInitializer.h"
 
 #include "mvodb.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -13,7 +15,9 @@
 
 namespace {
 
-using Value = std::variant<bool, int, double, std::string>;
+using Value = std::variant<bool, int, double, std::string,
+                           std::vector<bool>, std::vector<int>,
+                           std::vector<double>, std::vector<std::string>>;
 
 struct Node {
   std::map<std::string, std::unique_ptr<Node>> children;
@@ -34,23 +38,54 @@ class TrackingOdb final : public MVOdb {
     Node& analyzer = Child(state_->root, "Analyzer");
     Node& histograms = Child(analyzer, "Histograms");
     const std::string group = config.group.empty() ? "Test" : config.group;
-    const std::string slot = config.slot.empty() ? config.hist_name : config.slot;
-    Node& histogram = Child(Child(histograms, group), slot);
-    histogram.values["HistName"] = config.hist_name;
-    histogram.values["Title"] = config.title;
-    histogram.values["XTitle"] = config.x_title;
-    histogram.values["YTitle"] = config.y_title;
-    histogram.values["Type"] = config.type;
-    histogram.values["Expression"] = config.expression;
-    histogram.values["Bins"] = config.bins;
-    histogram.values["Min"] = config.min;
-    histogram.values["Max"] = config.max;
-    histogram.values["Cut"] = config.cut;
-    histogram.values["Enabled"] = config.enabled;
+    Node& histogram = Child(histograms, group);
+    AppendValue(histogram, "HistName", config.hist_name);
+    AppendValue(histogram, "Title", config.title);
+    AppendValue(histogram, "XTitle", config.x_title);
+    AppendValue(histogram, "YTitle", config.y_title);
+    AppendValue(histogram, "Type", config.type);
+    AppendValue(histogram, "Expression", config.expression);
+    AppendValue(histogram, "Bins", config.bins);
+    AppendValue(histogram, "Min", config.min);
+    AppendValue(histogram, "Max", config.max);
+    AppendValue(histogram, "Cut", config.cut);
+    AppendValue(histogram, "Enabled", config.enabled);
   }
 
   int CreateOperations() const { return state_->create_operations; }
   int WriteOperations() const { return state_->write_operations; }
+  std::size_t FieldCount() const {
+    const auto analyzer = state_->root.children.find("Analyzer");
+    if (analyzer == state_->root.children.end()) return 0;
+    const auto histograms = analyzer->second->children.find("Histograms");
+    if (histograms == analyzer->second->children.end()) return 0;
+    std::size_t count = 0;
+    for (const auto& [_, group] : histograms->second->children)
+      count += group->values.size();
+    return count;
+  }
+  std::size_t GroupCount() const {
+    const auto analyzer = state_->root.children.find("Analyzer");
+    if (analyzer == state_->root.children.end()) return 0;
+    const auto histograms = analyzer->second->children.find("Histograms");
+    return histograms == analyzer->second->children.end()
+               ? 0 : histograms->second->children.size();
+  }
+  std::size_t ChannelDirectoryCount() const {
+    const auto analyzer = state_->root.children.find("Analyzer");
+    if (analyzer == state_->root.children.end()) return 0;
+    const auto histograms = analyzer->second->children.find("Histograms");
+    if (histograms == analyzer->second->children.end()) return 0;
+    std::size_t count = 0;
+    for (const auto& [_, group] : histograms->second->children)
+      count += group->children.size();
+    return count;
+  }
+  void TruncateField(const std::string& group, const std::string& field) {
+    auto& values = Child(Child(Child(state_->root, "Analyzer"),
+                               "Histograms"), group).values;
+    std::get<std::vector<int>>(values.at(field)).pop_back();
+  }
 
   bool IsReadOnly() const override { return false; }
 
@@ -122,31 +157,35 @@ class TrackingOdb final : public MVOdb {
   UNUSED_SCALAR_READ(RU64, uint64_t)
 #undef UNUSED_SCALAR_READ
 
+#define STORED_ARRAY_READ(method, type)                                      \
+  void method(const char* name, std::vector<type>* value, bool create, int,  \
+              MVOdbError* error) override {                                  \
+    ReadValue(name, value, create, error);                                    \
+  }
+  STORED_ARRAY_READ(RBA, bool)
+  STORED_ARRAY_READ(RIA, int)
+  STORED_ARRAY_READ(RDA, double)
+#undef STORED_ARRAY_READ
 #define UNUSED_ARRAY_READ(method, type)                                      \
   void method(const char*, std::vector<type>*, bool create, int,             \
               MVOdbError* error) override {                                  \
     CountCreate(create);                                                      \
     SetOk(error);                                                             \
   }
-  UNUSED_ARRAY_READ(RBA, bool)
-  UNUSED_ARRAY_READ(RIA, int)
-  UNUSED_ARRAY_READ(RDA, double)
   UNUSED_ARRAY_READ(RFA, float)
   UNUSED_ARRAY_READ(RU16A, uint16_t)
   UNUSED_ARRAY_READ(RU32A, uint32_t)
   UNUSED_ARRAY_READ(RU64A, uint64_t)
 #undef UNUSED_ARRAY_READ
-  void RSA(const char*, std::vector<std::string>*, bool create, int, int,
+  void RSA(const char* name, std::vector<std::string>* value, bool create, int, int,
            MVOdbError* error) override {
-    CountCreate(create);
-    SetOk(error);
+    ReadValue(name, value, create, error);
   }
 
 #define UNUSED_INDEX_READ(method, type)                                  \
   void method(const char*, int, type*, MVOdbError* error) override {      \
     SetOk(error);                                                         \
   }
-  UNUSED_INDEX_READ(RBAI, bool)
   UNUSED_INDEX_READ(RIAI, int)
   UNUSED_INDEX_READ(RDAI, double)
   UNUSED_INDEX_READ(RFAI, float)
@@ -155,6 +194,15 @@ class TrackingOdb final : public MVOdb {
   UNUSED_INDEX_READ(RU32AI, uint32_t)
   UNUSED_INDEX_READ(RU64AI, uint64_t)
 #undef UNUSED_INDEX_READ
+  void RBAI(const char* name, int index, bool* value,
+            MVOdbError* error) override {
+    SetOk(error);
+    auto found = node_->values.find(name);
+    if (found == node_->values.end() || index < 0) return;
+    const auto* values = std::get_if<std::vector<bool>>(&found->second);
+    if (values && static_cast<std::size_t>(index) < values->size() && value)
+      *value = (*values)[index];
+  }
 
 #define UNUSED_SCALAR_WRITE(method, type)                               \
   void method(const char*, type, MVOdbError* error) override {           \
@@ -174,24 +222,29 @@ class TrackingOdb final : public MVOdb {
     SetOk(error);
   }
 
+#define STORED_ARRAY_WRITE(method, type)                                     \
+  void method(const char* name, const std::vector<type>& value,              \
+              MVOdbError* error) override {                                  \
+    WriteValue(name, value, error);                                          \
+  }
+  STORED_ARRAY_WRITE(WBA, bool)
+  STORED_ARRAY_WRITE(WIA, int)
+  STORED_ARRAY_WRITE(WDA, double)
+#undef STORED_ARRAY_WRITE
 #define UNUSED_ARRAY_WRITE(method, type)                                    \
   void method(const char*, const std::vector<type>&, MVOdbError* error)      \
       override {                                                             \
     ++state_->write_operations;                                              \
     SetOk(error);                                                            \
   }
-  UNUSED_ARRAY_WRITE(WBA, bool)
-  UNUSED_ARRAY_WRITE(WIA, int)
-  UNUSED_ARRAY_WRITE(WDA, double)
   UNUSED_ARRAY_WRITE(WFA, float)
   UNUSED_ARRAY_WRITE(WU16A, uint16_t)
   UNUSED_ARRAY_WRITE(WU32A, uint32_t)
   UNUSED_ARRAY_WRITE(WU64A, uint64_t)
 #undef UNUSED_ARRAY_WRITE
-  void WSA(const char*, const std::vector<std::string>&, int,
+  void WSA(const char* name, const std::vector<std::string>& value, int,
            MVOdbError* error) override {
-    ++state_->write_operations;
-    SetOk(error);
+    WriteValue(name, value, error);
   }
 
 #define UNUSED_INDEX_WRITE(method, type)                                  \
@@ -199,7 +252,6 @@ class TrackingOdb final : public MVOdb {
     ++state_->write_operations;                                            \
     SetOk(error);                                                          \
   }
-  UNUSED_INDEX_WRITE(WBAI, bool)
   UNUSED_INDEX_WRITE(WIAI, int)
   UNUSED_INDEX_WRITE(WDAI, double)
   UNUSED_INDEX_WRITE(WFAI, float)
@@ -207,6 +259,16 @@ class TrackingOdb final : public MVOdb {
   UNUSED_INDEX_WRITE(WU32AI, uint32_t)
   UNUSED_INDEX_WRITE(WU64AI, uint64_t)
 #undef UNUSED_INDEX_WRITE
+  void WBAI(const char* name, int index, bool value,
+             MVOdbError* error) override {
+    SetOk(error);
+    auto found = node_->values.find(name);
+    if (found == node_->values.end() || index < 0) return;
+    auto* values = std::get_if<std::vector<bool>>(&found->second);
+    if (!values || static_cast<std::size_t>(index) >= values->size()) return;
+    (*values)[index] = value;
+    ++state_->write_operations;
+  }
   void WSAI(const char*, int, const char*, MVOdbError* error) override {
     ++state_->write_operations;
     SetOk(error);
@@ -227,6 +289,22 @@ class TrackingOdb final : public MVOdb {
     auto& child = parent.children[name];
     if (!child) child = std::make_unique<Node>();
     return *child;
+  }
+
+  template <typename T>
+  static void AppendValue(Node& node, const std::string& name, T value) {
+    auto found = node.values.find(name);
+    if (found == node.values.end())
+      found = node.values.emplace(name, std::vector<T>{}).first;
+    std::get<std::vector<T>>(found->second).push_back(value);
+  }
+
+  template <typename T>
+  void WriteValue(const char* name, const std::vector<T>& value,
+                  MVOdbError* error) {
+    node_->values[name] = value;
+    ++state_->write_operations;
+    SetOk(error);
   }
 
   void CountCreate(bool create) {
@@ -277,6 +355,12 @@ int main() {
                 "normal load must perform zero create operations");
   okay &= Check(missing.WriteOperations() == 0,
                 "normal load must perform zero write operations");
+  std::string enable_error;
+  okay &= Check(!ana::HistogramEnableControl::Set(
+                    &missing, "QDC0", 0, true, &enable_error) &&
+                    missing.CreateOperations() == 0 &&
+                    missing.WriteOperations() == 0,
+                "channel control must not create a missing compact schema");
 
   TrackingOdb empty_for_initialization;
   const auto initialized =
@@ -297,6 +381,12 @@ int main() {
   }
   okay &= Check(actual_slots == expected_slots && defaults.size() == 521,
                 "default groups should contain all 521 channel slots");
+  okay &= Check(ana::HistogramEnableControl::GroupNames().size() == 8,
+                "enable editor should expose all eight channel groups");
+  for (const auto& group : ana::HistogramEnableControl::GroupNames())
+    okay &= Check(ana::HistogramEnableControl::ChannelCount(group) ==
+                      expected_slots.at(group),
+                  "enable editor channel count should match defaults");
   okay &= Check(initialized.okay,
                 "explicit initialization should succeed on an empty ODB");
   okay &= Check(initialized.created == defaults.size() &&
@@ -306,9 +396,87 @@ int main() {
                 "every default");
   okay &= Check(empty_for_initialization.CreateOperations() > 0 &&
                     empty_for_initialization.WriteOperations() ==
-                        static_cast<int>(defaults.size() * 11),
-                "explicit initialization should create all slot fields for "
-                "every default");
+                        static_cast<int>(expected_slots.size() * 11),
+                "explicit initialization should write 11 arrays per group");
+  okay &= Check(empty_for_initialization.GroupCount() == 9 &&
+                    empty_for_initialization.FieldCount() == 99 &&
+                    empty_for_initialization.ChannelDirectoryCount() == 0 &&
+                    empty_for_initialization.FieldCount() <
+                        defaults.size() * 11 / 10,
+                "compact schema should have 9 groups and only 99 fields");
+  const auto round_trip = loader.Load(&empty_for_initialization);
+  auto actual_configs = round_trip.configs;
+  auto expected_configs = defaults;
+  const auto by_name = [](const ana::HistogramConfig& a,
+                          const ana::HistogramConfig& b) {
+    return a.hist_name < b.hist_name;
+  };
+  std::sort(actual_configs.begin(), actual_configs.end(), by_name);
+  std::sort(expected_configs.begin(), expected_configs.end(), by_name);
+  okay &= Check(actual_configs == expected_configs,
+                "create then load should preserve all 521 configs");
+
+  const int writes_before_enable = empty_for_initialization.WriteOperations();
+  ana::HistogramEnableGroup qdc_group;
+  enable_error.clear();
+  okay &= Check(ana::HistogramEnableControl::Read(
+                    &empty_for_initialization, "QDC0", &qdc_group,
+                    &enable_error) &&
+                    qdc_group.enabled.size() == 32 && !qdc_group.enabled[5],
+                "web control should read the existing QDC0 Enabled array");
+  okay &= Check(empty_for_initialization.WriteOperations() ==
+                    writes_before_enable,
+                "viewing channel checkboxes must not write ODB");
+  okay &= Check(ana::HistogramEnableControl::Set(
+                    &empty_for_initialization, "QDC0", 5, true,
+                    &enable_error),
+                "explicit channel toggle should succeed");
+  const auto enabled_result = loader.Load(&empty_for_initialization);
+  const auto changed = std::find_if(
+      enabled_result.configs.begin(), enabled_result.configs.end(),
+      [](const ana::HistogramConfig& config) {
+        return config.group == "QDC0" && config.slot == "Ch05";
+      });
+  okay &= Check(changed != enabled_result.configs.end() &&
+                    changed->enabled && changed->title == "QDC0 Ch.5" &&
+                    empty_for_initialization.WriteOperations() ==
+                        writes_before_enable + 1,
+                "toggle should change one Enabled element and preserve metadata");
+  okay &= Check(ana::HistogramEnableControl::Set(
+                    &empty_for_initialization, "QDC0", 5, true,
+                    &enable_error) &&
+                    empty_for_initialization.WriteOperations() ==
+                        writes_before_enable + 1,
+                "repeating the same toggle must not write again");
+  okay &= Check(ana::HistogramEnableControl::Set(
+                    &empty_for_initialization, "QDC0", 5, false,
+                    &enable_error),
+                "explicit channel disable should succeed");
+  ana::HistogramEnableGroup disabled_group;
+  okay &= Check(ana::HistogramEnableControl::Read(
+                    &empty_for_initialization, "QDC0", &disabled_group,
+                    &enable_error) &&
+                    !disabled_group.enabled[5] &&
+                    empty_for_initialization.WriteOperations() ==
+                        writes_before_enable + 2,
+                "disable should update only one existing array element");
+  okay &= Check(!ana::HistogramEnableControl::Set(
+                    &empty_for_initialization, "QDC0", 99, true,
+                    &enable_error) &&
+                    !ana::HistogramEnableControl::Set(
+                        &empty_for_initialization, "Unknown", 0, true,
+                        &enable_error) &&
+                    empty_for_initialization.WriteOperations() ==
+                        writes_before_enable + 2,
+                "invalid group and channel must not write ODB");
+
+  empty_for_initialization.TruncateField("QDC0", "Bins");
+  const auto malformed_result = loader.Load(&empty_for_initialization);
+  okay &= Check(!malformed_result.loaded_from_odb &&
+                    malformed_result.configs == defaults,
+                "a mismatched group array should use defaults without writes");
+  okay &= Check(empty_for_initialization.WriteOperations() == 101,
+                "malformed group load must remain read-only");
 
   TrackingOdb existing;
   const ana::HistogramConfig first{"from_odb_a", "TH1D", "event", 10,

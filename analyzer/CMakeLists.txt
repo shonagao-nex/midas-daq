@@ -48,8 +48,12 @@ add_executable(midas_analyzer
   src/ExpressionResolver.cxx
   src/HistogramConfig.cxx
   src/HistogramConfigLoader.cxx
+  src/HistogramEnableControl.cxx
+  src/HistogramEnableWebHandler.cxx
+  src/HistogramEnableHttpServer.cxx
   src/HistogramOdbInitializer.cxx
   src/HistogramManager.cxx
+  src/OnlineHistogramState.cxx
   src/HistogramPdfWriter.cxx
   src/PageConfig.cxx
   src/PageConfigLoader.cxx
@@ -71,6 +75,15 @@ target_compile_options(midas_analyzer PRIVATE
   -Wall
   -Wextra
   -Wpedantic
+)
+
+configure_file(web/histogram_enable.html
+  "${CMAKE_CURRENT_BINARY_DIR}/histogram_enable.html" COPYONLY)
+configure_file(web/online_home.html
+  "${CMAKE_CURRENT_BINARY_DIR}/online_home.html" COPYONLY)
+target_compile_definitions(midas_analyzer PRIVATE
+  ANA_HISTOGRAM_ENABLE_PAGE="file:${CMAKE_CURRENT_BINARY_DIR}/histogram_enable.html"
+  ANA_ROOT_WEB_HOME="${CMAKE_CURRENT_BINARY_DIR}/online_home.html"
 )
 
 target_link_libraries(midas_analyzer PRIVATE
@@ -148,6 +161,7 @@ add_test(NAME analyzer_cli_test COMMAND analyzer_cli_test)
 add_executable(histogram_config_loader_test
   tests/HistogramConfigLoaderTest.cxx
   src/HistogramConfigLoader.cxx
+  src/HistogramEnableControl.cxx
   src/HistogramOdbInitializer.cxx
   src/HistogramConfig.cxx
   src/ExpressionResolver.cxx
@@ -165,6 +179,26 @@ target_link_libraries(histogram_config_loader_test PRIVATE
 )
 add_test(NAME histogram_config_loader_test
   COMMAND histogram_config_loader_test
+)
+
+add_executable(histogram_enable_http_server_test
+  tests/HistogramEnableHttpServerTest.cxx
+  src/HistogramEnableHttpServer.cxx
+)
+target_include_directories(histogram_enable_http_server_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(histogram_enable_http_server_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_compile_definitions(histogram_enable_http_server_test PRIVATE
+  ANA_ROOT_WEB_HOME="${CMAKE_CURRENT_BINARY_DIR}/online_home.html"
+)
+target_link_libraries(histogram_enable_http_server_test PRIVATE ROOT::RHTTP)
+add_test(NAME histogram_enable_http_server_test
+  COMMAND histogram_enable_http_server_test
 )
 
 add_executable(histogram_pdf_writer_test
@@ -215,3 +249,24 @@ target_link_libraries(page_manager_test PRIVATE
   ROOT::Gpad
 )
 add_test(NAME page_manager_test COMMAND page_manager_test)
+
+add_executable(online_histogram_state_test
+  tests/OnlineHistogramStateTest.cxx
+  src/OnlineHistogramState.cxx
+  src/HistogramManager.cxx
+  src/HistogramPdfWriter.cxx
+  src/PageManager.cxx
+  src/PageConfig.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(online_histogram_state_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(online_histogram_state_test PRIVATE
+  -Wall -Wextra -Wpedantic
+)
+target_link_libraries(online_histogram_state_test PRIVATE
+  midas::midas ROOT::Core ROOT::RIO ROOT::Hist ROOT::Graf ROOT::Gpad
+)
+add_test(NAME online_histogram_state_test COMMAND online_histogram_state_test)

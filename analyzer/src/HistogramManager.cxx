@@ -60,6 +60,12 @@ bool HistogramManager::ApplyConfigs(std::vector<HistogramConfig> configs) {
   return true;
 }
 
+bool HistogramManager::ConfigsMatch(
+    const std::vector<HistogramConfig>& configs) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return configs == requested_configs_;
+}
+
 bool HistogramManager::BookLocked() {
   bool all_valid = true;
   for (const auto& config : configs_) {

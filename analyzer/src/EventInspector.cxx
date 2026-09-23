@@ -9,17 +9,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <ctime>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
 
 namespace ana {
 
-EventInspector::EventInspector(TARunInfo* runinfo, EventInspectorOptions options)
+EventInspector::EventInspector(TARunInfo* runinfo, EventInspectorOptions options,
+                               OnlineHistogramState* online_state)
     : TARunObject(runinfo),
       options_(options),
+      online_state_(options.mode == AnalyzerMode::kOnline ? online_state
+                                                       : nullptr),
       builder_([this](const DecodedEvent& event) { ConsumeDecodedEvent(event); }) {
   fModuleName = "EventInspector";
   if (options_.mode == AnalyzerMode::kOffline) {
@@ -29,6 +30,14 @@ EventInspector::EventInspector(TARunInfo* runinfo, EventInspectorOptions options
     // name prevents manalyzer from creating any online ROOT output file.
     runinfo->fRoot->fOutputFileName.clear();
   }
+}
+
+HistogramManager& EventInspector::Histograms() {
+  return online_state_ ? online_state_->histograms : histogram_manager_;
+}
+
+PageManager& EventInspector::Pages() {
+  return online_state_ ? online_state_->pages : page_manager_;
 }
 
 void EventInspector::BeginRun(TARunInfo* runinfo) {
@@ -45,7 +54,6 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
                                ? histogram_config_loader_.Load(runinfo->fOdb)
                                : HistogramConfigLoader::Result{
                                      DefaultHistogramConfigs(), false, false};
-  histogram_manager_.SetConfigs(std::move(histogram_configs.configs));
   if (online && !histogram_configs.odb_path_found) {
     std::fprintf(stderr,
                  "WARNING: %s not found; using in-memory default histogram "
@@ -63,11 +71,14 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
     histogram_parent = output_file;
     if (tree_writer_) tree_writer_->BeginRun(output_file);
   }
-  histogram_manager_.BeginRun(histogram_parent, !online);
   if (online) {
-    page_manager_.BeginRun(TARootHelper::fgDir, &histogram_manager_);
     auto pages = page_config_loader_.Load(runinfo->fOdb);
-    page_manager_.ApplyConfigs(std::move(pages.pages), &histogram_manager_);
+    online_state_->BeginRun(histogram_parent,
+                            std::move(histogram_configs.configs),
+                            std::move(pages.pages), runinfo->fRunNo);
+  } else {
+    histogram_manager_.SetConfigs(std::move(histogram_configs.configs));
+    histogram_manager_.BeginRun(histogram_parent, true);
   }
   next_online_poll_ = std::chrono::steady_clock::now() +
                       std::chrono::seconds(1);
@@ -89,7 +100,7 @@ void EventInspector::ConsumeDecodedEvent(const DecodedEvent& event) {
     return;
   ++decoded_events_;
   if (tree_writer_) tree_writer_->Fill(event);
-  histogram_manager_.Fill(event);
+  Histograms().Fill(event);
   if (options_.decoded_event_limit > 0 &&
       decoded_events_ >= options_.decoded_event_limit)
     decoded_limit_reached_ = true;
@@ -103,65 +114,24 @@ void EventInspector::PollOnlineControls(TARunInfo* runinfo) {
   auto loaded = histogram_config_loader_.Load(runinfo->fOdb);
   const bool histogram_changed =
       loaded.loaded_from_odb &&
-      histogram_manager_.ApplyConfigs(std::move(loaded.configs));
+      !Histograms().ConfigsMatch(loaded.configs);
   if (histogram_changed) {
-    page_manager_.ClearCanvases();
-    page_manager_.Rebuild(&histogram_manager_);
+    Pages().ClearCanvases();
+    Histograms().ApplyConfigs(std::move(loaded.configs));
+    Pages().Rebuild(&Histograms());
     std::printf("HistogramConfigLoader: applied live ODB update (%zu active)\n",
-                histogram_manager_.ActiveCount());
+                Histograms().ActiveCount());
   }
   auto pages = page_config_loader_.Load(runinfo->fOdb);
-  if (page_manager_.ApplyConfigs(std::move(pages.pages),
-                                 &histogram_manager_)) {
+  if (Pages().ApplyConfigs(std::move(pages.pages), &Histograms())) {
     std::printf("PageConfigLoader: applied live page update (%zu pages)\n",
-                page_manager_.ActiveCount());
+                Pages().ActiveCount());
   }
   PollPdfRequest(runinfo);
 }
 
 void EventInspector::PollPdfRequest(TARunInfo* runinfo) {
-  if (!runinfo || !runinfo->fOdb) return;
-  std::unique_ptr<MVOdb> request_directory(
-      runinfo->fOdb->Chdir("Analyzer/HistogramPdf", false));
-  if (!request_directory) return;
-  request_directory->SetPrintError(false);
-
-  bool request = false;
-  MVOdbError error;
-  request_directory->RB("Request", &request, false, &error);
-  if (error.fError || !request) return;
-
-  std::string output_file;
-  error = MVOdbError{};
-  request_directory->RS("OutputFile", &output_file, false, 0, &error);
-  if (error.fError) output_file.clear();
-
-  const std::filesystem::path plot_directory(
-      "/home/daq/midas/midas/plots");
-  if (output_file.empty()) {
-    const std::time_t now = std::time(nullptr);
-    std::tm local{};
-    localtime_r(&now, &local);
-    char timestamp[32];
-    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S",
-                  &local);
-    output_file =
-        (plot_directory /
-         ("run" + std::to_string(runinfo->fRunNo) + "_" + timestamp +
-          ".pdf"))
-            .string();
-  } else if (!std::filesystem::path(output_file).is_absolute()) {
-    output_file = (plot_directory / output_file).string();
-  }
-
-  std::string write_error;
-  if (histogram_pdf_writer_.Write(histogram_manager_, runinfo->fRunNo,
-                                  output_file, &write_error)) {
-    std::printf("HistogramPdfWriter: wrote %s\n", output_file.c_str());
-  }
-
-  // Acknowledge an explicit request even on failure to avoid repeated output.
-  request_directory->WB("Request", false);
+  if (runinfo && online_state_) online_state_->PollPdfRequest(runinfo->fOdb);
 }
 
 void EventInspector::AnalyzeSpecialEvent(TARunInfo*, TMEvent* event) {
@@ -309,16 +279,20 @@ void EventInspector::EndRun(TARunInfo* runinfo) {
   else
     builder_.Finish();
   const auto tree_entries = tree_writer_ ? tree_writer_->Entries() : 0;
-  const auto event_hist_entries = histogram_manager_.Entries("h_event");
-  const auto qdc_hist_entries = histogram_manager_.Entries("h_qdc0_ch0");
-  const auto eadc_hist_entries = histogram_manager_.Entries("h_eadc0_ch0");
+  const auto event_hist_entries = Histograms().Entries("h_event");
+  const auto qdc_hist_entries = Histograms().Entries("h_qdc0_ch0");
+  const auto eadc_hist_entries = Histograms().Entries("h_eadc0_ch0");
   const auto tle_hist_entries =
-      histogram_manager_.Entries("h_tle0_ch0_hit0");
+      Histograms().Entries("h_tle0_ch0_hit0");
   const auto fadc_hist_entries =
-      histogram_manager_.Entries("h_fadc0_ch0_sample0");
+      Histograms().Entries("h_fadc0_ch0_sample0");
   if (tree_writer_) tree_writer_->EndRun();
-  page_manager_.Clear();
-  histogram_manager_.EndRun();
+  if (options_.mode == AnalyzerMode::kOnline) {
+    online_state_->EndRun();
+  } else {
+    page_manager_.Clear();
+    histogram_manager_.EndRun();
+  }
   std::printf("\nRun %d summary\n", runinfo->fRunNo);
   if (options_.mode == AnalyzerMode::kOffline) {
     std::printf("ROOT Events entries : %lld\n",

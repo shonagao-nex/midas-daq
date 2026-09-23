@@ -28,15 +28,17 @@ int main() {
   okay &= Check(online.okay &&
                     online.inspector_options.mode == ana::AnalyzerMode::kOnline,
                 "no -f should select online mode");
-  okay &= Check(Contains(online.manalyzer_arguments, "-R8082"),
-                "online mode should enable the standard ROOT web server");
+  okay &= Check(online.root_web_port == 8082 &&
+                    !Contains(online.manalyzer_arguments, "-R8082"),
+                "online mode should own the wildcard-bound ROOT web server");
 
   const auto explicit_port =
       ana::ParseAnalyzerCli({"midas_analyzer", "-R9090"});
   okay &= Check(explicit_port.okay &&
-                    Contains(explicit_port.manalyzer_arguments, "-R9090"),
+                    explicit_port.root_web_port == 9090 &&
+                    !Contains(explicit_port.manalyzer_arguments, "-R9090"),
                 "an explicit ROOT web port should be preserved");
-  okay &= Check(!Contains(explicit_port.manalyzer_arguments, "-R8082"),
+  okay &= Check(explicit_port.root_web_port != 8082,
                 "the default port must not override an explicit ROOT web port");
 
   const auto normal_online =
@@ -52,6 +54,8 @@ int main() {
                 "--init-hist-odb should select management mode");
   okay &= Check(!Contains(initialize.manalyzer_arguments, "-R8082"),
                 "management mode must not start the ROOT web server");
+  okay &= Check(initialize.root_web_port == 0,
+                "management mode should not configure a ROOT web port");
 
   const auto initialize_with_connection = ana::ParseAnalyzerCli(
       {"midas_analyzer", "--init-hist-odb", "-Hdaqhost", "-Edaq",
@@ -87,8 +91,15 @@ int main() {
   const auto offline = ana::ParseAnalyzerCli(
       {"midas_analyzer", "-f", "/data/run00062.mid.lz4", "-n", "100"});
   okay &= Check(offline.okay && offline.inspector_options.mode ==
-                                      ana::AnalyzerMode::kOffline,
+                                      ana::AnalyzerMode::kOffline &&
+                    offline.root_web_port == 0,
                 "-f should select offline mode");
+  okay &= Check(!ana::ParseAnalyzerCli(
+                     {"midas_analyzer", "-f", "run.mid", "-R9090"}).okay,
+                "offline mode must not start a ROOT web server");
+  okay &= Check(!ana::ParseAnalyzerCli({"midas_analyzer", "-R0"}).okay &&
+                    !ana::ParseAnalyzerCli({"midas_analyzer", "-R65536"}).okay,
+                "invalid ROOT web ports should be rejected");
   okay &= Check(offline.output_file ==
                     "/home/daq/midas/midas/rootfiles/run00062.root",
                 "offline default filename should strip .mid.lz4");

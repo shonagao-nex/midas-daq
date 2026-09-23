@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Histogram channels</title>
+  <style>
+    body { font: 15px system-ui, sans-serif; margin: 1.5rem; color: #222; }
+    header { display: flex; align-items: baseline; gap: 1.5rem; }
+    a { color: #075ca7; }
+    section { border: 1px solid #bbb; border-radius: .4rem; margin: 1rem 0; padding: 1rem; }
+    h2 { margin: 0 0 .6rem; }
+    .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr)); gap: .4rem; }
+    label { white-space: nowrap; }
+    input { margin-right: .35rem; }
+    .error { color: #a00; }
+    .pending { color: #805000; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Histogram channels</h1>
+    <a href="../../default.htm">ROOT objects</a>
+  </header>
+  <p>Each checkbox saves one element of the existing Enabled[] array.</p>
+  <p id="status" role="status">Connecting…</p>
+  <main id="groups"></main>
+  <script>
+    const groups = document.getElementById("groups");
+    const status = document.getElementById("status");
+    const socketUrl = new URL("root.websocket", location.href);
+    socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(socketUrl);
+    const sections = new Map();
+    socket.onopen = () => { status.textContent = "Connected"; };
+    socket.onclose = () => {
+      status.textContent = "Disconnected; reload to reconnect";
+      status.className = "error";
+      groups.querySelectorAll("input").forEach(input => input.disabled = true);
+    };
+    socket.onerror = () => { status.textContent = "Connection error"; status.className = "error"; };
+    socket.onmessage = event => {
+      const [kind, group, payload] = String(event.data).split("\t");
+      if (kind === "ERROR") {
+        const section = sections.get(group);
+        if (section) section.querySelectorAll("input").forEach(input => {
+          input.checked = input.dataset.saved === "1";
+          input.disabled = false;
+        });
+        const target = section?.querySelector(".message") || status;
+        target.textContent = payload || "Unable to load group";
+        target.className = "message error";
+        return;
+      }
+      if (kind !== "STATE" || !/^[A-Z0-9]+$/.test(group) ||
+          !/^[01]+$/.test(payload)) return;
+      let section = sections.get(group);
+      if (!section) {
+        section = document.createElement("section");
+        const heading = document.createElement("h2");
+        heading.textContent = group;
+        section.append(heading);
+        const message = document.createElement("p");
+        message.className = "message";
+        section.append(message);
+        const channels = document.createElement("div");
+        channels.className = "channels";
+        section.append(channels);
+        groups.append(section);
+        sections.set(group, section);
+      }
+      const channels = section.querySelector(".channels");
+      if (channels.children.length !== payload.length) {
+        channels.replaceChildren();
+        for (let index = 0; index < payload.length; ++index) {
+          const label = document.createElement("label");
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.dataset.index = index;
+          checkbox.addEventListener("change", () => {
+            checkbox.disabled = true;
+            section.querySelector(".message").textContent = "Saving…";
+            section.querySelector(".message").className = "message pending";
+            socket.send(`SET ${group} ${index} ${checkbox.checked ? 1 : 0}`);
+          });
+          label.append(checkbox, document.createTextNode(
+              `Ch${String(index).padStart(2, "0")}`));
+          channels.append(label);
+        }
+      }
+      [...channels.querySelectorAll("input")].forEach((checkbox, index) => {
+        checkbox.checked = payload[index] === "1";
+        checkbox.dataset.saved = payload[index];
+        checkbox.disabled = false;
+      });
+      const message = section.querySelector(".message");
+      message.textContent = "Saved / current ODB state";
+      message.className = "message";
+    };
+  </script>
+</body>
+</html>
