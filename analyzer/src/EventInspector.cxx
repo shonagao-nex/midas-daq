@@ -1,47 +1,147 @@
 #include "EventInspector.h"
 
 #include "midasio.h"
+#include "mvodb.h"
+
+#include "TDirectory.h"
+#include "TFile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <limits>
+#include <memory>
+#include <string>
 
 namespace ana {
 
-EventInspector::EventInspector(TARunInfo* runinfo)
+EventInspector::EventInspector(TARunInfo* runinfo, EventInspectorOptions options)
     : TARunObject(runinfo),
-      builder_([this](const DecodedEvent& event) {
-        tree_writer_.Fill(event);
-        histogram_manager_.Fill(event);
-      }) {
+      options_(options),
+      builder_([this](const DecodedEvent& event) { ConsumeDecodedEvent(event); }) {
   fModuleName = "EventInspector";
+  if (options_.mode == AnalyzerMode::kOffline) {
+    tree_writer_ = std::make_unique<RootTreeWriter>();
+  } else if (runinfo && runinfo->fRoot) {
+    // Run objects are constructed before TARootHelper::Init(). Clearing this
+    // name prevents manalyzer from creating any online ROOT output file.
+    runinfo->fRoot->fOutputFileName.clear();
+  }
 }
 
 void EventInspector::BeginRun(TARunInfo* runinfo) {
   detailed_printed_ = 0;
+  decoded_events_ = 0;
   malformed_events_ = 0;
+  decoded_limit_reached_ = false;
   event_ids_.clear();
   vme_ = SourceStatistics{};
   easiroc_ = SourceStatistics{};
   builder_.Clear();
-  const bool online = runinfo->fFileName.empty();
-  auto histogram_configs =
-      histogram_config_loader_.Load(runinfo->fOdb, online);
+  const bool online = options_.mode == AnalyzerMode::kOnline;
+  auto histogram_configs = online
+                               ? histogram_config_loader_.Load(runinfo->fOdb,
+                                                               true)
+                               : HistogramConfigLoader::Result{
+                                     DefaultHistogramConfigs(), false, false};
   histogram_manager_.SetConfigs(std::move(histogram_configs.configs));
   std::printf("HistogramConfigLoader: using %s configuration%s\n",
               histogram_configs.loaded_from_odb ? "ODB" : "default",
               histogram_configs.created_defaults ? " (newly created)" : "");
-  TFile* output_file = runinfo->fRoot ? runinfo->fRoot->fOutputFile : nullptr;
-  tree_writer_.BeginRun(output_file);
-  histogram_manager_.BeginRun(output_file);
+  TDirectory* histogram_parent = nullptr;
+  if (online) {
+    histogram_parent = TARootHelper::fgDir;
+  } else {
+    TFile* output_file = runinfo->fRoot ? runinfo->fRoot->fOutputFile : nullptr;
+    histogram_parent = output_file;
+    if (tree_writer_) tree_writer_->BeginRun(output_file);
+  }
+  histogram_manager_.BeginRun(histogram_parent, !online);
+  next_online_poll_ = std::chrono::steady_clock::now() +
+                      std::chrono::seconds(1);
   std::printf("EventInspector: begin run %d, file %s\n", runinfo->fRunNo,
               runinfo->fFileName.c_str());
 }
 
-TAFlowEvent* EventInspector::Analyze(TARunInfo*, TMEvent* event, TAFlags*,
-                                     TAFlowEvent* flow) {
+TAFlowEvent* EventInspector::Analyze(TARunInfo* runinfo, TMEvent* event,
+                                     TAFlags* flags, TAFlowEvent* flow) {
+  if (options_.mode == AnalyzerMode::kOnline) PollOnlineControls(runinfo);
   if (event) InspectEvent(*event);
+  if (decoded_limit_reached_ && flags) *flags |= TAFlag_QUIT;
   return flow;
+}
+
+void EventInspector::ConsumeDecodedEvent(const DecodedEvent& event) {
+  if (options_.decoded_event_limit > 0 &&
+      decoded_events_ >= options_.decoded_event_limit)
+    return;
+  ++decoded_events_;
+  if (tree_writer_) tree_writer_->Fill(event);
+  histogram_manager_.Fill(event);
+  if (options_.decoded_event_limit > 0 &&
+      decoded_events_ >= options_.decoded_event_limit)
+    decoded_limit_reached_ = true;
+}
+
+void EventInspector::PollOnlineControls(TARunInfo* runinfo) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now < next_online_poll_) return;
+  next_online_poll_ = now + std::chrono::seconds(1);
+
+  auto loaded = histogram_config_loader_.Load(runinfo->fOdb, false);
+  if (loaded.loaded_from_odb &&
+      histogram_manager_.ApplyConfigs(std::move(loaded.configs))) {
+    std::printf("HistogramConfigLoader: applied live ODB update (%zu active)\n",
+                histogram_manager_.ActiveCount());
+  }
+  PollPdfRequest(runinfo);
+}
+
+void EventInspector::PollPdfRequest(TARunInfo* runinfo) {
+  if (!runinfo || !runinfo->fOdb) return;
+  std::unique_ptr<MVOdb> request_directory(
+      runinfo->fOdb->Chdir("Analyzer/HistogramPdf", false));
+  if (!request_directory) return;
+  request_directory->SetPrintError(false);
+
+  bool request = false;
+  MVOdbError error;
+  request_directory->RB("Request", &request, false, &error);
+  if (error.fError || !request) return;
+
+  std::string output_file;
+  error = MVOdbError{};
+  request_directory->RS("OutputFile", &output_file, false, 0, &error);
+  if (error.fError) output_file.clear();
+
+  const std::filesystem::path plot_directory(
+      "/home/daq/midas/midas/plots");
+  if (output_file.empty()) {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    char timestamp[32];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S",
+                  &local);
+    output_file =
+        (plot_directory /
+         ("run" + std::to_string(runinfo->fRunNo) + "_" + timestamp +
+          ".pdf"))
+            .string();
+  } else if (!std::filesystem::path(output_file).is_absolute()) {
+    output_file = (plot_directory / output_file).string();
+  }
+
+  std::string write_error;
+  if (histogram_pdf_writer_.Write(histogram_manager_, runinfo->fRunNo,
+                                  output_file, &write_error)) {
+    std::printf("HistogramPdfWriter: wrote %s\n", output_file.c_str());
+  }
+
+  // Acknowledge an explicit request even on failure to avoid repeated output.
+  request_directory->WB("Request", false);
 }
 
 void EventInspector::AnalyzeSpecialEvent(TARunInfo*, TMEvent* event) {
@@ -184,8 +284,11 @@ void EventInspector::PrintSourceSummary(
 }
 
 void EventInspector::EndRun(TARunInfo* runinfo) {
-  builder_.Finish();
-  const auto tree_entries = tree_writer_.Entries();
+  if (decoded_limit_reached_)
+    builder_.DiscardPending();
+  else
+    builder_.Finish();
+  const auto tree_entries = tree_writer_ ? tree_writer_->Entries() : 0;
   const auto event_hist_entries = histogram_manager_.Entries("h_event");
   const auto qdc_hist_entries = histogram_manager_.Entries("h_qdc0_ch0");
   const auto eadc_hist_entries = histogram_manager_.Entries("h_eadc0_ch0");
@@ -193,11 +296,15 @@ void EventInspector::EndRun(TARunInfo* runinfo) {
       histogram_manager_.Entries("h_tle0_ch0_hit0");
   const auto fadc_hist_entries =
       histogram_manager_.Entries("h_fadc0_ch0_sample0");
-  tree_writer_.EndRun();
+  if (tree_writer_) tree_writer_->EndRun();
   histogram_manager_.EndRun();
   std::printf("\nRun %d summary\n", runinfo->fRunNo);
-  std::printf("ROOT Events entries : %lld\n",
-              static_cast<long long>(tree_entries));
+  if (options_.mode == AnalyzerMode::kOffline) {
+    std::printf("ROOT Events entries : %lld\n",
+                static_cast<long long>(tree_entries));
+  } else {
+    std::printf("Decoded events      : %zu\n", decoded_events_);
+  }
   PrintSourceSummary("EASIROC", easiroc_);
   PrintSourceSummary("VME", vme_);
 

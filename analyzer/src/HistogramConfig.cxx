@@ -8,6 +8,17 @@
 
 namespace ana {
 
+bool operator==(const HistogramConfig& left, const HistogramConfig& right) {
+  return left.hist_name == right.hist_name && left.type == right.type &&
+         left.expression == right.expression && left.bins == right.bins &&
+         left.min == right.min && left.max == right.max &&
+         left.cut == right.cut && left.enabled == right.enabled;
+}
+
+bool operator!=(const HistogramConfig& left, const HistogramConfig& right) {
+  return !(left == right);
+}
+
 std::vector<HistogramConfig> DefaultHistogramConfigs() {
   return {
       {"h_qdc0_ch0", "TH1D", "qdc0[0]", 4096, 0.0, 4096.0, "", true},

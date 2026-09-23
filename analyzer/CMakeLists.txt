@@ -13,7 +13,7 @@ endif()
 
 set(ROOTANA_DIR "/home/daq/midas/rootana" CACHE PATH "ROOTANA installation prefix")
 
-find_package(ROOT REQUIRED COMPONENTS Core RIO Tree Hist)
+find_package(ROOT REQUIRED COMPONENTS Core RIO Tree Hist Graf Gpad)
 
 if(NOT EXISTS "${MIDASSYS}/lib/midas-targets.cmake")
   message(FATAL_ERROR "MIDAS CMake targets not found below MIDASSYS=${MIDASSYS}")
@@ -41,6 +41,7 @@ ROOT_GENERATE_DICTIONARY(G__RootTreeTypes
 
 add_executable(midas_analyzer
   src/analyzer_main.cxx
+  src/AnalyzerCli.cxx
   src/EventInspector.cxx
   src/EventBuilder.cxx
   src/RootTreeWriter.cxx
@@ -48,6 +49,7 @@ add_executable(midas_analyzer
   src/HistogramConfig.cxx
   src/HistogramConfigLoader.cxx
   src/HistogramManager.cxx
+  src/HistogramPdfWriter.cxx
   "${CMAKE_CURRENT_BINARY_DIR}/G__RootTreeTypes.cxx"
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
@@ -124,3 +126,41 @@ target_link_libraries(histogram_manager_test PRIVATE
   ROOT::Hist
 )
 add_test(NAME histogram_manager_test COMMAND histogram_manager_test)
+
+add_executable(analyzer_cli_test
+  tests/AnalyzerCliTest.cxx
+  src/AnalyzerCli.cxx
+)
+target_include_directories(analyzer_cli_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(analyzer_cli_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+add_test(NAME analyzer_cli_test COMMAND analyzer_cli_test)
+
+add_executable(histogram_pdf_writer_test
+  tests/HistogramPdfWriterTest.cxx
+  src/HistogramPdfWriter.cxx
+  src/HistogramManager.cxx
+  src/HistogramConfig.cxx
+  src/ExpressionResolver.cxx
+)
+target_include_directories(histogram_pdf_writer_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(histogram_pdf_writer_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_link_libraries(histogram_pdf_writer_test PRIVATE
+  ROOT::Core
+  ROOT::RIO
+  ROOT::Hist
+  ROOT::Graf
+  ROOT::Gpad
+)
+add_test(NAME histogram_pdf_writer_test COMMAND histogram_pdf_writer_test)

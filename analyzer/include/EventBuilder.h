@@ -43,6 +43,7 @@ class EventBuilder {
 
   void AddEvent(TMEvent& event, RawEventSource source);
   void Finish();
+  void DiscardPending();
   void Clear();
 
   const Statistics& GetStatistics() const { return statistics_; }

@@ -27,7 +27,8 @@ int main() {
 
   TMemFile output("histogram_manager_test.root", "RECREATE");
   ana::HistogramManager manager(configs);
-  bool okay = Check(manager.BeginRun(&output), "valid configs should book");
+  bool okay =
+      Check(manager.BeginRun(&output, false), "valid configs should book");
 
   ana::DecodedEvent event;
   event.counters.event = 1;
@@ -50,6 +51,28 @@ int main() {
                 "enabled histogram should be booked");
   okay &= Check(directory && !directory->Get("disabled"),
                 "disabled histogram should not be booked");
+
+  const std::vector<ana::HistogramConfig> reloaded{
+      {"enabled", "TH1D", "qdc0[1]", 20, 0.0, 2000.0, "", true},
+      {"added", "TH1D", "event", 10, 0.0, 10.0, "", true},
+  };
+  okay &= Check(manager.ApplyConfigs(reloaded),
+                "changed configuration should be applied");
+  okay &= Check(manager.ActiveCount() == 2,
+                "reload should add and remove histograms");
+  okay &= Check(manager.Entries("enabled") == 0,
+                "expression/binning change should reset contents");
+  okay &= Check(directory && !directory->Get("missing_nested") &&
+                    directory->Get("added"),
+                "reload should remove stale object and book new object");
+
+  auto disabled_reload = reloaded;
+  disabled_reload[0].enabled = false;
+  okay &= Check(manager.ApplyConfigs(disabled_reload),
+                "Enabled change should be applied");
+  okay &= Check(manager.ActiveCount() == 1 &&
+                    directory && !directory->Get("enabled"),
+                "disabled object should be deleted");
   manager.EndRun();
 
   if (!okay) return 1;

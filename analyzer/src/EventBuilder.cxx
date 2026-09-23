@@ -117,6 +117,8 @@ void EventBuilder::Finish() {
   }
 }
 
+void EventBuilder::DiscardPending() { pending_.clear(); }
+
 void EventBuilder::Clear() {
   pending_.clear();
   statistics_ = Statistics{};

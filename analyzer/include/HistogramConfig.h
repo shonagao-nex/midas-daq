@@ -18,6 +18,9 @@ struct HistogramConfig {
   bool enabled = true;
 };
 
+bool operator==(const HistogramConfig& left, const HistogramConfig& right);
+bool operator!=(const HistogramConfig& left, const HistogramConfig& right);
+
 struct HistogramConfigValidationResult {
   std::vector<HistogramConfig> configs;
   std::size_t skipped = 0;

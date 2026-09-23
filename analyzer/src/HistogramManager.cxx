@@ -1,7 +1,7 @@
 #include "HistogramManager.h"
 
 #include "TDirectory.h"
-#include "TFile.h"
+#include "TH1.h"
 #include "TH1D.h"
 
 #include <cstdio>
@@ -9,33 +9,58 @@
 
 namespace ana {
 
+HistogramManager::HistogramManager() = default;
+
 HistogramManager::HistogramManager(std::vector<HistogramConfig> configs) {
   SetConfigs(std::move(configs));
 }
 
+HistogramManager::~HistogramManager() { EndRun(); }
+
 void HistogramManager::SetConfigs(std::vector<HistogramConfig> configs) {
-  EndRun();
+  std::lock_guard<std::mutex> lock(mutex_);
+  requested_configs_ = configs;
   auto validation = ValidateHistogramConfigs(configs);
   configs_ = std::move(validation.configs);
 }
 
-bool HistogramManager::BeginRun(TFile* output_file) {
-  EndRun();
-  if (!output_file || !output_file->IsOpen() || output_file->IsZombie()) {
+bool HistogramManager::BeginRun(TDirectory* parent_directory,
+                                bool write_at_end) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ClearHistogramsLocked(false);
+  if (!parent_directory) {
     std::fprintf(stderr,
-                 "ERROR: HistogramManager cannot use an invalid ROOT file\n");
+                 "ERROR: HistogramManager cannot use a null ROOT directory\n");
     return false;
   }
 
-  output_file->cd();
-  directory_ = output_file->GetDirectory("Histograms");
-  if (!directory_) directory_ = output_file->mkdir("Histograms");
+  parent_directory->cd();
+  directory_ = parent_directory->GetDirectory("Histograms");
+  if (!directory_) directory_ = parent_directory->mkdir("Histograms");
   if (!directory_) {
     std::fprintf(stderr,
                  "ERROR: HistogramManager cannot create Histograms directory\n");
     return false;
   }
+  write_at_end_ = write_at_end;
+  return BookLocked();
+}
 
+bool HistogramManager::ApplyConfigs(std::vector<HistogramConfig> configs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (configs == requested_configs_) return false;
+
+  requested_configs_ = configs;
+  auto validation = ValidateHistogramConfigs(configs);
+  configs_ = std::move(validation.configs);
+  if (!directory_) return true;
+
+  ClearHistogramsLocked(false);
+  BookLocked();
+  return true;
+}
+
+bool HistogramManager::BookLocked() {
   bool all_valid = true;
   for (const auto& config : configs_) {
     if (!config.enabled) continue;
@@ -50,17 +75,18 @@ bool HistogramManager::BeginRun(TFile* output_file) {
       continue;
     }
 
-    directory_->cd();
-    auto* object = new TH1D(config.hist_name.c_str(), config.hist_name.c_str(),
-                            config.bins, config.min, config.max);
+    auto object = std::make_unique<TH1D>(
+        config.hist_name.c_str(), config.hist_name.c_str(), config.bins,
+        config.min, config.max);
     object->SetDirectory(directory_);
-    histograms_.push_back({config, std::move(expression), object});
+    histograms_.push_back(
+        {config, std::move(expression), std::move(object)});
   }
-  output_file->cd();
   return all_valid;
 }
 
 void HistogramManager::Fill(const DecodedEvent& event) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (auto& histogram : histograms_) {
     const ResolveResult result = resolver_.Resolve(histogram.expression, event);
     if (result.valid) histogram.object->Fill(result.value);
@@ -68,16 +94,49 @@ void HistogramManager::Fill(const DecodedEvent& event) {
 }
 
 void HistogramManager::EndRun() {
-  histograms_.clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  ClearHistogramsLocked(write_at_end_);
   directory_ = nullptr;
+  write_at_end_ = false;
 }
 
 std::int64_t HistogramManager::Entries(const std::string& hist_name) const {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& histogram : histograms_) {
     if (histogram.config.hist_name == hist_name)
       return static_cast<std::int64_t>(histogram.object->GetEntries());
   }
   return 0;
+}
+
+std::vector<std::unique_ptr<TH1>> HistogramManager::Snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::unique_ptr<TH1>> snapshots;
+  snapshots.reserve(histograms_.size());
+  for (const auto& histogram : histograms_) {
+    auto* clone = dynamic_cast<TH1*>(histogram.object->Clone());
+    if (!clone) continue;
+    clone->SetDirectory(nullptr);
+    snapshots.emplace_back(clone);
+  }
+  return snapshots;
+}
+
+std::size_t HistogramManager::ActiveCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return histograms_.size();
+}
+
+void HistogramManager::ClearHistogramsLocked(bool write) {
+  if (write && directory_) {
+    directory_->cd();
+    for (const auto& histogram : histograms_)
+      histogram.object->Write(histogram.config.hist_name.c_str(),
+                              TObject::kOverwrite);
+  }
+  for (auto& histogram : histograms_)
+    histogram.object->SetDirectory(nullptr);
+  histograms_.clear();
 }
 
 }  // namespace ana
