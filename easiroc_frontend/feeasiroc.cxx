@@ -2,6 +2,7 @@
 #include "mfe.h"
 
 #include "easiroc_daq_control.h"
+#include "easiroc_diagnostic_log.h"
 #include "easiroc_last_applied.h"
 #include "easiroc_manual_apply.h"
 #include "easiroc_readout.h"
@@ -125,6 +126,7 @@ struct FrontendState {
   std::deque<easiroc::DecodedEvent> pending_events;
   bool daq_start_attempted = false;
   RuntimeState runtime;
+  easiroc::DiagnosticLogPolicy diagnostic_log;
   easiroc::ManualApplyStatus asic_apply;
   daq::BufferClearStatus buffer_clear;
   std::string buffer_clear_result = "Not requested";
@@ -1532,6 +1534,7 @@ void reset_software_readout_state() {
 void set_disabled_runtime_state() {
   reset_software_readout_state();
   g_state.runtime = {};
+  g_state.diagnostic_log.reset();
   g_state.firmware_observation = {};
   set_firmware_readback_valid(false);
 }
@@ -1620,13 +1623,24 @@ void publish_completed_diagnostic() {
     }
   }
 
-  if (result->rbcp_communication_ok && result->tcp_reachable) {
-    cm_msg(MINFO, "update_status",
-           "Read-only status OK: RBCP firmware read and TCP port 24 probe "
-           "succeeded");
-  } else {
-    cm_msg(MERROR, "update_status", "Read-only status failed: %s",
-           result->error.c_str());
+  switch (g_state.diagnostic_log.observe(result->rbcp_communication_ok &&
+                                         result->tcp_reachable)) {
+    case easiroc::DiagnosticLogEvent::kInitialOk:
+      cm_msg(MINFO, "update_status",
+             "EASIROC communication check OK: RBCP firmware read and "
+             "TCP port 24 probe succeeded");
+      break;
+    case easiroc::DiagnosticLogEvent::kRestored:
+      cm_msg(MINFO, "update_status",
+             "EASIROC communication restored: RBCP firmware read and "
+             "TCP port 24 probe succeeded");
+      break;
+    case easiroc::DiagnosticLogEvent::kError:
+      cm_msg(MERROR, "update_status", "Read-only status failed: %s",
+             result->error.c_str());
+      break;
+    case easiroc::DiagnosticLogEvent::kNoLog:
+      break;
   }
 }
 

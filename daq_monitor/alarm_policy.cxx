@@ -80,9 +80,17 @@ std::string format_alarm_message(const AlarmObservation& observation) {
 
 AlarmDecision decide_alarm_transition(
     const AlarmRuntimeState& current,
-    const AlarmObservation& observation) {
+    const AlarmObservation& observation,
+    bool alarm_system_active) {
   AlarmDecision decision;
   decision.next_state = current;
+  if (!alarm_system_active) {
+    // MIDAS suppresses al_trigger_alarm() while disabled. Reset existing
+    // alarms and forget the local level so enabling uses current status.
+    decision.reset = true;
+    decision.next_state = {};
+    return decision;
+  }
   const AlarmLevel target = observation.alarm_suppressed
                                 ? AlarmLevel::kInactive
                                 : alarm_level_from_severity(observation.severity);

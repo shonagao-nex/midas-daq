@@ -341,9 +341,11 @@ bool apply_alarm_decision(const char* alarm_name,
 bool update_component_alarm(
     const char* alarm_name,
     daq_monitor::AlarmRuntimeState* runtime_state,
-    const daq_monitor::AlarmObservation& observation) {
+    const daq_monitor::AlarmObservation& observation,
+    bool alarm_system_active) {
   const daq_monitor::AlarmDecision decision =
-      daq_monitor::decide_alarm_transition(*runtime_state, observation);
+      daq_monitor::decide_alarm_transition(*runtime_state, observation,
+                                           alarm_system_active);
   if (!apply_alarm_decision(alarm_name, decision))
     return false;
   *runtime_state = decision.next_state;
@@ -365,6 +367,11 @@ bool update_alarms() {
   INT run_state = 0;
   BOOL vme_connected = FALSE;
   BOOL easiroc_connected = FALSE;
+  BOOL alarm_system_active = FALSE;
+
+  if (!read_value("/Alarms/Alarm system active", TID_BOOL,
+                  &alarm_system_active))
+    return false;
 
   const bool vme_ok =
       read_string("/DAQ/Status/Frontends/VME/Severity", &vme_severity) &&
@@ -423,11 +430,14 @@ bool update_alarms() {
       disk_ok ? disk_detail : "", now_unix};
 
   bool ok = true;
-  ok = update_component_alarm("DAQ_VME", &gVmeAlarmState, vme) && ok;
+  ok = update_component_alarm("DAQ_VME", &gVmeAlarmState, vme,
+                              alarm_system_active != FALSE) && ok;
   ok = update_component_alarm("DAQ_EASIROC", &gEasirocAlarmState,
-                              easiroc) && ok;
-  ok = update_component_alarm("DAQ_LOGGER", &gLoggerAlarmState, logger) && ok;
-  ok = update_component_alarm("DAQ_DISK", &gDiskAlarmState, disk) && ok;
+                              easiroc, alarm_system_active != FALSE) && ok;
+  ok = update_component_alarm("DAQ_LOGGER", &gLoggerAlarmState, logger,
+                              alarm_system_active != FALSE) && ok;
+  ok = update_component_alarm("DAQ_DISK", &gDiskAlarmState, disk,
+                              alarm_system_active != FALSE) && ok;
   return ok;
 }
 

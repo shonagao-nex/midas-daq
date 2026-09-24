@@ -52,9 +52,11 @@ AlarmObservation observation(const char* component, const char* severity,
 }
 
 void apply_observation(AlarmRuntimeState* state, FakeAlarmApi* api,
-                       const AlarmObservation& value) {
+                       const AlarmObservation& value,
+                       bool alarm_system_active = true) {
   const AlarmDecision decision =
-      daq_monitor::decide_alarm_transition(*state, value);
+      daq_monitor::decide_alarm_transition(*state, value,
+                                           alarm_system_active);
   api->apply(decision);
   *state = decision.next_state;
 }
@@ -115,6 +117,31 @@ void test_warning_and_escalation() {
   EXPECT(api.reset_count == 2);
   EXPECT(api.trigger_count == 2);
   EXPECT(api.level == AlarmLevel::kError);
+}
+
+void test_alarm_system_off_then_on() {
+  AlarmRuntimeState state;
+  FakeAlarmApi api;
+  const auto error = observation("VME", "ERROR", "VME event slip detected");
+
+  apply_observation(&state, &api, error, false);
+  EXPECT(!api.active);
+  EXPECT(api.trigger_count == 0);
+  EXPECT(!state.initialized);
+
+  apply_observation(&state, &api, error, true);
+  EXPECT(api.active);
+  EXPECT(api.trigger_count == 1);
+
+  apply_observation(&state, &api, error, false);
+  EXPECT(!api.active);
+  EXPECT(!state.initialized);
+  apply_observation(&state, &api, observation("VME", "OK", "VME OK"),
+                    false);
+  apply_observation(&state, &api, observation("VME", "OK", "VME OK"),
+                    true);
+  EXPECT(!api.active);
+  EXPECT(api.trigger_count == 1);
 }
 
 void test_policy_inputs() {
@@ -437,6 +464,7 @@ void test_unknown_and_message() {
 int main() {
   test_vme_lifecycle();
   test_warning_and_escalation();
+  test_alarm_system_off_then_on();
   test_policy_inputs();
   test_unknown_and_message();
 

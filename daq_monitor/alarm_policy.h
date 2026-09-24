@@ -47,7 +47,8 @@ bool suppress_frontend_disconnect_alarm(RunState run_state, bool connected,
 std::string format_alarm_message(const AlarmObservation& observation);
 AlarmDecision decide_alarm_transition(
     const AlarmRuntimeState& current,
-    const AlarmObservation& observation);
+    const AlarmObservation& observation,
+    bool alarm_system_active = true);
 
 }  // namespace daq_monitor
 

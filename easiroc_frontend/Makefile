@@ -14,7 +14,7 @@ BIN_TEST_DIR := $(BIN_DIR)/tests
 
 PRODUCTION_TARGET := $(BIN_DIR)/feeasiroc
 TEST_NAMES := easiroc_test easiroc_event_test easiroc_stream_test \
-	easiroc_daq_control_test easiroc_slow_control_test \
+	easiroc_daq_control_test easiroc_diagnostic_log_test easiroc_slow_control_test \
 	easiroc_run_settings_test easiroc_asic_apply_test easiroc_manual_apply_test \
 	easiroc_last_applied_test \
 	manual_buffer_clear_test \
@@ -74,6 +74,7 @@ $(TEST_NAMES): %: $(BIN_TEST_DIR)/%
 
 check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	$(BIN_TEST_DIR)/easiroc_daq_control_test $(BIN_TEST_DIR)/easiroc_slow_control_test \
+	$(BIN_TEST_DIR)/easiroc_diagnostic_log_test \
 	$(BIN_TEST_DIR)/easiroc_run_settings_test \
 	$(BIN_TEST_DIR)/easiroc_asic_apply_test \
 	$(BIN_TEST_DIR)/easiroc_manual_apply_test \
@@ -86,6 +87,7 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	./$(BIN_TEST_DIR)/easiroc_event_test
 	./$(BIN_TEST_DIR)/easiroc_stream_test
 	./$(BIN_TEST_DIR)/easiroc_daq_control_test
+	./$(BIN_TEST_DIR)/easiroc_diagnostic_log_test
 	./$(BIN_TEST_DIR)/easiroc_slow_control_test
 	./$(BIN_TEST_DIR)/easiroc_run_settings_test
 	./$(BIN_TEST_DIR)/easiroc_asic_apply_test
@@ -110,6 +112,11 @@ $(BIN_TEST_DIR)/easiroc_stream_test: $(STREAM_TEST_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
 $(BIN_TEST_DIR)/easiroc_daq_control_test: $(DAQ_TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+$(BIN_TEST_DIR)/easiroc_diagnostic_log_test: \
+		$(BUILD_DIR)/tests/easiroc_diagnostic_log_test.o
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
@@ -172,7 +179,8 @@ $(PRODUCTION_TARGET): $(FEEASIROC_OBJECTS)
 $(BUILD_DIR)/feeasiroc.o: CPPFLAGS += $(MIDAS_CPPFLAGS)
 $(BUILD_DIR)/feeasiroc.o: feeasiroc.cxx easiroc_daq_control.h easiroc_run_settings.h \
 	easiroc_manual_apply.h easiroc_asic_apply.h easiroc_slow_control.h \
-	easiroc_last_applied.h easiroc_status.h easiroc_stream.h easiroc_readout.h rbcp.h tcp_probe.h
+	easiroc_last_applied.h easiroc_status.h easiroc_stream.h easiroc_readout.h \
+	easiroc_diagnostic_log.h rbcp.h tcp_probe.h
 
 $(BUILD_DIR)/manual_buffer_clear.o: ../common/manual_buffer_clear.cxx \
 	../common/manual_buffer_clear.h
@@ -194,6 +202,7 @@ $(BUILD_DIR)/easiroc_stream.o: easiroc_stream.cxx easiroc_stream.h easiroc_event
 $(BUILD_DIR)/tests/easiroc_stream_test.o: tests/easiroc_stream_test.cxx easiroc_stream.h easiroc_event.h
 $(BUILD_DIR)/easiroc_daq_control.o: easiroc_daq_control.cxx easiroc_daq_control.h
 $(BUILD_DIR)/tests/easiroc_daq_control_test.o: tests/easiroc_daq_control_test.cxx easiroc_daq_control.h
+$(BUILD_DIR)/tests/easiroc_diagnostic_log_test.o: tests/easiroc_diagnostic_log_test.cxx easiroc_diagnostic_log.h
 $(BUILD_DIR)/easiroc_slow_control.o: easiroc_slow_control.cxx easiroc_slow_control.h
 $(BUILD_DIR)/tests/easiroc_slow_control_test.o: tests/easiroc_slow_control_test.cxx easiroc_slow_control.h
 $(BUILD_DIR)/easiroc_run_settings.o: easiroc_run_settings.cxx easiroc_run_settings.h

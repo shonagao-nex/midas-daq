@@ -96,9 +96,13 @@ range can be switched between 10 minutes, 30 minutes, 1 hour, 6 hours,
 cleared by a reload. Recent messages come from MIDAS JSON-RPC
 `cm_msg_retrieve`; the standard Messages and Status links remain available.
 
-The Alarm ON/OFF control affects only the browser beep and is stored in
-`localStorage`. It does not change any MIDAS alarm. A short Web Audio beep is
-requested only on a new transition into global ERROR.
+The Alarm ON/OFF control reads and writes `/Alarms/Alarm system active` and
+confirms each write by reading it back. MIDAS supplies the standard alarm beep;
+the DAQ page disables TALK speech in the browser and stops any sound playing in
+that tab when Alarm is switched off. Status collection and the
+Severity/Reason display continue while the alarm system is off. On re-enable,
+`daq_monitor` evaluates the current status and triggers only alarms that are
+still active.
 
 ## EASIROC slow-control page
 
@@ -170,6 +174,17 @@ It also reads the standard MIDAS statistics fields `Events per sec.`,
 
 The two physics streams are shown separately. Their counters are not summed,
 because they can represent correlated but non-identical event streams.
+
+Acquisition Time writes `/Logger/Run duration` in seconds. MIDAS Logger uses
+its standard STOP transition when the run duration is reached. Event Limit
+writes the same value to `/Equipment/VME/Common/Event limit` and
+`/Equipment/NIM-EASIROC Physics/Common/Event limit`. Each Physics frontend
+uses its own internal events-sent counter and requests the standard MIDAS
+STOP transition when its limit is reached. Blank input is saved as zero;
+zero disables both limits. The GUI reads back both values and reports a
+mismatch instead of showing one as the shared limit. The old
+`/Logger/Channels/0/Settings/Event limit` must remain zero because it counts
+all events written by the Logger channel, including both streams.
 
 Start and Stop call the mhttpd JSON-RPC method `cm_transition` with
 `TR_START` or `TR_STOP`. The Start button directly follows the published
