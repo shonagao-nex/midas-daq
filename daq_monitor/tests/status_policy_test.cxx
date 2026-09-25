@@ -173,10 +173,19 @@ void test_easiroc_integrity() {
   raw.status_fresh = true;
   raw.acquisition_running = true;
   raw.overflow_count = 1;
-  expect_severity(evaluate_easiroc(RunState::kRunning, raw), Severity::kError);
+  expect_severity(evaluate_easiroc(RunState::kRunning, raw),
+                  Severity::kWarning);
+  EXPECT(evaluate_easiroc(RunState::kRunning, raw).reason ==
+         "EASIROC ADC over-threshold flag detected");
   expect_severity(evaluate_easiroc(RunState::kPausedOrTransition, raw),
-                  Severity::kError);
+                  Severity::kWarning);
   expect_severity(evaluate_easiroc(RunState::kStopped, raw), Severity::kOk);
+  raw.event_content_error_count = 1;
+  expect_severity(evaluate_easiroc(RunState::kRunning, raw), Severity::kError);
+  raw.event_content_error_count = 0;
+  raw.connected = false;
+  raw.status_fresh = false;
+  expect_severity(evaluate_easiroc(RunState::kRunning, raw), Severity::kError);
   raw = EasirocRawStatus{};
   raw.connected = true;
   raw.status_fresh = true;
@@ -409,6 +418,13 @@ void test_global() {
   RawStatus raw = normal_raw();
   EXPECT(evaluate_status(raw).global_severity == Severity::kOk);
   EXPECT(evaluate_status(raw).global_summary == "DAQ OK");
+
+  raw.easiroc.overflow_count = 1;
+  EXPECT(evaluate_status(raw).easiroc.severity == Severity::kWarning);
+  EXPECT(evaluate_status(raw).global_severity == Severity::kWarning);
+  EXPECT(evaluate_status(raw).global_summary ==
+         "EASIROC ADC over-threshold flag detected");
+  raw.easiroc.overflow_count = 0;
 
   raw.logger_connected = false;
   EXPECT(evaluate_status(raw).global_severity == Severity::kWarning);

@@ -108,13 +108,15 @@ ComponentStatus evaluate_easiroc(RunState run_state,
     return status(Severity::kError, "EASIROC decode error detected");
   if (is_run_active(run_state) && raw.timeout_count > 0)
     return status(Severity::kError, "EASIROC receive timeout detected");
-  if (is_run_active(run_state) && raw.overflow_count > 0)
-    return status(Severity::kError, "EASIROC ADC overflow detected");
   if (is_run_active(run_state) && raw.event_content_error_count > 0)
     return status(Severity::kError, "EASIROC event content error detected");
 
-  if (raw.connected && raw.status_fresh)
+  if (raw.connected && raw.status_fresh) {
+    if (is_run_active(run_state) && raw.overflow_count > 0)
+      return status(Severity::kWarning,
+                    "EASIROC ADC over-threshold flag detected");
     return status(Severity::kOk, "EASIROC OK");
+  }
   if (raw.connected)
     return status(is_run_active(run_state) ? Severity::kError
                                         : Severity::kWarning,

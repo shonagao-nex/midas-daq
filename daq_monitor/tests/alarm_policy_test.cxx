@@ -446,10 +446,13 @@ void test_unknown_and_message() {
   EXPECT(message.find("2023-11-14T22:13:20Z") != std::string::npos);
   EXPECT(message.size() < 80);
 
-  value = observation("EASIROC", "ERROR", "EASIROC ADC overflow detected");
+  value = observation("EASIROC", "WARNING",
+                      "EASIROC ADC over-threshold flag detected");
   value.detail = "count=3092";
   const std::string overflow_message = daq_monitor::format_alarm_message(value);
-  EXPECT(overflow_message.find("EASIROC ADC overflow detected") !=
+  EXPECT(overflow_message.find("EASIROC WARNING") != std::string::npos);
+  // MIDAS's 80-byte alarm message can shorten the reason to retain count.
+  EXPECT(overflow_message.find("ADC over-threshold") !=
          std::string::npos);
   EXPECT(overflow_message.find("(count=3092)") != std::string::npos);
   EXPECT(overflow_message.back() == ')');
@@ -457,6 +460,52 @@ void test_unknown_and_message() {
              AlarmLevel::kWarning)) == "DAQ Warning");
   EXPECT(std::string(daq_monitor::alarm_class_for_level(
              AlarmLevel::kError)) == "DAQ Error");
+}
+
+void test_easiroc_otr_alarm_level() {
+  using daq_monitor::evaluate_status;
+  using daq_monitor::severity_name;
+
+  RawStatus raw = normal_raw();
+  AlarmRuntimeState state;
+  FakeAlarmApi api;
+  raw.easiroc.overflow_count = 0;
+  auto evaluated = evaluate_status(raw);
+  EXPECT(evaluated.easiroc.severity == daq_monitor::Severity::kOk);
+  apply_observation(&state, &api,
+                    observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                                evaluated.easiroc.reason.c_str()));
+  EXPECT(!api.active);
+
+  raw.easiroc.overflow_count = 128;
+  evaluated = evaluate_status(raw);
+  EXPECT(evaluated.global_severity == daq_monitor::Severity::kWarning);
+  const auto warning = observation(
+      "EASIROC", severity_name(evaluated.easiroc.severity),
+      evaluated.easiroc.reason.c_str());
+  apply_observation(&state, &api, warning);
+  EXPECT(api.active);
+  EXPECT(api.level == AlarmLevel::kWarning);
+  EXPECT(std::string(daq_monitor::alarm_class_for_level(api.level)) ==
+         "DAQ Warning");
+
+  raw.easiroc.acquisition_fault = true;
+  evaluated = evaluate_status(raw);
+  apply_observation(&state, &api,
+                    observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                                evaluated.easiroc.reason.c_str()));
+  EXPECT(api.level == AlarmLevel::kError);
+  EXPECT(std::string(daq_monitor::alarm_class_for_level(api.level)) ==
+         "DAQ Error");
+
+  raw.easiroc.acquisition_fault = false;
+  evaluated = evaluate_status(raw);
+  const int resets_before_warning = api.reset_count;
+  apply_observation(&state, &api,
+                    observation("EASIROC", severity_name(evaluated.easiroc.severity),
+                                evaluated.easiroc.reason.c_str()));
+  EXPECT(api.reset_count == resets_before_warning + 1);
+  EXPECT(api.level == AlarmLevel::kWarning);
 }
 
 }  // namespace
@@ -467,6 +516,7 @@ int main() {
   test_alarm_system_off_then_on();
   test_policy_inputs();
   test_unknown_and_message();
+  test_easiroc_otr_alarm_level();
 
   if (gFailures != 0) {
     std::fprintf(stderr, "alarm_policy_test: %d of %d checks failed\n",
