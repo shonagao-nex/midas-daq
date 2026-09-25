@@ -47,11 +47,11 @@ int main() {
   const std::string stop = functionBody(
       source, "static bool stop_v1720e_and_publish_state(",
       "/* Low-level VME access helpers. */");
-  require(stop.find("!gV1720StartAttempted && !gV1720Started") !=
+  require(stop.find("if (!gV1720StartAttempted && !gV1720Started)") ==
               std::string::npos,
-          "rollback does not cover attempted and completed starts");
-  require(stop.find("v1720e_stop(gVme, V1720E_BASE)") != std::string::npos,
-          "rollback does not stop V1720E acquisition");
+          "rollback still skips untracked hardware RUN");
+  require(stop.find("v1720e_stop_if_running(") != std::string::npos,
+          "rollback does not check hardware RUN before stopping");
   require(stop.find("gV1720StartAttempted = false") != std::string::npos &&
               stop.find("gV1720Started = false") != std::string::npos,
           "successful rollback does not become idempotent");
@@ -61,8 +61,9 @@ int main() {
       "/* Handle a MIDAS run pause. */");
   require(abort.find("readout_enable(FALSE)") != std::string::npos,
           "STARTABORT does not disable frontend readout");
-  require(abort.find(
-              "stop_v1720e_and_publish_state(\"STARTABORT rollback\")") !=
+  require(abort.find("stop_v1720e_and_publish_state(") !=
+              std::string::npos &&
+              abort.find("\"STARTABORT rollback\", &stop_outcome") !=
               std::string::npos,
           "STARTABORT does not use the common V1720E stop path");
   require(abort.find("run_state = STATE_STOPPED") != std::string::npos,
@@ -79,5 +80,18 @@ int main() {
               std::string::npos,
           "normal EOR no longer uses the common stop path");
 
-  std::cout << "test_start_abort_contract: 9 checks passed\n";
+  const std::string init = functionBody(
+      source, "INT frontend_init()\n{", "/* Close the MIDAS VME interface");
+  require(init.find("current_run_state == STATE_STOPPED") != std::string::npos &&
+              init.find("STOPPED frontend startup recovery") != std::string::npos,
+          "startup recovery is not limited to MIDAS STOPPED");
+  const std::string exit = functionBody(
+      source, "INT frontend_exit()\n{", "/* Begin a run:");
+  require(exit.find("gV1720StartupRunState != STATE_STOPPED || midas_active") !=
+              std::string::npos &&
+              exit.find("V1720E hardware stop failed during frontend exit") !=
+              std::string::npos,
+          "frontend exit does not protect active restarts or report stop failures");
+
+  std::cout << "test_start_abort_contract: 11 checks passed\n";
 }

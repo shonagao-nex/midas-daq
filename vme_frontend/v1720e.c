@@ -312,6 +312,46 @@ int v1720e_stop(MVME_INTERFACE *vme, DWORD base)
                : MVME_ACCESS_ERROR;
 }
 
+int v1720e_read_run_state(MVME_INTERFACE *vme, DWORD base,
+                          DWORD *control, DWORD *status_reg)
+{
+    int status;
+    if (!vme || !control || !status_reg)
+        return MVME_INVALID_PARAM;
+    status = read32(vme, base, REG_ACQUISITION_CONTROL, control);
+    if (status != MVME_SUCCESS)
+        return status;
+    return read32(vme, base, REG_ACQUISITION_STATUS, status_reg);
+}
+
+int v1720e_stop_if_running(MVME_INTERFACE *vme, DWORD base,
+                           DWORD *control_after, DWORD *status_after,
+                           int *stop_attempted)
+{
+    int status;
+    if (!control_after || !status_after || !stop_attempted)
+        return MVME_INVALID_PARAM;
+    *stop_attempted = 0;
+    status = v1720e_read_run_state(vme, base, control_after, status_after);
+    if (status != MVME_SUCCESS)
+        return status;
+    if (((*control_after & ACQUISITION_CONTROL_RUN_REQUEST) == 0) &&
+        ((*status_after & ACQUISITION_STATUS_RUN_ACTIVE) == 0))
+        return MVME_SUCCESS;
+
+    *stop_attempted = 1;
+    status = v1720e_stop(vme, base);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_read_run_state(vme, base, control_after, status_after);
+    if (status != MVME_SUCCESS)
+        return status;
+    return ((*control_after & ACQUISITION_CONTROL_RUN_REQUEST) == 0 &&
+            (*status_after & ACQUISITION_STATUS_RUN_ACTIVE) == 0)
+               ? MVME_SUCCESS
+               : MVME_ACCESS_ERROR;
+}
+
 int v1720e_software_clear(MVME_INTERFACE *vme, DWORD base,
                           DWORD *event_stored_after,
                           int *event_stored_after_valid)

@@ -68,6 +68,16 @@ int v1720e_read_event(MVME_INTERFACE *vme, DWORD base, DWORD *data,
                       DWORD expected_channel_mask, V1720E_EVENT_INFO *info);
 int v1720e_start(MVME_INTERFACE *vme, DWORD base);
 int v1720e_stop(MVME_INTERFACE *vme, DWORD base);
+/* Read only: return the Acquisition Control and Status RUN bits with their
+ * complete register values. */
+int v1720e_read_run_state(MVME_INTERFACE *vme, DWORD base,
+                          DWORD *control, DWORD *status);
+/* Stop only when either hardware RUN bit is set. stop_attempted is set before
+ * calling v1720e_stop(); both RUN bits are checked again after a successful
+ * stop. No write is performed when the module is already stopped. */
+int v1720e_stop_if_running(MVME_INTERFACE *vme, DWORD base,
+                           DWORD *control_after, DWORD *status_after,
+                           int *stop_attempted);
 /* Clears event memory without resetting or reloading board configuration.
  * event_stored_after_valid is false unless Event Stored was read successfully. */
 int v1720e_software_clear(MVME_INTERFACE *vme, DWORD base,

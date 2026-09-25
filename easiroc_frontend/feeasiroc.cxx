@@ -173,6 +173,17 @@ bool set_odb_value(const std::string& path, const void* value, INT size,
   return status == DB_SUCCESS;
 }
 
+bool publish_global_busy_ready(bool participates, bool ready, INT run_number) {
+  const BOOL p = participates ? TRUE : FALSE;
+  const BOOL r = ready ? TRUE : FALSE;
+  return set_odb_value("/Equipment/EASIROC/Status/ParticipatesInGlobalBusy",
+                       &p, sizeof(p), 1, TID_BOOL) &&
+         set_odb_value("/Equipment/EASIROC/Status/DAQReady",
+                       &r, sizeof(r), 1, TID_BOOL) &&
+         set_odb_value("/Equipment/EASIROC/Status/ReadyRunNumber",
+                       &run_number, sizeof(run_number), 1, TID_INT);
+}
+
 bool ensure_odb_value(const std::string& path, const void* default_value,
                       INT size, INT count, DWORD type) {
   HNDLE key = 0;
@@ -1833,6 +1844,8 @@ INT frontend_init() {
 
   const INT settings_status = read_settings(&g_state.settings);
   if (settings_status != SUCCESS) return settings_status;
+  if (!publish_global_busy_ready(g_state.settings.enabled, false, 0))
+    return FE_ERR_ODB;
   if (!load_last_applied_settings()) return FE_ERR_ODB;
   if (!publish_runtime_variables()) return FE_ERR_ODB;
   if (!g_state.settings.enabled) {
@@ -1852,6 +1865,7 @@ INT frontend_init() {
 }
 
 INT frontend_exit() {
+  publish_global_busy_ready(false, false, 0);
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
   const CleanupResult cleanup = stop_acquisition("frontend_exit", true);
   g_state.run_active = false;
@@ -1865,6 +1879,7 @@ INT frontend_exit() {
 
 INT begin_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  if (!publish_global_busy_ready(false, false, 0)) return FE_ERR_ODB;
   if (!publish_configuration_status(false, run_number)) {
     if (error != nullptr)
       std::snprintf(error, 256,
@@ -1921,6 +1936,8 @@ INT begin_of_run(INT run_number, char* error) {
   }
 
   g_state.settings = run_settings;
+  if (!publish_global_busy_ready(run_settings.enabled, false, 0))
+    return FE_ERR_ODB;
   // Capture the validated requested configuration before any BOR hardware
   // access. The completed snapshot is published only after acquisition setup
   // succeeds, preserving FrontendBORComplete semantics.
@@ -2081,6 +2098,11 @@ INT begin_of_run(INT run_number, char* error) {
       mark_configuration_failed(run_number);
       return FE_ERR_ODB;
     }
+    if (!publish_global_busy_ready(true, true, run_number)) {
+      if (error != nullptr)
+        std::snprintf(error, 256, "Cannot publish EASIROC DAQReady");
+      return FE_ERR_ODB;
+    }
     return SUCCESS;
   } catch (const std::exception& exception) {
     const std::string start_error =
@@ -2102,6 +2124,7 @@ INT begin_of_run(INT run_number, char* error) {
 
 INT end_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  publish_global_busy_ready(g_state.runtime.enabled_for_run, false, 0);
   if (!g_state.runtime.enabled_for_run) {
     set_disabled_runtime_state();
     g_state.run_active = false;
@@ -2130,6 +2153,7 @@ INT end_of_run(INT run_number, char* error) {
 
 static INT start_abort(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
+  publish_global_busy_ready(g_state.runtime.enabled_for_run, false, 0);
 
   // A successful BOR enables legacy MFE readout before a peer frontend can
   // fail the common START. Quiesce software readout before sending DAQ OFF.

@@ -13,6 +13,8 @@
 #include "v775.h"
 #include "v1720e.h"
 #include "rpv130.h"
+#include "global_busy.h"
+#include "out0_diagnostic.h"
 
 /* Module locations. */
 #define V792_BASE 0x00600000
@@ -194,6 +196,7 @@ static V1720ESettings default_v1720e_settings()
 static V1720ESettings gV1720RunSettings = default_v1720e_settings();
 static V1720E_CONFIG gV1720RunConfig = {};
 static bool gV1720StartupEnabled = true;
+static INT gV1720StartupRunState = -1;
 static bool gV1720VariablesEnabled = true;
 static DWORD gV1720ExpectedEventWords = V1720E_DEFAULT_EVENT_WORDS;
 static DWORD gV1720ExpectedChannelMask = V1720E_DEFAULT_CHANNEL_MASK;
@@ -1537,6 +1540,18 @@ static bool gV1720Started = false;
  */
 static bool gV1720StartAttempted = false;
 
+enum class V1720StopOutcome { Disabled, AlreadyStopped, StopVerified };
+
+static const char *v1720_stop_outcome_name(V1720StopOutcome outcome)
+{
+    switch (outcome) {
+    case V1720StopOutcome::Disabled: return "disabled (not checked)";
+    case V1720StopOutcome::AlreadyStopped: return "already stopped (no write)";
+    case V1720StopOutcome::StopVerified: return "stop write and readback verified";
+    }
+    return "unknown";
+}
+
 static void invalidate_v1720e_current_state()
 {
     gV1720Runtime.communication_ok = FALSE;
@@ -1551,10 +1566,13 @@ static void invalidate_v1720e_current_state()
     gV1720Runtime.dirty = true;
 }
 
-static bool stop_v1720e_and_publish_state(const char *context)
+static bool stop_v1720e_and_publish_state(
+    const char *context, V1720StopOutcome *outcome = nullptr)
 {
-    if (!gV1720StartAttempted && !gV1720Started)
+    if (!gV1720StartupEnabled && !gV1720StartAttempted && !gV1720Started) {
+        if (outcome) *outcome = V1720StopOutcome::Disabled;
         return true;
+    }
 
     if (!gVme) {
         cm_msg(MERROR, frontend_name,
@@ -1565,42 +1583,52 @@ static bool stop_v1720e_and_publish_state(const char *context)
         return false;
     }
 
-    const int stop_status = v1720e_stop(gVme, V1720E_BASE);
+    DWORD control = 0, acquisition_status = 0;
+    int stop_attempted = 0;
+    const int stop_status = v1720e_stop_if_running(
+        gVme, V1720E_BASE, &control, &acquisition_status, &stop_attempted);
     if (stop_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
-               "V1720E Acquisition Stop failed during %s: status %d",
-               context, stop_status);
+               "V1720E stop/verification failed during %s: status %d, "
+               "stop_attempted=%d, AcqControl=0x%08X AcqStatus=0x%08X",
+               context, stop_status, stop_attempted, control,
+               acquisition_status);
         invalidate_v1720e_current_state();
         publish_v1720e_variables();
         return false;
-    }
-    gV1720StartAttempted = false;
-    gV1720Started = false;
-
-    if (!gV1720RunSettings.enabled || !gV1720Runtime.communication_ok) {
-        invalidate_v1720e_current_state();
-        publish_v1720e_variables();
-        return true;
     }
 
     V1720E_BOARD_INFO state = {};
     const int read_status = v1720e_probe(gVme, V1720E_BASE, &state);
     if (read_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
-               "V1720E post-stop status read failed during %s: status %d; "
-               "current-state Variables invalidated",
+               "V1720E post-stop probe failed during %s: status %d",
                context, read_status);
         invalidate_v1720e_current_state();
         publish_v1720e_variables();
-        return true;
+        return false;
+    }
+    if ((state.acquisition_control & V1720E_ACQ_RUN) ||
+        (state.acquisition_status & V1720E_ACQ_RUN)) {
+        cm_msg(MERROR, frontend_name,
+               "V1720E still RUN during %s: AcqControl=0x%08X AcqStatus=0x%08X",
+               context, state.acquisition_control, state.acquisition_status);
+        invalidate_v1720e_current_state();
+        publish_v1720e_variables();
+        return false;
     }
 
+    gV1720StartAttempted = false;
+    gV1720Started = false;
+    if (outcome) *outcome = stop_attempted
+        ? V1720StopOutcome::StopVerified : V1720StopOutcome::AlreadyStopped;
+    gV1720Runtime.communication_ok = TRUE;
     update_v1720e_board_state(state);
     publish_v1720e_variables();
-    printf("  V1720E post-stop state (%s): AcqControl=0x%08X "
-           "AcqStatus=0x%08X EventStored=%u\n",
-           context, state.acquisition_control, state.acquisition_status,
-           state.event_stored);
+    cm_msg(MINFO, frontend_name,
+           "V1720E %s during %s: AcqControl=0x%08X AcqStatus=0x%08X",
+           stop_attempted ? "stop verified" : "already stopped; no write",
+           context, state.acquisition_control, state.acquisition_status);
     return true;
 }
 
@@ -3431,6 +3459,23 @@ static INT start_abort(INT run_number, char *error);
 
 INT frontend_init()
 {
+    global_busy::disable_readout();
+    INT current_run_state = 0;
+    if (!get_absolute_odb_value("/Runinfo/State", &current_run_state,
+                                sizeof(current_run_state), TID_INT)) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot verify MIDAS Run state for V1720E startup recovery");
+        return FE_ERR_ODB;
+    }
+    if (current_run_state != STATE_STOPPED &&
+        current_run_state != STATE_RUNNING &&
+        current_run_state != STATE_PAUSED) {
+        cm_msg(MERROR, frontend_name,
+               "Unknown MIDAS Run state %d; refusing V1720E startup recovery",
+               current_run_state);
+        return FE_ERR_ODB;
+    }
+    gV1720StartupRunState = current_run_state;
 #if ENABLE_V792_SW_TRIGGER_TEST || ENABLE_V1190_SOFT_TRIGGER_TEST || ENABLE_V775_SW_TRIGGER_TEST
     printf("============================================================\n"
            " WARNING: SOFTWARE-TRIGGER DIAGNOSTIC BUILD\n"
@@ -3460,6 +3505,7 @@ INT frontend_init()
                "Cannot initialize VME RunSnapshot ODB schema");
         return FE_ERR_ODB;
     }
+    if (!global_busy::initialize()) return FE_ERR_ODB;
     const INT transition_status =
         cm_register_transition(TR_STARTABORT, start_abort, 500);
     if (transition_status != CM_SUCCESS) {
@@ -3468,6 +3514,11 @@ INT frontend_init()
                transition_status);
         return transition_status;
     }
+    if (cm_register_transition(TR_START, global_busy::before_start, 400) != CM_SUCCESS ||
+        cm_register_transition(TR_START, global_busy::after_start, 600) != CM_SUCCESS ||
+        cm_register_transition(TR_STOP, global_busy::before_stop, 400) != CM_SUCCESS ||
+        cm_register_transition(TR_STARTABORT, global_busy::start_abort, 400) != CM_SUCCESS)
+        return FE_ERR_ODB;
 
     printf("Opening VME interface...\n");
 
@@ -3477,6 +3528,11 @@ INT frontend_init()
         cm_msg(MERROR, frontend_name, "mvme_open() failed: %d", status);
         return FE_ERR_HW;
     }
+    log_v3718_out0_diagnostic(gVme);
+    global_busy::attach(gVme);
+    // OUT0 may be unconfigured or temporarily unavailable. Keep VME diagnostics
+    // usable; the START transition will require a successful BUSY assertion.
+    global_busy::set_global_busy(true);
 
     mvme_set_am(gVme, MVME_AM_A24_ND);
     mvme_set_dmode(gVme, MVME_DMODE_D16);
@@ -3486,7 +3542,65 @@ INT frontend_init()
     if (!check_module_communication(gV1720StartupEnabled)) {
         mvme_close(gVme);
         gVme = NULL;
+        global_busy::attach(NULL);
         return FE_ERR_HW;
+    }
+    // Recheck just before recovery so a run-state change during initialization
+    // cannot use the earlier STOPPED snapshot to authorize a V1720E stop.
+    if (!get_absolute_odb_value("/Runinfo/State", &current_run_state,
+                                sizeof(current_run_state), TID_INT)) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot recheck MIDAS Run state before V1720E startup recovery");
+        mvme_close(gVme);
+        gVme = NULL;
+        global_busy::attach(NULL);
+        return FE_ERR_ODB;
+    }
+    gV1720StartupRunState = current_run_state;
+    if (current_run_state != STATE_STOPPED &&
+        current_run_state != STATE_RUNNING &&
+        current_run_state != STATE_PAUSED) {
+        cm_msg(MERROR, frontend_name,
+               "Unknown MIDAS Run state %d before V1720E startup recovery",
+               current_run_state);
+        mvme_close(gVme);
+        gVme = NULL;
+        global_busy::attach(NULL);
+        return FE_ERR_ODB;
+    }
+    if (gV1720StartupEnabled && current_run_state == STATE_STOPPED) {
+        DWORD control = 0, acquisition_status = 0;
+        const int read_status = v1720e_read_run_state(
+            gVme, V1720E_BASE, &control, &acquisition_status);
+        if (read_status != MVME_SUCCESS) {
+            cm_msg(MERROR, frontend_name,
+                   "Cannot read V1720E RUN state at STOPPED startup: status %d",
+                   read_status);
+            mvme_close(gVme);
+            gVme = NULL;
+            global_busy::attach(NULL);
+            return FE_ERR_HW;
+        }
+        if ((control & V1720E_ACQ_RUN) ||
+            (acquisition_status & V1720E_ACQ_RUN)) {
+            cm_msg(MERROR, frontend_name,
+                   "V1720E RUN persisted while MIDAS STOPPED: "
+                   "AcqControl=0x%08X AcqStatus=0x%08X; attempting stop",
+                   control, acquisition_status);
+            if (!stop_v1720e_and_publish_state("STOPPED frontend startup recovery")) {
+                cm_msg(MERROR, frontend_name,
+                       "V1720E startup recovery failed; fevme startup refused");
+                mvme_close(gVme);
+                gVme = NULL;
+                global_busy::attach(NULL);
+                return FE_ERR_HW;
+            }
+        }
+    } else if (current_run_state == STATE_RUNNING ||
+               current_run_state == STATE_PAUSED) {
+        cm_msg(MINFO, frontend_name,
+               "V1720E startup auto-stop skipped: MIDAS state %d",
+               current_run_state);
     }
     return SUCCESS;
 }
@@ -3495,8 +3609,22 @@ INT frontend_init()
 /* Close the MIDAS VME interface when the frontend terminates. */
 INT frontend_exit()
 {
+    global_busy::publish_ready(true, false, 0);
+    if (gVme) global_busy::set_global_busy(true);
     if (gVme) {
-        stop_v1720e_and_publish_state("frontend exit");
+        const bool owns_v1720_run = gV1720StartAttempted || gV1720Started;
+        const bool midas_active = run_state == STATE_RUNNING ||
+                                  run_state == STATE_PAUSED;
+        if (!owns_v1720_run &&
+            (gV1720StartupRunState != STATE_STOPPED || midas_active)) {
+            cm_msg(MINFO, frontend_name,
+                   "V1720E auto-stop skipped on frontend exit: "
+                   "startup MIDAS state %d, current state %d, no frontend start",
+                   gV1720StartupRunState, run_state);
+        } else if (!stop_v1720e_and_publish_state("frontend exit")) {
+            cm_msg(MERROR, frontend_name,
+                   "V1720E hardware stop failed during frontend exit");
+        }
         refresh_enabled_module_variables();
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
         if (gV1190RunSettings.enabled && !restore_v1190_diagnostic_settings())
@@ -3508,6 +3636,7 @@ INT frontend_exit()
 #endif
         mvme_close(gVme);
         gVme = NULL;
+        global_busy::attach(NULL);
     }
 
     printf("VME interface closed.\n");
@@ -3518,11 +3647,18 @@ INT frontend_exit()
 /* Begin a run: reset software state, prepare normal operation, then arm diagnostics. */
 INT begin_of_run(INT run_number, char *error)
 {
+    const auto finish = [run_number](INT result) {
+        cm_msg(MINFO, frontend_name, "START 500 begin_of_run exit run %d status %d",
+               run_number, result);
+        return result;
+    };
+    cm_msg(MINFO, frontend_name, "START 500 begin_of_run enter run %d", run_number);
     printf("Begin run %d\n", run_number);
+    if (!global_busy::publish_ready(true, false, 0)) return finish(FE_ERR_ODB);
     if (!publish_configuration_status(false, run_number)) {
         snprintf(error, 256,
                  "Cannot reset VME configuration status at BOR");
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
     reset_run_statistics();
     mark_run_counters_dirty();
@@ -3531,7 +3667,7 @@ INT begin_of_run(INT run_number, char *error)
                "Cannot reset VME RunCounters ODB values at BOR");
         snprintf(error, 256, "Cannot reset VME RunCounters");
         mark_configuration_failed(run_number);
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
     reset_vme_run_snapshot(run_number);
 
@@ -3542,14 +3678,14 @@ INT begin_of_run(INT run_number, char *error)
                "Cannot snapshot/validate VME module Settings at BOR");
         snprintf(error, 256, "Invalid VME module ODB Settings");
         mark_configuration_failed(run_number);
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
     if (!validate_v792_event_source_dependency()) {
         snprintf(error, 256,
                  "V792 must be enabled when any VME physics readout module "
                  "is enabled");
         mark_configuration_failed(run_number);
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
     capture_vme_requested_snapshot();
     publish_vme_enabled_for_run();
@@ -3564,7 +3700,7 @@ INT begin_of_run(INT run_number, char *error)
                "BOR configuration failed; refusing to start run %d", run_number);
         snprintf(error, 256, "Normal BOR module preparation failed");
         mark_configuration_failed(run_number);
-        return FE_ERR_HW;
+        return finish(FE_ERR_HW);
     }
 
 #if ENABLE_V792_SW_TRIGGER_TEST
@@ -3577,7 +3713,7 @@ INT begin_of_run(INT run_number, char *error)
         restore_v1190_diagnostic_settings();
         stop_v1720e_and_publish_state("BOR diagnostic setup failure");
         mark_configuration_failed(run_number);
-        return FE_ERR_HW;
+        return finish(FE_ERR_HW);
     }
 #endif
 #if ENABLE_V775_SW_TRIGGER_TEST
@@ -3587,7 +3723,7 @@ INT begin_of_run(INT run_number, char *error)
         restore_v775_diagnostic_settings();
         stop_v1720e_and_publish_state("BOR diagnostic setup failure");
         mark_configuration_failed(run_number);
-        return FE_ERR_HW;
+        return finish(FE_ERR_HW);
     }
 #endif
     gVmeRunSnapshot.frontend_bor_complete = TRUE;
@@ -3598,7 +3734,7 @@ INT begin_of_run(INT run_number, char *error)
                "VME BOR completed without all enabled modules ready");
         snprintf(error, 256, "VME configuration readiness check failed");
         mark_configuration_failed(run_number);
-        return FE_ERR_HW;
+        return finish(FE_ERR_HW);
     }
     if (!publish_vme_run_snapshot()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
@@ -3608,7 +3744,7 @@ INT begin_of_run(INT run_number, char *error)
                run_number);
         snprintf(error, 256, "Cannot publish completed VME RunSnapshot");
         mark_configuration_failed(run_number);
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
     if (!publish_configuration_status(true, run_number)) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
@@ -3619,14 +3755,20 @@ INT begin_of_run(INT run_number, char *error)
                run_number);
         snprintf(error, 256, "Cannot publish VME configuration status");
         mark_configuration_failed(run_number);
-        return FE_ERR_ODB;
+        return finish(FE_ERR_ODB);
     }
-    return SUCCESS;
+    if (!global_busy::publish_ready(true, true, run_number)) {
+        snprintf(error, 256, "Cannot publish VME DAQReady");
+        return finish(FE_ERR_ODB);
+    }
+    return finish(SUCCESS);
 }
 
 /* Handle the end of a MIDAS run. */
 INT end_of_run(INT run_number, char *error)
 {
+    global_busy::disable_readout();
+    global_busy::publish_ready(true, false, 0);
     bool restore_failed = false;
     printf("End run %d\n", run_number);
     if (!stop_v1720e_and_publish_state("EOR")) {
@@ -3662,14 +3804,17 @@ INT end_of_run(INT run_number, char *error)
 /* Roll back hardware and framework state after any failed START transition. */
 static INT start_abort(INT run_number, char *error)
 {
+    global_busy::disable_readout();
+    global_busy::publish_ready(true, false, 0);
     if (error)
         error[0] = '\0';
 
     /* A successful BOR enables the legacy MFE readout before another client
      * can fail the common START. Stop software readout before hardware. */
     readout_enable(FALSE);
-    const bool stopped =
-        stop_v1720e_and_publish_state("STARTABORT rollback");
+    V1720StopOutcome stop_outcome = V1720StopOutcome::Disabled;
+    const bool stopped = stop_v1720e_and_publish_state(
+        "STARTABORT rollback", &stop_outcome);
 
     gVmeRunSnapshot.frontend_bor_complete = FALSE;
     publish_vme_run_snapshot();
@@ -3684,7 +3829,8 @@ static INT start_abort(INT run_number, char *error)
         return FE_ERR_HW;
     }
     cm_msg(MINFO, frontend_name,
-           "STARTABORT rollback completed for run %d", run_number);
+           "STARTABORT rollback completed for run %d; V1720E %s",
+           run_number, v1720_stop_outcome_name(stop_outcome));
     return SUCCESS;
 }
 
@@ -3706,6 +3852,7 @@ INT resume_run(INT run_number, char *error)
 /* Poll RPV130 status outside the DAQ event readout path. */
 INT frontend_loop()
 {
+    global_busy::process_diagnostic_request(run_state == STATE_STOPPED);
     process_manual_buffer_clear_request();
     publish_rpv130_status(false);
     const DWORD now = ss_millitime();
@@ -3756,6 +3903,8 @@ INT frontend_loop()
 /* Poll without consuming FIFO words; test mode performs timing iterations only. */
 INT poll_event(INT source, INT count, BOOL test)
 {
+    if (!global_busy::readout_allowed())
+        return 0;
     if (!gVme || gReadoutFailed ||
         !gV792RunSettings.enabled ||
         (gV1720RunSettings.enabled && !gV1720Started))
@@ -3908,6 +4057,8 @@ static INT build_midas_event(char *pevent,
 /* Acquire one event per module, check pairing, and publish one MIDAS event. */
 INT read_vme_event(char *pevent, INT off)
 {
+    if (!global_busy::readout_allowed())
+        return 0;
     if (!gVme || gReadoutFailed)
         return 0;
 

@@ -40,7 +40,8 @@ VME_TEST_NAMES = \
 	test_v1190_soft_event \
 	test_v792_eventread \
 	test_v792_swcomm \
-	test_v7xx_counter
+	test_v7xx_counter \
+	test_v3718_out0
 VME_TEST_TARGETS = $(addprefix $(BIN_TEST_DIR)/,$(VME_TEST_NAMES))
 VME_C_TEST_NAMES = $(filter-out test_rpv130_status,$(VME_TEST_NAMES))
 VME_C_TEST_OBJECTS = $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(VME_C_TEST_NAMES)))
@@ -51,17 +52,23 @@ COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
            $(BUILD_DIR)/v1720e.o \
            $(BUILD_DIR)/rpv130.o \
            $(BUILD_DIR)/manual_buffer_clear.o
-OBJS = $(BUILD_DIR)/fevme.o $(COMMON_OBJS)
-DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(COMMON_OBJS)
+OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/global_busy.o \
+       $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
+DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/global_busy.o \
+            $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
 RPV130_TEST_OBJ = $(BUILD_DIR)/tests/test_rpv130_status.o
 IDLE_POLICY_TEST = $(BIN_TEST_DIR)/test_fevme_idle_policy
 MANUAL_CLEAR_TEST = $(BIN_TEST_DIR)/manual_buffer_clear_test
 MANUAL_CLEAR_CONTRACT_TEST = $(BIN_TEST_DIR)/test_manual_buffer_clear_contract
 START_ABORT_CONTRACT_TEST = $(BIN_TEST_DIR)/test_start_abort_contract
+READOUT_GATE_CONTRACT_TEST = $(BIN_TEST_DIR)/test_readout_gate_contract
+GLOBAL_BUSY_READINESS_TEST = $(BIN_TEST_DIR)/test_global_busy_readiness
 V1720E_CLEAR_TEST = $(BIN_TEST_DIR)/test_v1720e_software_clear
+V1720E_STOP_TEST = $(BIN_TEST_DIR)/test_v1720e_stop_recovery
 DEPS = $(OBJS:.o=.d) $(DIAG_OBJS:.o=.d) $(RPV130_TEST_OBJ:.o=.d) \
 	$(VME_C_TEST_OBJECTS:.o=.d) \
-	$(BUILD_DIR)/tests/test_fevme_idle_policy.d
+	$(BUILD_DIR)/tests/test_fevme_idle_policy.d \
+	$(BUILD_DIR)/tests/test_v1720e_stop_recovery.d
 
 .PHONY: all check diagnostic tests rpv130-test clean fevme fevme_diagnostic \
 	$(VME_TEST_NAMES)
@@ -72,12 +79,17 @@ all: $(TARGET)
 fevme: $(TARGET)
 
 check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
-	$(START_ABORT_CONTRACT_TEST) $(V1720E_CLEAR_TEST)
+	$(START_ABORT_CONTRACT_TEST) $(READOUT_GATE_CONTRACT_TEST) \
+	$(GLOBAL_BUSY_READINESS_TEST) \
+	$(V1720E_CLEAR_TEST) $(V1720E_STOP_TEST)
 	./$(IDLE_POLICY_TEST)
 	./$(MANUAL_CLEAR_TEST)
 	./$(MANUAL_CLEAR_CONTRACT_TEST)
 	./$(START_ABORT_CONTRACT_TEST)
+	./$(READOUT_GATE_CONTRACT_TEST)
+	./$(GLOBAL_BUSY_READINESS_TEST)
 	./$(V1720E_CLEAR_TEST)
+	./$(V1720E_STOP_TEST)
 
 diagnostic: $(DIAG_TARGET)
 
@@ -119,7 +131,20 @@ $(START_ABORT_CONTRACT_TEST): $(BUILD_DIR)/tests/test_start_abort_contract.o
 	@mkdir -p $(dir $@)
 	$(CXX) -o $@ $^
 
+$(READOUT_GATE_CONTRACT_TEST): $(BUILD_DIR)/tests/test_readout_gate_contract.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(GLOBAL_BUSY_READINESS_TEST): $(BUILD_DIR)/tests/test_global_busy_readiness.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
 $(V1720E_CLEAR_TEST): $(BUILD_DIR)/tests/test_v1720e_software_clear.o \
+	$(BUILD_DIR)/v1720e.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^
+
+$(V1720E_STOP_TEST): $(BUILD_DIR)/tests/test_v1720e_stop_recovery.o \
 	$(BUILD_DIR)/v1720e.o
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $^
@@ -135,6 +160,14 @@ $(BUILD_DIR)/fevme.o: fevme.cxx
 $(BUILD_DIR)/fevme_diag.o: fevme.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(DIAGNOSTIC_DEFINES) -c $< -o $@
+
+$(BUILD_DIR)/global_busy.o: global_busy.cxx global_busy.h global_busy_readiness.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/out0_diagnostic.o: out0_diagnostic.cxx out0_diagnostic.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/caenvme.o: caenvme.c caenvme.h
 	@mkdir -p $(dir $@)
@@ -176,6 +209,11 @@ $(BUILD_DIR)/tests/test_v1720e_software_clear.o: \
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -std=c11 -Wextra -Wpedantic -c $< -o $@
 
+$(BUILD_DIR)/tests/test_v1720e_stop_recovery.o: \
+	tests/test_v1720e_stop_recovery.c v1720e.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Wpedantic -c $< -o $@
+
 $(BUILD_DIR)/tests/test_rpv130_status.o: tests/test_rpv130_status.cxx rpv130.h caenvme.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -186,6 +224,16 @@ $(BUILD_DIR)/tests/test_fevme_idle_policy.o: tests/test_fevme_idle_policy.cxx fe
 
 $(BUILD_DIR)/tests/test_start_abort_contract.o: \
 	tests/test_start_abort_contract.cxx fevme.cxx
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_readout_gate_contract.o: \
+	tests/test_readout_gate_contract.cxx fevme.cxx global_busy.cxx
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_global_busy_readiness.o: \
+	tests/test_global_busy_readiness.cxx global_busy.cxx global_busy_readiness.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
