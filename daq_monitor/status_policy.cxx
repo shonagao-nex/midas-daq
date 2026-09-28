@@ -1,6 +1,9 @@
 #include "status_policy.h"
 
 #include <array>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
 
 namespace daq_monitor {
@@ -158,6 +161,17 @@ ActiveParticipation resolve_run_participation(
   // disappear from monitoring. Monitoring both is the fail-safe fallback;
   // only an exact current-run record is allowed to suppress a frontend.
   return {false, true, true};
+}
+
+std::int64_t runlog_event_count(bool participating, double latest,
+                                double largest_observed) {
+  if (!participating) return -1;
+  const double count = std::max(std::isfinite(latest) ? latest : 0.0,
+                                std::isfinite(largest_observed) ? largest_observed : 0.0);
+  if (count <= 0.0) return 0;
+  if (count >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+    return std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(count);
 }
 
 StatusEvaluation evaluate_status(const RawStatus& raw) {

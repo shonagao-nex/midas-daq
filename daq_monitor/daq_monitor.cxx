@@ -593,6 +593,7 @@ bool publish_status(bool synchronous_start_check = false) {
   INT run_state = 0;
   INT transition_in_progress = 0;
   DWORD start_time = 0;
+  DWORD stop_time = 0;
   std::uint64_t previous_update_unix = 0;
   bool collection_ok = true;
   collection_ok =
@@ -607,6 +608,7 @@ bool publish_status(bool synchronous_start_check = false) {
              &transition_in_progress);
   collection_ok = read_value("/Runinfo/Start time binary", TID_DWORD,
                              &start_time) && collection_ok;
+  read_value("/Runinfo/Stop time binary", TID_DWORD, &stop_time);
   read_value("/DAQ/Status/Global/LastUpdateUnix", TID_QWORD,
              &previous_update_unix);
 
@@ -617,6 +619,9 @@ bool publish_status(bool synchronous_start_check = false) {
   if (run_state == STATE_RUNNING && start_time != 0 &&
       now_unix >= static_cast<std::uint64_t>(start_time))
     duration_sec = now_unix - static_cast<std::uint64_t>(start_time);
+  else if (run_state == STATE_STOPPED && start_time != 0 &&
+           stop_time >= start_time)
+    duration_sec = stop_time - start_time;
 
   const ClientHealth vme_health = client_health(kVmeClientName);
   const ClientHealth easiroc_health = client_health(kEasirocClientName);
@@ -725,6 +730,34 @@ bool publish_status(bool synchronous_start_check = false) {
   const daq_monitor::ActiveParticipation participation =
       daq_monitor::resolve_run_participation(
           raw_status.run_state, run_number, read_run_participation());
+  // Preserve the largest observed MIDAS event count if a participating
+  // frontend disconnects before EOR. The record is keyed by run number.
+  if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
+    INT count_run = 0;
+    double previous_vme = 0, previous_easiroc = 0;
+    read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
+    if (count_run == run_number) {
+      read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
+                 &previous_vme);
+      read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
+                 &previous_easiroc);
+    }
+    double current_vme = 0, current_easiroc = 0;
+    read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
+               &current_vme);
+    read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+               TID_DOUBLE, &current_easiroc);
+    const double observed_vme = participation.vme
+        ? std::max(previous_vme, current_vme) : 0;
+    const double observed_easiroc = participation.easiroc
+        ? std::max(previous_easiroc, current_easiroc) : 0;
+    write_value("/DAQ/Status/Runlog/ObservedVMEEvents", &observed_vme,
+                sizeof(observed_vme), TID_DOUBLE);
+    write_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", &observed_easiroc,
+                sizeof(observed_easiroc), TID_DOUBLE);
+    write_value("/DAQ/Status/Runlog/CountRunNumber", &run_number,
+                sizeof(run_number), TID_INT32);
+  }
   raw_status.vme.participating = participation.vme;
   raw_status.vme.connected = vme_connected != FALSE;
   raw_status.vme.status_fresh = vme_status_fresh != FALSE;
@@ -756,6 +789,30 @@ bool publish_status(bool synchronous_start_check = false) {
       easiroc_configuration_checked_unix};
   const daq_monitor::StatusEvaluation evaluation =
       daq_monitor::evaluate_status(raw_status);
+
+  // Keep the worst observed run status so a transient disconnect remains
+  // visible in the EOR record even if the frontend reconnects before STOP.
+  if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
+    INT status_run = 0;
+    std::string previous;
+    read_value("/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
+               &status_run);
+    if (status_run == run_number) {
+      read_string("/DAQ/Status/Runlog/DAQStatus", &previous);
+    }
+    const std::string current =
+        daq_monitor::severity_name(evaluation.global_severity);
+    const auto rank = [](const std::string& value) {
+      return value == "ERROR" ? 2 : value == "WARNING" ? 1 : 0;
+    };
+    if (status_run != run_number || rank(current) > rank(previous)) {
+      write_string("/DAQ/Status/Runlog/DAQStatus", current);
+      write_string("/DAQ/Status/Runlog/DAQSummary",
+                   evaluation.global_summary);
+    }
+    write_value("/DAQ/Status/Runlog/StatusRunNumber", &run_number,
+                sizeof(run_number), TID_INT32);
+  }
 
   bool ok = true;
 #define PUBLISH(path, value, type) \
@@ -900,6 +957,53 @@ INT validate_start_transition(INT run_number, char* error) {
   return CM_TRANSITION_CANCELED;
 }
 
+// Logger reads EOR links at sequence 800. Capture the finished run first.
+INT capture_runlog_eor(INT run_number, char*) {
+  const daq_monitor::RunParticipation participation = read_run_participation();
+  if (!participation.valid || participation.run_number != run_number) {
+    cm_msg(MERROR, kClientName, "No participation record for EOR run %d", run_number);
+    return CM_SUCCESS;  // Never prevent STOP from completing.
+  }
+  DWORD start = 0, stop = 0;
+  read_value("/Runinfo/Start time binary", TID_DWORD, &start);
+  read_value("/Runinfo/Stop time binary", TID_DWORD, &stop);
+  const std::uint64_t elapsed = stop >= start ? stop - start : 0;
+  double vme_sent = 0, easiroc_sent = 0;
+  read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent);
+  read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+             TID_DOUBLE, &easiroc_sent);
+  INT count_run = 0;
+  read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
+  if (count_run == run_number) {
+    double observed = 0;
+    if (read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
+                   &observed)) vme_sent = std::max(vme_sent, observed);
+    if (read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
+                   &observed)) easiroc_sent = std::max(easiroc_sent, observed);
+  }
+  const std::int64_t vme_events =
+      daq_monitor::runlog_event_count(participation.vme, vme_sent, 0);
+  const std::int64_t easiroc_events =
+      daq_monitor::runlog_event_count(participation.easiroc, easiroc_sent, 0);
+  std::uint64_t slips = 0;
+  if (participation.vme)
+    read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
+               TID_QWORD, &slips);
+  publish_status();
+  bool ok = true;
+  ok = write_value("/DAQ/Status/Runlog/DurationSec", &elapsed,
+                   sizeof(elapsed), TID_QWORD) && ok;
+  ok = write_value("/DAQ/Status/Runlog/VMEEvents", &vme_events,
+                   sizeof(vme_events), TID_INT64) && ok;
+  ok = write_value("/DAQ/Status/Runlog/EASIROCEvents", &easiroc_events,
+                   sizeof(easiroc_events), TID_INT64) && ok;
+  ok = write_value("/DAQ/Status/Runlog/EventSlipCount", &slips,
+                   sizeof(slips), TID_QWORD) && ok;
+  if (!ok)
+    cm_msg(MERROR, kClientName, "Cannot capture EOR run %d for JSON runlog", run_number);
+  return CM_SUCCESS;
+}
+
 void print_usage(const char* program) {
   std::printf("Usage: %s [-h host] [-e experiment]\n", program);
 }
@@ -962,6 +1066,12 @@ int main(int argc, char** argv) {
                  "Cannot register START validation at sequence %d: status "
                  "%d\n",
                  daq_monitor::kStartTransitionSequence, transition_status);
+    cm_disconnect_experiment();
+    return 1;
+  }
+  const INT stop_status = cm_register_transition(TR_STOP, capture_runlog_eor, 700);
+  if (stop_status != CM_SUCCESS) {
+    std::fprintf(stderr, "Cannot register EOR runlog capture: status %d\n", stop_status);
     cm_disconnect_experiment();
     return 1;
   }

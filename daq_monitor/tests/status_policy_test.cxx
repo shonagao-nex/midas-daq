@@ -409,6 +409,14 @@ void test_run_participation() {
   EXPECT(!active.easiroc);
 }
 
+void test_runlog_event_count() {
+  using daq_monitor::runlog_event_count;
+  EXPECT(runlog_event_count(true, 0, 0) == 0);
+  EXPECT(runlog_event_count(false, 999, 999) == -1);
+  EXPECT(runlog_event_count(true, 12, 19) == 19);
+  EXPECT(runlog_event_count(true, 23, 19) == 23);
+}
+
 void test_transition_sequence() {
   EXPECT(daq_monitor::kStartTransitionSequence == 400);
 }
@@ -450,6 +458,7 @@ int main() {
   test_stop_transition_acquisition_policy();
   test_global();
   test_run_participation();
+  test_runlog_event_count();
   test_can_start();
   test_transition_sequence();
 
