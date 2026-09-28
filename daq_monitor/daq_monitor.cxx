@@ -3,15 +3,21 @@
 #include "status_policy.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <spawn.h>
 #include <string>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
+
+extern char** environ;
 
 namespace {
 
@@ -26,6 +32,8 @@ constexpr std::size_t kTransitionErrorCapacity = 256;
 constexpr char kVmeClientName[] = "fevme";
 constexpr char kEasirocClientName[] = "feeasiroc";
 constexpr char kLoggerClientName[] = "Logger";
+constexpr char kRunElogScript[] =
+    "/home/nagao/midas/midas/online/scripts/run_elog.py";
 
 volatile std::sig_atomic_t gStopRequested = 0;
 HNDLE gDatabase = 0;
@@ -732,6 +740,7 @@ bool publish_status(bool synchronous_start_check = false) {
           raw_status.run_state, run_number, read_run_participation());
   // Preserve the largest observed MIDAS event count if a participating
   // frontend disconnects before EOR. The record is keyed by run number.
+  bool ok = true;
   if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
     INT count_run = 0;
     double previous_vme = 0, previous_easiroc = 0;
@@ -806,15 +815,14 @@ bool publish_status(bool synchronous_start_check = false) {
       return value == "ERROR" ? 2 : value == "WARNING" ? 1 : 0;
     };
     if (status_run != run_number || rank(current) > rank(previous)) {
-      write_string("/DAQ/Status/Runlog/DAQStatus", current);
-      write_string("/DAQ/Status/Runlog/DAQSummary",
-                   evaluation.global_summary);
+      ok = write_string("/DAQ/Status/Runlog/DAQStatus", current) && ok;
+      ok = write_string("/DAQ/Status/Runlog/DAQSummary",
+                        evaluation.global_summary) && ok;
     }
-    write_value("/DAQ/Status/Runlog/StatusRunNumber", &run_number,
-                sizeof(run_number), TID_INT32);
+    ok = write_value("/DAQ/Status/Runlog/StatusRunNumber", &run_number,
+                     sizeof(run_number), TID_INT32) && ok;
   }
 
-  bool ok = true;
 #define PUBLISH(path, value, type) \
   ok = write_value(path, &(value), sizeof(value), type) && ok
   ok = write_string("/DAQ/Status/Global/Severity",
@@ -965,8 +973,9 @@ INT capture_runlog_eor(INT run_number, char*) {
     return CM_SUCCESS;  // Never prevent STOP from completing.
   }
   DWORD start = 0, stop = 0;
-  read_value("/Runinfo/Start time binary", TID_DWORD, &start);
-  read_value("/Runinfo/Stop time binary", TID_DWORD, &stop);
+  bool times_ok = read_value("/Runinfo/Start time binary", TID_DWORD, &start);
+  times_ok = read_value("/Runinfo/Stop time binary", TID_DWORD, &stop) &&
+             times_ok;
   const std::uint64_t elapsed = stop >= start ? stop - start : 0;
   double vme_sent = 0, easiroc_sent = 0;
   read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent);
@@ -989,8 +998,13 @@ INT capture_runlog_eor(INT run_number, char*) {
   if (participation.vme)
     read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
                TID_QWORD, &slips);
-  publish_status();
-  bool ok = true;
+  bool ok = publish_status() && times_ok;
+  INT status_run = 0;
+  std::string daq_status, daq_summary;
+  ok = read_value("/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
+                  &status_run) && status_run == run_number &&
+       read_string("/DAQ/Status/Runlog/DAQStatus", &daq_status) &&
+       read_string("/DAQ/Status/Runlog/DAQSummary", &daq_summary) && ok;
   ok = write_value("/DAQ/Status/Runlog/DurationSec", &elapsed,
                    sizeof(elapsed), TID_QWORD) && ok;
   ok = write_value("/DAQ/Status/Runlog/VMEEvents", &vme_events,
@@ -999,9 +1013,50 @@ INT capture_runlog_eor(INT run_number, char*) {
                    sizeof(easiroc_events), TID_INT64) && ok;
   ok = write_value("/DAQ/Status/Runlog/EventSlipCount", &slips,
                    sizeof(slips), TID_QWORD) && ok;
+  // The marker identifies the run whose ODB EOR sources are complete;
+  // Logger writes their JSON snapshot later in this STOP transition.
+  if (ok)
+    ok = write_value("/DAQ/Status/Runlog/EORCompleteRunNumber", &run_number,
+                     sizeof(run_number), TID_INT32);
   if (!ok)
     cm_msg(MERROR, kClientName, "Cannot capture EOR run %d for JSON runlog", run_number);
   return CM_SUCCESS;
+}
+
+void maybe_spawn_run_elog(INT* last_spawned_run) {
+  INT state = 0, transition = 0, eor_run = 0, last_attempt = 0, last_run = 0;
+  if (!read_value("/Runinfo/State", TID_INT32, &state) ||
+      !read_value("/Runinfo/Transition in progress", TID_INT32, &transition) ||
+      !read_value("/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
+                  &eor_run) ||
+      !read_value("/Experiment/Run Elog/Last Attempt Run", TID_INT32,
+                  &last_attempt) ||
+      !read_value("/Experiment/Run Elog/Last Run", TID_INT32, &last_run) ||
+      state != STATE_STOPPED || transition != 0 || eor_run <= 0 ||
+      eor_run <= std::max({*last_spawned_run, last_attempt, last_run}))
+    return;
+
+  char run_text[32] = {};
+  std::snprintf(run_text, sizeof(run_text), "%d", eor_run);
+  char* const arguments[] = {
+      const_cast<char*>("/usr/bin/python3"),
+      const_cast<char*>(kRunElogScript),
+      const_cast<char*>("--run"), run_text, nullptr};
+  pid_t child = 0;
+  const int result = posix_spawn(&child, arguments[0], nullptr, nullptr,
+                                 arguments, environ);
+  *last_spawned_run = eor_run;
+  if (result != 0) {
+    const std::string reason = std::string("Cannot launch run_elog.py: ") +
+                               std::strerror(result);
+    db_set_value(gDatabase, 0, "/Experiment/Run Elog/Last Status",
+                 "ERROR", 6, 1, TID_STRING);
+    db_set_value(gDatabase, 0, "/Experiment/Run Elog/Last Error",
+                 reason.c_str(), static_cast<INT>(reason.size() + 1), 1,
+                 TID_STRING);
+    cm_msg(MERROR, kClientName, "Run %d ELOG post failed: %s", eor_run,
+           reason.c_str());
+  }
 }
 
 void print_usage(const char* program) {
@@ -1082,9 +1137,12 @@ int main(int argc, char** argv) {
          "Started DAQ status collection and component alarm synchronization");
 
   INT yield_status = CM_SUCCESS;
+  INT last_spawned_elog_run = 0;
   while (!gStopRequested) {
     if (publish_status() && !update_alarms())
       cm_msg(MERROR, kClientName, "DAQ alarm synchronization failed");
+    while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+    maybe_spawn_run_elog(&last_spawned_elog_run);
     yield_status = cm_yield(kUpdatePeriodMs);
     if (yield_status == RPC_SHUTDOWN || yield_status == SS_ABORT)
       break;

@@ -67,6 +67,8 @@ vcpkg_installed/
 # Test output & cache
 Testing/
 .cache/
+__pycache__/
+*.pyc
 
 # MIDAS runtime files
 .*.SHM
