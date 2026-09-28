@@ -8,6 +8,30 @@
 #include "mvmestd.h"
 #include "caenvme.h"
 
+int caenvme_blt_read32(int handle, mvme_addr_t address, void *destination,
+                       int requested_bytes, int *actual_bytes)
+{
+    if (actual_bytes)
+        *actual_bytes = 0;
+    if (!destination || !actual_bytes || requested_bytes < 0 ||
+        (requested_bytes % 4) != 0)
+        return cvInvalidParam;
+    return CAENVME_BLTReadCycle(handle, address, destination, requested_bytes,
+                                cvA32_U_BLT, cvD32, actual_bytes);
+}
+
+int caenvme_a24_blt_read32(int handle, mvme_addr_t address, void *destination,
+                           int requested_bytes, int *actual_bytes)
+{
+    if (actual_bytes)
+        *actual_bytes = 0;
+    if (!destination || !actual_bytes || requested_bytes <= 0 ||
+        (requested_bytes % 4) != 0)
+        return cvInvalidParam;
+    return CAENVME_BLTReadCycle(handle, address, destination, requested_bytes,
+                                cvA24_U_BLT, cvD32, actual_bytes);
+}
+
 
 /* Convert a MIDAS address modifier to the corresponding CAEN address modifier. */
 static int caen_get_am(int am, CVAddressModifier *caen_am)

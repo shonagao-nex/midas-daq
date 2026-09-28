@@ -35,6 +35,7 @@ DIAG_TARGET = $(BIN_TEST_DIR)/fevme_diagnostic
 VME_TEST_NAMES = \
 	test_rpv130_status \
 	test_v1190_config \
+	test_v1190_pout_readonly \
 	test_v1190_eventread \
 	test_v1190_micro_drain \
 	test_v1190_soft_event \
@@ -47,6 +48,8 @@ VME_C_TEST_NAMES = $(filter-out test_rpv130_status,$(VME_TEST_NAMES))
 VME_C_TEST_OBJECTS = $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(VME_C_TEST_NAMES)))
 
 COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
+           $(BUILD_DIR)/v792_blt32.o \
+           $(BUILD_DIR)/v1190_fifo_blt32.o \
            $(BUILD_DIR)/v792.o \
            $(BUILD_DIR)/v775.o \
            $(BUILD_DIR)/v1720e.o \
@@ -65,6 +68,11 @@ READOUT_GATE_CONTRACT_TEST = $(BIN_TEST_DIR)/test_readout_gate_contract
 GLOBAL_BUSY_READINESS_TEST = $(BIN_TEST_DIR)/test_global_busy_readiness
 V1720E_CLEAR_TEST = $(BIN_TEST_DIR)/test_v1720e_software_clear
 V1720E_STOP_TEST = $(BIN_TEST_DIR)/test_v1720e_stop_recovery
+V1720E_BLT_TEST = $(BIN_TEST_DIR)/test_v1720e_blt32
+CAENVME_BLT_TEST = $(BIN_TEST_DIR)/test_caenvme_blt_wrapper
+V792_BLT_TEST = $(BIN_TEST_DIR)/test_v792_blt32
+V1190_FIFO_BLT_TEST = $(BIN_TEST_DIR)/test_v1190_fifo_blt32
+RPV130_BUSY_MOCK_TEST = $(BIN_TEST_DIR)/test_rpv130_busy_mock
 DEPS = $(OBJS:.o=.d) $(DIAG_OBJS:.o=.d) $(RPV130_TEST_OBJ:.o=.d) \
 	$(VME_C_TEST_OBJECTS:.o=.d) \
 	$(BUILD_DIR)/tests/test_fevme_idle_policy.d \
@@ -81,8 +89,10 @@ fevme: $(TARGET)
 check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	$(START_ABORT_CONTRACT_TEST) $(READOUT_GATE_CONTRACT_TEST) \
 	$(GLOBAL_BUSY_READINESS_TEST) \
-	$(V1720E_CLEAR_TEST) $(V1720E_STOP_TEST)
+	$(V1720E_CLEAR_TEST) $(V1720E_STOP_TEST) $(V1720E_BLT_TEST) \
+	$(CAENVME_BLT_TEST) $(V792_BLT_TEST) $(V1190_FIFO_BLT_TEST) $(RPV130_BUSY_MOCK_TEST)
 	./$(IDLE_POLICY_TEST)
+	./$(RPV130_BUSY_MOCK_TEST)
 	./$(MANUAL_CLEAR_TEST)
 	./$(MANUAL_CLEAR_CONTRACT_TEST)
 	./$(START_ABORT_CONTRACT_TEST)
@@ -90,6 +100,10 @@ check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	./$(GLOBAL_BUSY_READINESS_TEST)
 	./$(V1720E_CLEAR_TEST)
 	./$(V1720E_STOP_TEST)
+	./$(V1720E_BLT_TEST)
+	./$(CAENVME_BLT_TEST)
+	./$(V792_BLT_TEST)
+	./$(V1190_FIFO_BLT_TEST)
 
 diagnostic: $(DIAG_TARGET)
 
@@ -112,6 +126,14 @@ $(DIAG_TARGET): $(DIAG_OBJS) $(MFEOBJ) $(MIDASLIB) $(LIBS)
 $(BIN_TEST_DIR)/test_rpv130_status: $(RPV130_TEST_OBJ) $(BUILD_DIR)/rpv130.o $(BUILD_DIR)/caenvme.o
 	@mkdir -p $(dir $@)
 	$(CXX) -o $@ $^ $(LIBS)
+
+$(RPV130_BUSY_MOCK_TEST): $(BUILD_DIR)/tests/test_rpv130_busy_mock.o $(BUILD_DIR)/rpv130.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(BUILD_DIR)/tests/test_rpv130_busy_mock.o: tests/test_rpv130_busy_mock.cxx rpv130.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(IDLE_POLICY_TEST): $(BUILD_DIR)/tests/test_fevme_idle_policy.o
 	@mkdir -p $(dir $@)
@@ -149,6 +171,25 @@ $(V1720E_STOP_TEST): $(BUILD_DIR)/tests/test_v1720e_stop_recovery.o \
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $^
 
+$(V1720E_BLT_TEST): $(BUILD_DIR)/tests/test_v1720e_blt32.o \
+	$(BUILD_DIR)/v1720e.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^
+
+$(CAENVME_BLT_TEST): $(BUILD_DIR)/tests/test_caenvme_blt_wrapper.o \
+	$(BUILD_DIR)/caenvme.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^ -Wl,--wrap=CAENVME_BLTReadCycle -lCAENVME
+
+$(V792_BLT_TEST): $(BUILD_DIR)/tests/test_v792_blt32.o $(BUILD_DIR)/v792_blt32.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^ -lCAENVME
+
+$(V1190_FIFO_BLT_TEST): $(BUILD_DIR)/tests/test_v1190_fifo_blt32.o \
+	$(BUILD_DIR)/v1190_fifo_blt32.o
+	@mkdir -p $(dir $@)
+	$(CC) -o $@ $^ -lCAENVME
+
 $(BIN_TEST_DIR)/%: $(BUILD_DIR)/tests/%.o
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $< -lCAENVME
@@ -172,6 +213,14 @@ $(BUILD_DIR)/out0_diagnostic.o: out0_diagnostic.cxx out0_diagnostic.h
 $(BUILD_DIR)/caenvme.o: caenvme.c caenvme.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/v792_blt32.o: v792_blt32.c v792_blt32.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/v1190_fifo_blt32.o: v1190_fifo_blt32.c v1190_fifo_blt32.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -std=c11 -Wextra -Wpedantic -c $< -o $@
 
 $(BUILD_DIR)/v792.o: $(MIDASSYS)/drivers/vme/v792.c
 	@mkdir -p $(dir $@)

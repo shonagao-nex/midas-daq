@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <atomic>
 #include <string>
 
 #include "midas.h"
@@ -12,6 +13,9 @@
 #include "vme/v792.h"
 #include "v775.h"
 #include "v1720e.h"
+#include "v792_blt32.h"
+#include "v1190_fifo_blt32.h"
+#include "caenvme.h"
 #include "rpv130.h"
 #include "global_busy.h"
 #include "out0_diagnostic.h"
@@ -34,7 +38,14 @@
 
 /* Bounded single-event readout limits and counter widths. */
 static const size_t V792_MAX_EVENT_WORDS = 64;
+enum V792ReadoutMode { V792_SINGLE_D32, V792_BLT32 };
+/* Source selection for the V792 hardware comparison run. */
+static const V792ReadoutMode V792_READOUT_MODE_SELECT = V792_BLT32;
 static const size_t V1190_MAX_EVENT_WORDS = 4096;
+enum V1190ReadoutMode { V1190_SINGLE_D32, V1190_EVENT_FIFO_BLT32 };
+static const V1190ReadoutMode V1190_READOUT_MODE_SELECT = V1190_EVENT_FIFO_BLT32;
+/* Set true for the original per-event Event FIFO Stored before/after checks. */
+static const bool V1190_FIFO_STRICT_SYNC_CHECK = false;
 static const size_t V775_MAX_EVENT_WORDS = 64;
 static const DWORD V7XX_EVENT_COUNTER_MASK = 0x00FFFFFF;
 static const DWORD V1190_EVENT_COUNTER_MASK = 0x003FFFFF;
@@ -68,9 +79,14 @@ static const DWORD V1190_SOFT_CLEAR = 0x1016;
 static const DWORD V1190_SOFT_TRIGGER = 0x101A;
 static const DWORD V1190_EVENT_COUNTER = 0x101C;
 static const DWORD V1190_EVENT_STORED = 0x1020;
+static const DWORD V1190_ALMOST_FULL_LEVEL = 0x1022;
 static const DWORD V1190_FIRMWARE_REVISION = 0x1026;
+static const DWORD V1190_OUT_PROG = 0x102C;
+static const WORD V1190_POUT_ALMOST_FULL = 2;
 static const DWORD V1190_MICRO_DATA = 0x102E;
 static const DWORD V1190_MICRO_HANDSHAKE = 0x1030;
+static const DWORD V1190_EVENT_FIFO_STATUS = V1190_FIFO_STATUS_OFFSET;
+static const DWORD V1190_EVENT_FIFO_STORED = V1190_FIFO_STORED_OFFSET;
 static const WORD V1190_CONTROL_EMPTY_EVENT = 0x0008;
 static const WORD V1190_CONTROL_EVENT_FIFO = 0x0100;
 static const WORD V1190_CONTROL_EXT_TRIGGER_TIME = 0x0200;
@@ -78,6 +94,7 @@ static const WORD V1190_STATUS_DATA_READY = 0x0001;
 static const WORD V1190_STATUS_ALMOST_FULL = 0x0002;
 static const WORD V1190_STATUS_FULL = 0x0004;
 static const WORD V1190_STATUS_TRIGGER_MATCH = 0x0008;
+static const WORD V1190_FIFO_STATUS_DATA_READY = 0x0001;
 static const WORD V1190_MICRO_WRITE_OK = 0x0001;
 static const WORD V1190_MICRO_READ_OK = 0x0002;
 
@@ -131,18 +148,149 @@ INT event_buffer_size = 10 * 1024 * 1024;       // MIDAS event buffer size [byte
 
 static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
+static std::atomic<bool> gBltStopRequested(false);
+static std::atomic<unsigned> gV1190BltDiagnosticCount(0);
+static std::atomic<unsigned> gV1720BltDiagnosticCount(0);
+static V1190_FIFO_BLT_STATE gV1190FifoBltState = {};
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
 static DWORD gRpv130LastPoll = 0;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
+static const char *RPV130_STATUS_PATH = "/Equipment/VME/Status/RPV130";
 static const char *RUN_COUNTERS_PATH = "/Equipment/VME/Variables/RunCounters";
 static const char *FRONTEND_VARIABLES_PATH =
     "/Equipment/VME/Variables/Frontend";
 static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
 static bool gRpv130EnabledForRun = true;
+static bool gSingleEventBusyEnabledForRun = false;
+static bool gRpv130BusyConfigured = false;
+
+/* First ten physics events per run only. Logging runs on function exit. */
+static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
+static std::atomic<unsigned> gRpv130TimingEventCount(0);
+static std::atomic<uint64_t> gRpv130PollReadyNs(0);
+static std::atomic<uint64_t> gRpv130LastPollMissNs(0);
+static std::atomic<uint64_t> gRpv130PollPreviousMissNs(0);
+
+static uint64_t monotonic_ns()
+{
+    struct timespec ts = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+}
+
+static double interval_us(uint64_t first, uint64_t second)
+{
+    return first && second && second >= first ?
+        static_cast<double>(second - first) / 1000.0 : -1.0;
+}
+
+struct Rpv130EventTiming {
+    bool active = false;
+    unsigned index = 0;
+    DWORD serial = 0;
+    const char *outcome = "incomplete";
+    uint64_t poll_ready_ns = 0;
+    uint64_t poll_previous_miss_ns = 0;
+    uint64_t read_start_ns = 0;
+    uint64_t csr_confirm_ns = 0;
+    uint64_t peers_start_ns = 0;
+    uint64_t peers_end_ns = 0;
+    uint64_t v1190_ready_start_ns = 0, v1190_ready_end_ns = 0;
+    uint64_t v775_ready_start_ns = 0, v775_ready_end_ns = 0;
+    uint64_t v1720_ready_start_ns = 0, v1720_ready_end_ns = 0;
+    uint64_t v792_start_ns = 0, v792_end_ns = 0;
+    uint64_t v1190_start_ns = 0, v1190_end_ns = 0;
+    uint64_t v775_start_ns = 0, v775_end_ns = 0;
+    uint64_t v1720_start_ns = 0, v1720_end_ns = 0;
+    uint64_t consistency_end_ns = 0;
+    uint64_t build_start_ns = 0, build_end_ns = 0;
+    uint64_t clear_call_ns = 0, clear_return_ns = 0;
+    RPV130_BUSY_TIMING writes = {};
+
+    ~Rpv130EventTiming()
+    {
+        if (!active) return;
+        const uint64_t return_ns = monotonic_ns();
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u serial=%u %s: poll_ready_monotonic_ns=%llu",
+               index, serial, outcome,
+               static_cast<unsigned long long>(poll_ready_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: prior miss->ready=%.3f us poll->read=%.3f us",
+               index,
+               interval_us(poll_previous_miss_ns, poll_ready_ns),
+               interval_us(poll_ready_ns, read_start_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: CSR1 read=%.3f us peer ready=%.3f us",
+               index,
+               interval_us(read_start_ns, csr_confirm_ns),
+               interval_us(peers_start_ns, peers_end_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u monotonic_ns: read=%llu BUSY1_CSR1=%llu",
+               index,
+               static_cast<unsigned long long>(read_start_ns),
+               static_cast<unsigned long long>(csr_confirm_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u monotonic_ns: CLR1_before=%llu CLR1_after=%llu",
+               index,
+               static_cast<unsigned long long>(writes.clr1_before_ns),
+               static_cast<unsigned long long>(writes.clr1_after_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u monotonic_ns: rearm_after=%llu",
+               index,
+               static_cast<unsigned long long>(writes.rearm_after_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: V1190 wait=%.3f us read=%.3f us",
+               index,
+               interval_us(v1190_ready_start_ns, v1190_ready_end_ns),
+               interval_us(v1190_start_ns, v1190_end_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: V775 wait=%.3f us read=%.3f us",
+               index,
+               interval_us(v775_ready_start_ns, v775_ready_end_ns),
+               interval_us(v775_start_ns, v775_end_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: V1720E wait=%.3f us read=%.3f us",
+               index,
+               interval_us(v1720_ready_start_ns, v1720_ready_end_ns),
+               interval_us(v1720_start_ns, v1720_end_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: V792 read=%.3f us mode=%s",
+               index, interval_us(v792_start_ns, v792_end_ns),
+               V792_READOUT_MODE_SELECT == V792_BLT32 ? "BLT32" : "SINGLE_D32");
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: peer_end->consistency=%.3f us build=%.3f us",
+               index, interval_us(peers_end_ns, consistency_end_ns),
+               interval_us(build_start_ns, build_end_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: build_end->CLR1=%.3f us CLR1 write=%.3f us",
+               index, interval_us(build_end_ns, writes.clr1_before_ns),
+               interval_us(writes.clr1_before_ns, writes.clr1_after_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: CLR1->rearm=%.3f us build_end->driver=%.3f us",
+               index, interval_us(writes.clr1_after_ns, writes.rearm_after_ns),
+               interval_us(build_end_ns, clear_call_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: driver->CLR1=%.3f us rearm->driver_return=%.3f us",
+               index,
+               interval_us(clear_call_ns, writes.clr1_before_ns),
+               interval_us(writes.rearm_after_ns, clear_return_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: driver_return->read_return=%.3f us "
+               "poll->CLR1=%.3f us",
+               index,
+               interval_us(clear_return_ns, return_ns),
+               interval_us(poll_ready_ns, writes.clr1_before_ns));
+        cm_msg(MINFO, frontend_name,
+               "RPV130 timing %u: poll->read_return=%.3f us "
+               "(-1=unavailable/disabled)",
+               index, interval_us(poll_ready_ns, return_ns));
+    }
+};
 
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
 static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
@@ -200,6 +348,8 @@ static INT gV1720StartupRunState = -1;
 static bool gV1720VariablesEnabled = true;
 static DWORD gV1720ExpectedEventWords = V1720E_DEFAULT_EVENT_WORDS;
 static DWORD gV1720ExpectedChannelMask = V1720E_DEFAULT_CHANNEL_MASK;
+/* Change this source constant to BLT32 for the hardware comparison run. */
+static const V1720E_READOUT_MODE V1720E_READOUT_MODE_SELECT = BLT32;
 static const DWORD V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
 static const DWORD V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
 
@@ -390,6 +540,9 @@ struct V1190ReadbackSnapshot {
     WORD error_mask;
     DWORD effective_fifo_size_words;
     WORD control_raw;
+    WORD pout_selection;
+    char pout_function[16];
+    WORD almost_full_level_words;
 };
 
 struct V775ReadbackSnapshot {
@@ -442,6 +595,7 @@ struct VmeRunSnapshot {
     V775Settings v775_requested;
     V1720ESettings v1720e_requested;
     BOOL rpv130_enabled;
+    BOOL rpv130_single_event_busy_enabled;
     V792ReadbackSnapshot v792_readback;
     V1190ReadbackSnapshot v1190_readback;
     V775ReadbackSnapshot v775_readback;
@@ -785,6 +939,8 @@ static bool publish_vme_run_snapshot()
          TID_WORD);
     SNAP("Requested/RPV130/Enabled", gVmeRunSnapshot.rpv130_enabled, 1,
          TID_BOOL);
+    SNAP("Requested/RPV130/SingleEventBusyEnabled",
+         gVmeRunSnapshot.rpv130_single_event_busy_enabled, 1, TID_BOOL);
 
     SNAP("Readback/V792/Valid", gVmeRunSnapshot.v792_readback.valid, 1,
          TID_BOOL);
@@ -831,6 +987,10 @@ static bool publish_vme_run_snapshot()
     SNAP("Readback/V1190/EffectiveFifoSizeWords",
          r1190.effective_fifo_size_words, 1, TID_DWORD);
     SNAP("Readback/V1190/ControlRaw", r1190.control_raw, 1, TID_WORD);
+    SNAP("Readback/V1190/POUTSelection", r1190.pout_selection, 1, TID_WORD);
+    SNAP_STRING("Readback/V1190/POUTFunction", r1190.pout_function);
+    SNAP("Readback/V1190/AlmostFullLevelWords",
+         r1190.almost_full_level_words, 1, TID_WORD);
 
     const V775ReadbackSnapshot &r775 = gVmeRunSnapshot.v775_readback;
     SNAP("Readback/V775/Valid", r775.valid, 1, TID_BOOL);
@@ -904,6 +1064,7 @@ static bool publish_vme_run_snapshot()
 static bool initialize_rpv130_odb()
 {
     const BOOL default_enabled = TRUE;
+    const BOOL default_single_event_busy = FALSE;
     const DWORD base_address = RPV130_BASE_ADDRESS;
     const char address_modifier[] = "A16_ND";
     const char register_width[] = "D16";
@@ -920,6 +1081,23 @@ static bool initialize_rpv130_odb()
                                 sizeof(startup_enabled), TID_BOOL))
         return false;
     gRpv130EnabledForRun = startup_enabled != FALSE;
+    if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH,
+                       "SingleEventBusyEnabled") ||
+        !ensure_odb_value(path, &default_single_event_busy,
+                          sizeof(default_single_event_busy), 1, TID_BOOL))
+        return false;
+    BOOL startup_busy_enabled = FALSE;
+    if (!get_absolute_odb_value(path, &startup_busy_enabled,
+                                sizeof(startup_busy_enabled), TID_BOOL))
+        return false;
+    gSingleEventBusyEnabledForRun = startup_busy_enabled != FALSE;
+    if (!set_module_output(RPV130_STATUS_PATH, "Busy1",
+                           &default_single_event_busy,
+                           sizeof(default_single_event_busy), 1, TID_BOOL) ||
+        !set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed",
+                           &default_single_event_busy,
+                           sizeof(default_single_event_busy), 1, TID_BOOL))
+        return false;
 
 #define SET_RPV130_INFO(name, value, size, type) \
     do { \
@@ -988,9 +1166,11 @@ static void publish_rpv130_disabled_state()
                       sizeof(zero), 1, TID_BYTE);
 }
 
+static void fail_single_event_busy(const char *reason);
+
 static void publish_rpv130_status(bool force)
 {
-    if (!gRpv130EnabledForRun || !gVme)
+    if ((!gRpv130EnabledForRun && !gSingleEventBusyEnabledForRun) || !gVme)
         return;
     const DWORD now = ss_millitime();
     if (!force &&
@@ -1007,6 +1187,9 @@ static void publish_rpv130_status(bool force)
         cm_msg(MERROR, frontend_name,
                "RPV130 read-only status poll failed at base 0x%04X: status %d",
                RPV130_BASE_ADDRESS, read_result);
+        if (gSingleEventBusyEnabledForRun &&
+            global_busy::readout_allowed())
+            fail_single_event_busy("RPV130 status/CSR1 poll failed");
     }
 
     set_module_output(RPV130_VARIABLES_PATH, "Latch1", &status.latch1,
@@ -1021,6 +1204,16 @@ static void publish_rpv130_status(bool force)
                       sizeof(status.csr1), 1, TID_BYTE);
     set_module_output(RPV130_VARIABLES_PATH, "CSR2", &status.csr2,
                       sizeof(status.csr2), 1, TID_BYTE);
+    const BOOL busy1 = (status.csr1 & RPV130_CSR1_BUSY1) ? TRUE : FALSE;
+    const BOOL armed = communication_ok && gRpv130BusyConfigured &&
+        (status.csr1 & RPV130_CSR1_CHANNEL1_ARMED) ==
+            RPV130_CSR1_CHANNEL1_ARMED ? TRUE : FALSE;
+    // Keep the last hardware-derived BUSY1 value when CSR1 cannot be read.
+    if (communication_ok)
+        set_module_output(RPV130_STATUS_PATH, "Busy1", &busy1,
+                          sizeof(busy1), 1, TID_BOOL);
+    set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &armed,
+                      sizeof(armed), 1, TID_BOOL);
     set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK",
                       &communication_ok, sizeof(communication_ok), 1,
                       TID_BOOL);
@@ -1028,6 +1221,85 @@ static void publish_rpv130_status(bool force)
     set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun",
                       &enabled_for_run, sizeof(enabled_for_run), 1,
                       TID_BOOL);
+}
+
+static bool publish_rpv130_busy_state(bool busy, bool armed)
+{
+    const BOOL b = busy ? TRUE : FALSE;
+    const BOOL a = armed ? TRUE : FALSE;
+    return set_module_output(RPV130_STATUS_PATH, "Busy1", &b,
+                             sizeof(b), 1, TID_BOOL) &&
+           set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &a,
+                             sizeof(a), 1, TID_BOOL);
+}
+
+static void fail_single_event_busy(const char *reason)
+{
+    if (!gSingleEventBusyEnabledForRun) return;
+    gReadoutFailed = true;
+    global_busy::disable_readout();
+    cm_msg(MERROR, frontend_name, "RPV130 Single Event BUSY held: %s", reason);
+    if (!global_busy::set_global_busy(true))
+        cm_msg(MERROR, frontend_name,
+               "Cannot assert V3718 Global BUSY after RPV130/readout failure");
+    const BOOL no = FALSE;
+    set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &no,
+                      sizeof(no), 1, TID_BOOL);
+}
+
+static bool arm_rpv130_single_event_busy()
+{
+    if (!gSingleEventBusyEnabledForRun) return true;
+    // A failed first write still needs a later cleanup attempt under Global BUSY.
+    gRpv130BusyConfigured = true;
+    if (!global_busy::set_global_busy(true)) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot verify Global BUSY before arming RPV130 FIN1");
+        return false;
+    }
+    uint8_t csr1 = 0;
+    const int rc = rpv130_clear_busy1_and_rearm(
+        gVme, RPV130_BASE_ADDRESS, &csr1);
+    if (rc != MVME_SUCCESS || (csr1 & RPV130_CSR1_BUSY1)) {
+        cm_msg(MERROR, frontend_name,
+               "RPV130 FIN1 arm/CSR1 readback failed: status %d CSR1=0x%02X",
+               rc, csr1);
+        const BOOL no = FALSE;
+        set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed",
+                          &no, sizeof(no), 1, TID_BOOL);
+        return false;
+    }
+    if (!publish_rpv130_busy_state(false, true)) return false;
+    cm_msg(MINFO, frontend_name,
+           "RPV130 Single Event BUSY armed: FIN1->BOUT1, CSR1=0x%02X",
+           csr1);
+    return true;
+}
+
+static bool quiesce_rpv130_single_event_busy(const char *context)
+{
+    if (!gSingleEventBusyEnabledForRun || !gVme) return true;
+    // Never release BUSY1 before OUT0 has been asserted and verified.
+    if (!global_busy::set_global_busy(true)) {
+        cm_msg(MERROR, frontend_name,
+               "RPV130 %s: Global BUSY assertion failed; BUSY1 left untouched",
+               context);
+        return false;
+    }
+    uint8_t csr1 = 0;
+    const int rc = rpv130_clear_busy1_and_disable(
+        gVme, RPV130_BASE_ADDRESS, &csr1);
+    if (rc != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name,
+               "RPV130 %s: CLR1/disable/readback failed: status %d CSR1=0x%02X",
+               context, rc, csr1);
+        const BOOL no = FALSE;
+        set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed",
+                          &no, sizeof(no), 1, TID_BOOL);
+        return false;
+    }
+    gRpv130BusyConfigured = false;
+    return publish_rpv130_busy_state(false, false);
 }
 
 static bool publish_module_info(const char *path, DWORD base_address,
@@ -1224,6 +1496,10 @@ static void initialize_module_output_schema()
     set_module_output(V1190_READBACK_PATH,"ErrorMask",&zword,sizeof(zword),1,TID_WORD);
     set_module_output(V1190_READBACK_PATH,"EffectiveFifoSizeWords",&zdword,sizeof(zdword),1,TID_DWORD);
     set_module_output(V1190_READBACK_PATH,"ControlRaw",&zword,sizeof(zword),1,TID_WORD);
+    set_module_output(V1190_READBACK_PATH,"POUTSelection",&zword,sizeof(zword),1,TID_WORD);
+    const char unknown_pout[]="Unknown";
+    set_module_output(V1190_READBACK_PATH,"POUTFunction",unknown_pout,sizeof(unknown_pout),1,TID_STRING);
+    set_module_output(V1190_READBACK_PATH,"AlmostFullLevelWords",&zword,sizeof(zword),1,TID_WORD);
 
     set_module_readback_valid(V775_READBACK_PATH,false);
     set_module_output(V775_READBACK_PATH,"FirmwareRevision",&zword,sizeof(zword),1,TID_WORD);
@@ -1852,6 +2128,65 @@ static V792EventInfo read_v792_single_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
     return event;
 }
 
+static int v792_blt_header_read(void *context, uint32_t address, uint32_t *word)
+{
+    return mvme_read(static_cast<MVME_INTERFACE *>(context), word, address,
+                     sizeof(*word)) == MVME_SUCCESS ? 0 : -1;
+}
+
+static int v792_blt_transfer(void *context, uint32_t address, void *destination,
+                             int requested_bytes, int *actual_bytes)
+{
+    const MVME_INTERFACE *vme = static_cast<MVME_INTERFACE *>(context);
+    return caenvme_a24_blt_read32(vme->handle, address, destination,
+                                  requested_bytes, actual_bytes);
+}
+
+static V792EventInfo read_v792_blt32_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
+{
+    V792EventInfo event = {};
+    int saved_mode = 0;
+    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name, "V792 BLT32 cannot get VME data mode");
+        return event;
+    }
+    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
+        mvme_set_dmode(gVme, saved_mode);
+        cm_msg(MERROR, frontend_name, "V792 BLT32 cannot select D32 header mode");
+        return event;
+    }
+    const V792_BLT_IO io = {v792_blt_header_read, v792_blt_transfer, gVme};
+    V792_BLT_RESULT result = {};
+    const V792_BLT_STATUS status = v792_read_blt32(
+        &io, V792_BASE, data, V792_MAX_EVENT_WORDS, &result);
+    const int restore_status = mvme_set_dmode(gVme, saved_mode);
+    static std::atomic<unsigned> diagnostic_count{0};
+    if (result.requested_bytes != 0 &&
+        diagnostic_count.fetch_add(1, std::memory_order_relaxed) < 10) {
+        cm_msg(MINFO, frontend_name,
+               "V792 BLT32: requested=%d actual=%d bytes CAEN status=%d validation=%d",
+               result.requested_bytes, result.actual_bytes,
+               result.caen_status, static_cast<int>(status));
+    }
+    if (status != V792_BLT_OK || restore_status != MVME_SUCCESS) {
+        gBltStopRequested.store(true, std::memory_order_relaxed);
+        cm_msg(MERROR, frontend_name,
+               "V792 BLT32 readout failed: validation=%d CAEN status=%d requested=%d actual=%d restore=%d",
+               static_cast<int>(status), result.caen_status,
+               result.requested_bytes, result.actual_bytes, restore_status);
+        return event;
+    }
+    event.words = result.words;
+    event.event_counter = result.event_counter;
+    event.expected_measurements = result.measurements;
+    event.measurements = result.measurements;
+    event.geo = result.geo;
+    event.valid = true;
+    gV792Runtime.event_counter = event.event_counter;
+    gV792Runtime.dirty = true;
+    return event;
+}
+
 /* Read exactly one V1190 event through its Global Trailer using D32 cycles. */
 static V1190EventInfo read_v1190_single_event(DWORD (&data)[V1190_MAX_EVENT_WORDS])
 {
@@ -1942,6 +2277,84 @@ static V1190EventInfo read_v1190_single_event(DWORD (&data)[V1190_MAX_EVENT_WORD
         event.words = 0;
         event.valid = false;
     }
+    return event;
+}
+
+static int v1190_fifo_read16(void *, uint32_t address, uint16_t *value)
+{
+    WORD readback = 0;
+    if (!vme_read16(address, readback, "V1190 Event FIFO D16 read")) return -1;
+    *value = readback;
+    return 0;
+}
+
+static int v1190_fifo_read32(void *, uint32_t address, uint32_t *value)
+{
+    DWORD readback = 0;
+    if (!vme_read32(address, readback, "V1190 Event FIFO entry read")) return -1;
+    *value = readback;
+    return 0;
+}
+
+static V1190EventInfo read_v1190_fifo_blt32_event(
+    DWORD (&data)[V1190_MAX_EVENT_WORDS], V1190_FIFO_BLT_TIMING &phases,
+    bool &diagnostic)
+{
+    V1190EventInfo event = {};
+    const V1190_FIFO_BLT_IO io = {v1190_fifo_read16, v1190_fifo_read32,
+                                  v792_blt_transfer, gVme};
+    V1190_FIFO_BLT_RESULT result = {};
+    const V1190_FIFO_BLT_STATUS status = v1190_fifo_read_blt32(
+        &io, V1190_BASE, data, V1190_MAX_EVENT_WORDS,
+        V1190_FIFO_STRICT_SYNC_CHECK, &gV1190FifoBltState, &result);
+    phases = result.timing;
+    diagnostic = gV1190BltDiagnosticCount.fetch_add(
+        1, std::memory_order_relaxed) < 10;
+    if (diagnostic) {
+        cm_msg(MINFO, frontend_name,
+               "V1190 BLT FIFO=%u stored=%d->%d req=%d got=%d CAEN=%d",
+               static_cast<unsigned>(result.fifo_word_count),
+               result.timing.stored_before_checked ?
+                   static_cast<int>(result.stored_before) : -1,
+               result.timing.stored_after_checked ?
+                   static_cast<int>(result.stored_after) : -1,
+               result.requested_bytes, result.actual_bytes,
+               result.caen_status);
+        cm_msg(MINFO, frontend_name,
+               "V1190 BLT trailer=%u ctr=%04X/%06X match=%d status=%d",
+               static_cast<unsigned>(result.trailer_word_count),
+               static_cast<unsigned>(result.fifo_event_counter),
+               static_cast<unsigned>(result.event_counter),
+               result.counter_consistent, static_cast<int>(status));
+    }
+    if (status != V1190_FIFO_BLT_OK) {
+        /* The FIFO entry and/or Output Buffer may have advanced. Never retry. */
+        gBltStopRequested.store(true, std::memory_order_relaxed);
+        if (!V1190_FIFO_STRICT_SYNC_CHECK &&
+            status == V1190_FIFO_BLT_STORED_MISMATCH)
+            cm_msg(MERROR, frontend_name,
+                   "V1190 FIFO periodic sync failed: stored_after=%u expected=0",
+                   static_cast<unsigned>(result.stored_after));
+        cm_msg(MERROR, frontend_name,
+               "V1190 BLT error s=%d c=%d n=%u req=%d got=%d",
+               static_cast<int>(status), result.caen_status,
+               static_cast<unsigned>(result.fifo_word_count),
+               result.requested_bytes,
+               result.actual_bytes);
+        return event;
+    }
+    if (!V1190_FIFO_STRICT_SYNC_CHECK && result.timing.stored_after_checked)
+        cm_msg(MINFO, frontend_name,
+               "V1190 FIFO check: event=%llu stored_after=%u OK",
+               static_cast<unsigned long long>(
+                   gV1190FifoBltState.successful_event_count),
+               static_cast<unsigned>(result.stored_after));
+    event.words = result.words;
+    event.event_counter = result.event_counter;
+    event.trailer_word_count = result.trailer_word_count;
+    event.valid = true;
+    gV1190Runtime.event_counter = event.event_counter;
+    gV1190Runtime.dirty = true;
     return event;
 }
 
@@ -2658,6 +3071,7 @@ struct V1190Configuration {
     WORD mode, trigger[5], edge, resolution, dead_time, header, max_hits;
     WORD error_mask, fifo_size, channels[V1190_CHANNEL_MASK_WORDS];
     WORD control, status, firmware, rom_version;
+    WORD pout_selection, almost_full_level_words;
 };
 
 static bool read_v1190_configuration(V1190Configuration &c)
@@ -2675,6 +3089,10 @@ static bool read_v1190_configuration(V1190Configuration &c)
                                     V1190_CHANNEL_MASK_WORDS) &&
            vme_read16(V1190_BASE + V1190_CONTROL, c.control, "V1190 Control") &&
            vme_read16(V1190_BASE + V1190_STATUS, c.status, "V1190 Status") &&
+           vme_read16(V1190_BASE + V1190_OUT_PROG, c.pout_selection,
+                      "V1190 POUT selection") &&
+           vme_read16(V1190_BASE + V1190_ALMOST_FULL_LEVEL,
+                      c.almost_full_level_words, "V1190 Almost Full Level") &&
            vme_read16(V1190_BASE + V1190_FIRMWARE_REVISION, c.firmware,
                       "V1190 Firmware Revision") &&
            vme_read16(V1190_BASE + V1190_CONFIGURATION_ROM_VERSION,
@@ -2685,6 +3103,55 @@ static int decode_signed_12(WORD value)
 {
     int result=value&0x0FFF;
     return (result&0x0800)?result-0x1000:result;
+}
+
+static const char *v1190_pout_function(WORD selection)
+{
+    static const char *const names[] = {
+        "DATA_READY", "FULL", "ALMOST_FULL", "ERROR"
+    };
+    return selection < 4 ? names[selection] : "UNKNOWN";
+}
+
+/* POUT is a frontend hardware setting, independent of BOR run settings. */
+static bool configure_v1190_pout_startup()
+{
+    if (!gV1190RunSettings.enabled) return true;
+    if (!vme_write16(V1190_BASE + V1190_OUT_PROG,
+                     V1190_POUT_ALMOST_FULL, "V1190 startup POUT ALMOST_FULL"))
+        return false;
+
+    WORD actual = 0;
+    if (!vme_read16(V1190_BASE + V1190_OUT_PROG, actual,
+                    "V1190 startup POUT readback"))
+        return false;
+    if (actual != V1190_POUT_ALMOST_FULL) {
+        cm_msg(MERROR, frontend_name,
+               "V1190 startup POUT mismatch: expected ALMOST_FULL (0x%04X), actual %s (0x%04X)",
+               V1190_POUT_ALMOST_FULL, v1190_pout_function(actual), actual);
+        return false;
+    }
+
+    WORD almost_full_level = 0;
+    if (!vme_read16(V1190_BASE + V1190_ALMOST_FULL_LEVEL,
+                    almost_full_level, "V1190 startup Almost Full Level"))
+        return false;
+    const char *function = v1190_pout_function(actual);
+    if (!set_module_output(V1190_READBACK_PATH, "POUTSelection", &actual,
+                           sizeof(actual), 1, TID_WORD) ||
+        !set_module_output(V1190_READBACK_PATH, "POUTFunction", function,
+                           strlen(function) + 1, 1, TID_STRING) ||
+        !set_module_output(V1190_READBACK_PATH, "AlmostFullLevelWords",
+                           &almost_full_level, sizeof(almost_full_level),
+                           1, TID_WORD)) {
+        cm_msg(MERROR, frontend_name,
+               "Cannot publish V1190 startup POUT readback");
+        return false;
+    }
+    cm_msg(MINFO, frontend_name,
+           "V1190 startup POUT expected=ALMOST_FULL (0x%04X) actual=%s (0x%04X); Almost Full Level=%u words",
+           V1190_POUT_ALMOST_FULL, function, actual, almost_full_level);
+    return true;
 }
 
 static bool encode_v1190_semantics(const V1190Settings &s, WORD &resolution,
@@ -2734,11 +3201,17 @@ static bool validate_and_snapshot_module_settings()
 static bool snapshot_rpv130_enabled_for_run()
 {
     char path[256];
-    BOOL enabled = FALSE;
+    BOOL enabled = FALSE, single_event_busy = FALSE;
     if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH, "Enabled") ||
         !get_absolute_odb_value(path, &enabled, sizeof(enabled), TID_BOOL))
         return false;
     gRpv130EnabledForRun = enabled != FALSE;
+    if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH,
+                       "SingleEventBusyEnabled") ||
+        !get_absolute_odb_value(path, &single_event_busy,
+                                sizeof(single_event_busy), TID_BOOL))
+        return false;
+    gSingleEventBusyEnabledForRun = single_event_busy != FALSE;
     return true;
 }
 
@@ -2750,6 +3223,8 @@ static void capture_vme_requested_snapshot()
     gVmeRunSnapshot.v1720e_requested = gV1720RunSettings;
     gVmeRunSnapshot.rpv130_enabled =
         gRpv130EnabledForRun ? TRUE : FALSE;
+    gVmeRunSnapshot.rpv130_single_event_busy_enabled =
+        gSingleEventBusyEnabledForRun ? TRUE : FALSE;
     gVmeRunSnapshot.enabled_for_run =
         (gV792RunSettings.enabled || gV1190RunSettings.enabled ||
          gV775RunSettings.enabled || gV1720RunSettings.enabled ||
@@ -2854,6 +3329,37 @@ static bool configure_v792_for_run()
            vme_write16(V792_BASE + atreg,V792_BIT2_ALL_TRIGGER,"V792 ALL TRG");
 }
 
+static bool configure_v1190_control_for_run(WORD current)
+{
+    const WORD mask = V1190_CONTROL_EMPTY_EVENT |
+                      V1190_CONTROL_EVENT_FIFO |
+                      V1190_CONTROL_EXT_TRIGGER_TIME;
+    WORD requested = 0;
+    if (gV1190RunSettings.empty_event_enabled)
+        requested |= V1190_CONTROL_EMPTY_EVENT;
+    /* The source-selected BLT mode requires a FIFO entry for each event. */
+    if (gV1190RunSettings.event_fifo_enabled ||
+        V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
+        requested |= V1190_CONTROL_EVENT_FIFO;
+    if (gV1190RunSettings.extended_trigger_time_enabled)
+        requested |= V1190_CONTROL_EXT_TRIGGER_TIME;
+    const WORD control = WORD((current & ~mask) | requested);
+    if (!vme_write16(V1190_BASE + V1190_CONTROL, control,
+                     "V1190 Control run settings")) return false;
+    if (V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32) {
+        WORD readback = 0;
+        if (!vme_read16(V1190_BASE + V1190_CONTROL, readback,
+                        "V1190 Event FIFO enable readback")) return false;
+        if (!(readback & V1190_CONTROL_EVENT_FIFO)) {
+            cm_msg(MERROR, frontend_name,
+                   "V1190 Event FIFO enable readback failed: Control=0x%04X",
+                   readback);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool configure_v1190_for_run()
 {
     if (!gV1190RunSettings.enabled) return true;
@@ -2877,13 +3383,7 @@ static bool configure_v1190_for_run()
         !v1190_micro_write_command(V1190_OPCODE_WRITE_CHANNEL_MASK,channels,V1190_CHANNEL_MASK_WORDS) ||
         !v1190_micro_write_command(gV1190RunSettings.tdc_header_enabled?V1190_OPCODE_ENABLE_TDC_HEADER:V1190_OPCODE_DISABLE_TDC_HEADER,NULL,0) ||
         !vme_read16(V1190_BASE + V1190_CONTROL, control, "V1190 Control RMW read")) return false;
-    const WORD mask=V1190_CONTROL_EMPTY_EVENT|V1190_CONTROL_EVENT_FIFO|V1190_CONTROL_EXT_TRIGGER_TIME;
-    WORD requested=0;
-    if(gV1190RunSettings.empty_event_enabled) requested|=V1190_CONTROL_EMPTY_EVENT;
-    if(gV1190RunSettings.event_fifo_enabled) requested|=V1190_CONTROL_EVENT_FIFO;
-    if(gV1190RunSettings.extended_trigger_time_enabled) requested|=V1190_CONTROL_EXT_TRIGGER_TIME;
-    control=WORD((control&~mask)|requested);
-    return vme_write16(V1190_BASE + V1190_CONTROL, control, "V1190 Control run settings");
+    return configure_v1190_control_for_run(control);
 }
 
 static bool configure_v775_for_run()
@@ -3019,9 +3519,19 @@ static bool verify_v1190_configuration()
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i)
         V1190_VERIFY("Channel mask word",channels[i],c.channels[i]);
     V1190_VERIFY("Empty Event",gV1190RunSettings.empty_event_enabled,!!(c.control&V1190_CONTROL_EMPTY_EVENT));
-    V1190_VERIFY("Event FIFO",gV1190RunSettings.event_fifo_enabled,!!(c.control&V1190_CONTROL_EVENT_FIFO));
+    V1190_VERIFY("Event FIFO",
+                 gV1190RunSettings.event_fifo_enabled ||
+                     V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32,
+                 !!(c.control&V1190_CONTROL_EVENT_FIFO));
     V1190_VERIFY("Extended Trigger Time Tag",gV1190RunSettings.extended_trigger_time_enabled,
                  !!(c.control & V1190_CONTROL_EXT_TRIGGER_TIME));
+    V1190_VERIFY("POUT selection", V1190_POUT_ALMOST_FULL,
+                 c.pout_selection);
+    cm_msg(MINFO, frontend_name,
+           "V1190 POUT expected=ALMOST_FULL (%u) actual=%s (0x%04X); Almost Full Level=%u words",
+           V1190_POUT_ALMOST_FULL,
+           v1190_pout_function(c.pout_selection),
+           c.pout_selection, c.almost_full_level_words);
 #undef V1190_VERIFY
     V1190Settings rb={}; rb.trigger_matching_enabled=!!(c.mode&1); rb.window_width=c.trigger[0]&0xFFF;
     rb.window_offset=decode_signed_12(c.trigger[1]); rb.extra_search_margin=c.trigger[2]&0xFFF; rb.reject_margin=c.trigger[3]&0xFFF;
@@ -3040,12 +3550,23 @@ static bool verify_v1190_configuration()
     gVmeRunSnapshot.v1190_readback.effective_fifo_size_words =
         (c.fifo_size & 0xF) <= 7 ? (1u << ((c.fifo_size & 0xF) + 1)) : 0;
     gVmeRunSnapshot.v1190_readback.control_raw = c.control;
+    gVmeRunSnapshot.v1190_readback.pout_selection = c.pout_selection;
+    snprintf(gVmeRunSnapshot.v1190_readback.pout_function,
+             sizeof(gVmeRunSnapshot.v1190_readback.pout_function), "%s",
+             v1190_pout_function(c.pout_selection));
+    gVmeRunSnapshot.v1190_readback.almost_full_level_words =
+        c.almost_full_level_words;
 #define P1190(k,m,cnt,t) set_module_output(V1190_READBACK_PATH,k,&rb.m,sizeof(rb.m),cnt,t)
     set_module_output(V1190_READBACK_PATH,"FirmwareRevision",&c.firmware,sizeof(c.firmware),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"ConfigurationRomVersion",&c.rom_version,sizeof(c.rom_version),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"BoardType",board,strlen(board)+1,1,TID_STRING);
     P1190("TriggerMatchingEnabled",trigger_matching_enabled,1,TID_BOOL); P1190("WindowWidth",window_width,1,TID_DWORD); P1190("WindowOffset",window_offset,1,TID_INT); P1190("ExtraSearchMargin",extra_search_margin,1,TID_DWORD); P1190("RejectMargin",reject_margin,1,TID_DWORD); P1190("TriggerSubtractionEnabled",trigger_subtraction_enabled,1,TID_BOOL); P1190("EdgeMode",edge_mode,1,TID_DWORD); P1190("ResolutionPs",resolution_ps,1,TID_DWORD); P1190("DeadTimeNs",dead_time_ns,1,TID_DWORD); P1190("MaxHitsPerEvent",max_hits_per_event,1,TID_INT); P1190("TdcHeaderEnabled",tdc_header_enabled,1,TID_BOOL); P1190("EmptyEventEnabled",empty_event_enabled,1,TID_BOOL); P1190("EventFifoEnabled",event_fifo_enabled,1,TID_BOOL); P1190("ExtendedTriggerTimeEnabled",extended_trigger_time_enabled,1,TID_BOOL); P1190("ChannelEnabled",channel_enabled,128,TID_BOOL);
 #undef P1190
     WORD error=c.error_mask&0x7FF; DWORD fifo=(c.fifo_size&0xF)<=7?(1u<<((c.fifo_size&0xF)+1)):0;
-    set_module_output(V1190_READBACK_PATH,"ErrorMask",&error,sizeof(error),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"EffectiveFifoSizeWords",&fifo,sizeof(fifo),1,TID_DWORD); set_module_output(V1190_READBACK_PATH,"ControlRaw",&c.control,sizeof(c.control),1,TID_WORD); set_module_readback_valid(V1190_READBACK_PATH,ok);
+    set_module_output(V1190_READBACK_PATH,"ErrorMask",&error,sizeof(error),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"EffectiveFifoSizeWords",&fifo,sizeof(fifo),1,TID_DWORD); set_module_output(V1190_READBACK_PATH,"ControlRaw",&c.control,sizeof(c.control),1,TID_WORD);
+    set_module_output(V1190_READBACK_PATH,"POUTSelection",&c.pout_selection,sizeof(c.pout_selection),1,TID_WORD);
+    const char *pout_function = v1190_pout_function(c.pout_selection);
+    set_module_output(V1190_READBACK_PATH,"POUTFunction",pout_function,strlen(pout_function)+1,1,TID_STRING);
+    set_module_output(V1190_READBACK_PATH,"AlmostFullLevelWords",&c.almost_full_level_words,sizeof(c.almost_full_level_words),1,TID_WORD);
+    set_module_readback_valid(V1190_READBACK_PATH,ok);
     return ok;
 }
 
@@ -3303,6 +3824,21 @@ static bool verify_run_start_state()
         cm_msg(MERROR, frontend_name, "BOR run-start verify failed: module buffer is not empty");
         return false;
     }
+    if (gV1190RunSettings.enabled &&
+        V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32) {
+        WORD fifo_status = 0, fifo_stored = 0;
+        if (!vme_read16(V1190_BASE + V1190_EVENT_FIFO_STATUS,
+                        fifo_status, "V1190 run-start Event FIFO Status") ||
+            !vme_read16(V1190_BASE + V1190_EVENT_FIFO_STORED,
+                        fifo_stored, "V1190 run-start Event FIFO Stored"))
+            return false;
+        if ((fifo_status & V1190_FIFO_STATUS_DATA_READY) || fifo_stored) {
+            cm_msg(MERROR, frontend_name,
+                   "BOR run-start verify failed: Event FIFO not empty (status=0x%04X stored=%u)",
+                   fifo_status, fifo_stored);
+            return false;
+        }
+    }
     printf("BOR configuration complete:\n  V792  : %s\n  V1190 : %s\n"
            "  V775  : %s\n"
            "  V1720E: %s\n  Buffers empty\n"
@@ -3402,6 +3938,7 @@ static void setup_v792_sw_trigger_test()
 static void reset_run_statistics()
 {
     gReadoutFailed = false;
+    gBltStopRequested.store(false, std::memory_order_relaxed);
     gRunStatistics = {};
     gRunStatistics.v1720_min_ttt_delta = 0x7FFFFFFFu;
 }
@@ -3454,7 +3991,7 @@ static void refresh_enabled_module_variables()
 }
 
 
-/* Open VME and verify both modules without changing their configuration. */
+/* Open VME, check modules, and initialize frontend-owned hardware settings. */
 static INT start_abort(INT run_number, char *error);
 
 INT frontend_init()
@@ -3568,6 +4105,13 @@ INT frontend_init()
         global_busy::attach(NULL);
         return FE_ERR_ODB;
     }
+    if (current_run_state == STATE_STOPPED &&
+        !quiesce_rpv130_single_event_busy("STOPPED frontend startup")) {
+        mvme_close(gVme);
+        gVme = NULL;
+        global_busy::attach(NULL);
+        return FE_ERR_HW;
+    }
     if (gV1720StartupEnabled && current_run_state == STATE_STOPPED) {
         DWORD control = 0, acquisition_status = 0;
         const int read_status = v1720e_read_run_state(
@@ -3602,6 +4146,39 @@ INT frontend_init()
                "V1720E startup auto-stop skipped: MIDAS state %d",
                current_run_state);
     }
+    if (gV1190RunSettings.enabled) {
+        INT state_before_pout = 0;
+        INT transition_in_progress = 0;
+        if (!get_absolute_odb_value("/Runinfo/State", &state_before_pout,
+                                    sizeof(state_before_pout), TID_INT) ||
+            !get_absolute_odb_value("/Runinfo/Transition in progress",
+                                    &transition_in_progress,
+                                    sizeof(transition_in_progress), TID_INT)) {
+            cm_msg(MERROR, frontend_name,
+                   "Cannot verify MIDAS transition state before V1190 startup POUT setting");
+            mvme_close(gVme);
+            gVme = NULL;
+            global_busy::attach(NULL);
+            return FE_ERR_ODB;
+        }
+        if (state_before_pout != STATE_STOPPED || transition_in_progress) {
+            cm_msg(MERROR, frontend_name,
+                   "V1190 startup POUT setting requires stable STOPPED state; MIDAS state %d transition %d",
+                   state_before_pout, transition_in_progress);
+            mvme_close(gVme);
+            gVme = NULL;
+            global_busy::attach(NULL);
+            return FE_ERR_HW;
+        }
+        if (!configure_v1190_pout_startup()) {
+            cm_msg(MERROR, frontend_name,
+                   "V1190 startup POUT configuration failed; fevme startup refused");
+            mvme_close(gVme);
+            gVme = NULL;
+            global_busy::attach(NULL);
+            return FE_ERR_HW;
+        }
+    }
     return SUCCESS;
 }
 
@@ -3611,6 +4188,8 @@ INT frontend_exit()
 {
     global_busy::publish_ready(true, false, 0);
     if (gVme) global_busy::set_global_busy(true);
+    const bool rpv130_stopped =
+        quiesce_rpv130_single_event_busy("frontend exit");
     if (gVme) {
         const bool owns_v1720_run = gV1720StartAttempted || gV1720Started;
         const bool midas_active = run_state == STATE_RUNNING ||
@@ -3641,7 +4220,7 @@ INT frontend_exit()
 
     printf("VME interface closed.\n");
 
-    return SUCCESS;
+    return rpv130_stopped ? SUCCESS : FE_ERR_HW;
 }
 
 /* Begin a run: reset software state, prepare normal operation, then arm diagnostics. */
@@ -3661,6 +4240,13 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_ODB);
     }
     reset_run_statistics();
+    gV1190BltDiagnosticCount.store(0, std::memory_order_relaxed);
+    gV1720BltDiagnosticCount.store(0, std::memory_order_relaxed);
+    v1190_fifo_blt_state_reset(&gV1190FifoBltState);
+    gRpv130TimingEventCount.store(0, std::memory_order_relaxed);
+    gRpv130PollReadyNs.store(0, std::memory_order_relaxed);
+    gRpv130LastPollMissNs.store(0, std::memory_order_relaxed);
+    gRpv130PollPreviousMissNs.store(0, std::memory_order_relaxed);
     mark_run_counters_dirty();
     if (!publish_run_counters()) {
         cm_msg(MERROR, frontend_name,
@@ -3726,9 +4312,17 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_HW);
     }
 #endif
+    if (!arm_rpv130_single_event_busy()) {
+        snprintf(error, 256, "RPV130 Single Event BUSY arm failed");
+        quiesce_rpv130_single_event_busy("BOR arm failure");
+        stop_v1720e_and_publish_state("BOR RPV130 arm failure");
+        mark_configuration_failed(run_number);
+        return finish(FE_ERR_HW);
+    }
     gVmeRunSnapshot.frontend_bor_complete = TRUE;
     if (!vme_configuration_ready()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        quiesce_rpv130_single_event_busy("BOR readiness failure");
         stop_v1720e_and_publish_state("BOR readiness failure");
         cm_msg(MERROR, frontend_name,
                "VME BOR completed without all enabled modules ready");
@@ -3738,6 +4332,7 @@ INT begin_of_run(INT run_number, char *error)
     }
     if (!publish_vme_run_snapshot()) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        quiesce_rpv130_single_event_busy("BOR RunSnapshot publish failure");
         stop_v1720e_and_publish_state("BOR RunSnapshot publish failure");
         cm_msg(MERROR, frontend_name,
                "Cannot publish completed VME RunSnapshot for run %d",
@@ -3749,6 +4344,7 @@ INT begin_of_run(INT run_number, char *error)
     if (!publish_configuration_status(true, run_number)) {
         gVmeRunSnapshot.frontend_bor_complete = FALSE;
         publish_vme_run_snapshot();
+        quiesce_rpv130_single_event_busy("BOR status publish failure");
         stop_v1720e_and_publish_state("BOR status publish failure");
         cm_msg(MERROR, frontend_name,
                "Cannot publish successful VME configuration status for run %d",
@@ -3759,6 +4355,7 @@ INT begin_of_run(INT run_number, char *error)
     }
     if (!global_busy::publish_ready(true, true, run_number)) {
         snprintf(error, 256, "Cannot publish VME DAQReady");
+        quiesce_rpv130_single_event_busy("BOR DAQReady publish failure");
         return finish(FE_ERR_ODB);
     }
     return finish(SUCCESS);
@@ -3771,9 +4368,13 @@ INT end_of_run(INT run_number, char *error)
     global_busy::publish_ready(true, false, 0);
     bool restore_failed = false;
     printf("End run %d\n", run_number);
-    if (!stop_v1720e_and_publish_state("EOR")) {
+    const bool rpv130_stopped = quiesce_rpv130_single_event_busy("EOR");
+    const bool v1720_stopped = stop_v1720e_and_publish_state("EOR");
+    if (!rpv130_stopped || !v1720_stopped) {
         publish_run_counters();
-        snprintf(error, 256, "V1720E Acquisition Stop failed");
+        snprintf(error, 256, "%s failed during EOR",
+                 !rpv130_stopped ? "RPV130 BUSY disable" :
+                                   "V1720E Acquisition Stop");
         return FE_ERR_HW;
     }
     log_run_statistics();
@@ -3812,6 +4413,8 @@ static INT start_abort(INT run_number, char *error)
     /* A successful BOR enables the legacy MFE readout before another client
      * can fail the common START. Stop software readout before hardware. */
     readout_enable(FALSE);
+    const bool rpv130_stopped =
+        quiesce_rpv130_single_event_busy("STARTABORT");
     V1720StopOutcome stop_outcome = V1720StopOutcome::Disabled;
     const bool stopped = stop_v1720e_and_publish_state(
         "STARTABORT rollback", &stop_outcome);
@@ -3822,10 +4425,12 @@ static INT start_abort(INT run_number, char *error)
 
     run_state = STATE_STOPPED;
     cm_set_client_run_state(run_state);
-    if (!stopped) {
+    if (!stopped || !rpv130_stopped) {
         if (error)
             snprintf(error, 256,
-                     "V1720E Acquisition Stop failed during STARTABORT");
+                     "%s failed during STARTABORT",
+                     !rpv130_stopped ? "RPV130 BUSY disable" :
+                                       "V1720E Acquisition Stop");
         return FE_ERR_HW;
     }
     cm_msg(MINFO, frontend_name,
@@ -3852,6 +4457,21 @@ INT resume_run(INT run_number, char *error)
 /* Poll RPV130 status outside the DAQ event readout path. */
 INT frontend_loop()
 {
+    if (gBltStopRequested.exchange(false, std::memory_order_relaxed) &&
+        run_state == STATE_RUNNING) {
+        char error[TRANSITION_ERROR_STRING_LENGTH] = {};
+        const INT status = cm_transition(TR_STOP, 0, error, sizeof(error),
+                                         TR_ASYNC, FALSE);
+        if (status != CM_SUCCESS) {
+            cm_msg(MERROR, frontend_name,
+                   "BLT32 failure: RUN stop request failed: status %d %s",
+                   status, error);
+            gBltStopRequested.store(true, std::memory_order_relaxed);
+        } else {
+            cm_msg(MERROR, frontend_name,
+                   "BLT32 failure: RUN stop requested");
+        }
+    }
     global_busy::process_diagnostic_request(run_state == STATE_STOPPED);
     process_manual_buffer_clear_request();
     publish_rpv130_status(false);
@@ -3910,9 +4530,25 @@ INT poll_event(INT source, INT count, BOOL test)
         (gV1720RunSettings.enabled && !gV1720Started))
         return 0;
     for (INT i = 0; i < count; ++i) {
-        if (v792_DataReady(gVme, V792_BASE) && !test)
+        if (v792_DataReady(gVme, V792_BASE) && !test) {
+            if (gSingleEventBusyEnabledForRun &&
+                gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+                    RPV130_TIMING_EVENT_LIMIT) {
+                uint64_t empty = 0;
+                if (gRpv130PollReadyNs.compare_exchange_strong(
+                        empty, monotonic_ns(), std::memory_order_relaxed))
+                    gRpv130PollPreviousMissNs.store(
+                        gRpv130LastPollMissNs.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+            }
             return 1;
+        }
     }
+    if (!test && gSingleEventBusyEnabledForRun &&
+        gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+            RPV130_TIMING_EVENT_LIMIT)
+        gRpv130LastPollMissNs.store(monotonic_ns(),
+                                    std::memory_order_relaxed);
     return 0;
 }
 
@@ -3980,10 +4616,12 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
     }
 }
 
-static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
+static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
                                     DWORD midas_serial)
 {
+    bool valid = true;
     if (!event.size_valid) {
+        valid = false;
         ++gRunStatistics.v1720_size_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
@@ -3991,6 +4629,7 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
                midas_serial, event.event_size, gV1720ExpectedEventWords);
     }
     if (!event.channel_mask_valid) {
+        valid = false;
         ++gRunStatistics.v1720_mask_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
@@ -4008,6 +4647,7 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
             (event.trigger_time_tag - gRunStatistics.v1720_previous_ttt) &
             0x7FFFFFFFu;
         if (counter_delta != 1) {
+            valid = false;
             ++gRunStatistics.v1720_counter_discontinuity_count;
             mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
@@ -4026,6 +4666,7 @@ static void update_v1720e_integrity(const V1720E_EVENT_INFO &event,
     gRunStatistics.v1720_last_counter = event.event_counter;
     gRunStatistics.v1720_previous_counter = event.event_counter;
     gRunStatistics.v1720_previous_ttt = event.trigger_time_tag;
+    return valid;
 }
 
 /* MIDAS publishing layer. Hardware access and counter pairing stay outside. */
@@ -4057,19 +4698,73 @@ static INT build_midas_event(char *pevent,
 /* Acquire one event per module, check pairing, and publish one MIDAS event. */
 INT read_vme_event(char *pevent, INT off)
 {
+    Rpv130EventTiming timing;
+    if (gSingleEventBusyEnabledForRun &&
+        gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+            RPV130_TIMING_EVENT_LIMIT)
+        timing.read_start_ns = monotonic_ns();
     if (!global_busy::readout_allowed())
         return 0;
     if (!gVme || gReadoutFailed)
         return 0;
+    if (gSingleEventBusyEnabledForRun && timing.read_start_ns) {
+        const unsigned index = gRpv130TimingEventCount.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        timing.active = index <= RPV130_TIMING_EVENT_LIMIT;
+        if (timing.active) {
+            timing.index = index;
+            timing.serial = SERIAL_NUMBER(pevent);
+            timing.poll_ready_ns = gRpv130PollReadyNs.exchange(
+                0, std::memory_order_relaxed);
+            timing.poll_previous_miss_ns = gRpv130PollPreviousMissNs.exchange(
+                0, std::memory_order_relaxed);
+        }
+    }
+
+    if (gSingleEventBusyEnabledForRun) {
+        bool busy1 = false;
+        uint8_t csr1 = 0;
+        const int busy_status = rpv130_read_busy1(
+            gVme, RPV130_BASE_ADDRESS, &busy1, &csr1);
+        if (timing.active) timing.csr_confirm_ns = monotonic_ns();
+        if (busy_status != MVME_SUCCESS ||
+            !busy1 ||
+            (csr1 & RPV130_CSR1_CHANNEL1_ARMED) !=
+                RPV130_CSR1_CHANNEL1_ARMED) {
+            fail_single_event_busy("FIN1 BUSY1 absent, disarmed, or CSR1 read failed");
+            return 0;
+        }
+        if (!publish_rpv130_busy_state(true, true)) {
+            fail_single_event_busy("RPV130 ODB BUSY status update failed");
+            return 0;
+        }
+    }
 
     // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
-    if ((gV1190RunSettings.enabled && !wait_for_v1190_data_ready())
-        || (gV775RunSettings.enabled && !wait_for_v775_data_ready())
-        || (gV1720RunSettings.enabled && !wait_for_v1720e_data_ready())) {
+    if (timing.active) timing.peers_start_ns = monotonic_ns();
+    bool peers_ready = true;
+    if (gV1190RunSettings.enabled) {
+        if (timing.active) timing.v1190_ready_start_ns = monotonic_ns();
+        peers_ready = wait_for_v1190_data_ready();
+        if (timing.active) timing.v1190_ready_end_ns = monotonic_ns();
+    }
+    if (peers_ready && gV775RunSettings.enabled) {
+        if (timing.active) timing.v775_ready_start_ns = monotonic_ns();
+        peers_ready = wait_for_v775_data_ready();
+        if (timing.active) timing.v775_ready_end_ns = monotonic_ns();
+    }
+    if (peers_ready && gV1720RunSettings.enabled) {
+        if (timing.active) timing.v1720_ready_start_ns = monotonic_ns();
+        peers_ready = wait_for_v1720e_data_ready();
+        if (timing.active) timing.v1720_ready_end_ns = monotonic_ns();
+    }
+    if (timing.active) timing.peers_end_ns = monotonic_ns();
+    if (!peers_ready) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "Synchronized readout disabled after module-ready timeout; "
                "no FIFO was consumed. Check hardware and restart the run.");
+        fail_single_event_busy("module-ready timeout");
         return 0;
     }
 
@@ -4078,42 +4773,140 @@ INT read_vme_event(char *pevent, INT off)
     DWORD v775_data[V775_MAX_EVENT_WORDS];
     DWORD v1720_data[V1720E_MAX_EVENT_WORDS];
     V792EventInfo v792 = {};
-    if(gV792RunSettings.enabled) v792=read_v792_single_event(v792_data);
+    if (gV792RunSettings.enabled) {
+        if (timing.active) timing.v792_start_ns = monotonic_ns();
+        v792 = V792_READOUT_MODE_SELECT == V792_BLT32 ?
+            read_v792_blt32_event(v792_data) :
+            read_v792_single_event(v792_data);
+        if (timing.active) timing.v792_end_ns = monotonic_ns();
+    }
     if (gV792RunSettings.enabled && (!v792.valid || v792.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "V792 readout disabled after error; no partial bank sent. Check hardware and restart the run to reset readout.");
+        fail_single_event_busy("V792 event readout failed");
         return 0;
     }
 
     V1190EventInfo v1190 = {};
-    if(gV1190RunSettings.enabled) v1190=read_v1190_single_event(v1190_data);
+    V1190_FIFO_BLT_TIMING v1190_phases = {};
+    bool v1190_diagnostic = false;
+    if (gV1190RunSettings.enabled) {
+        if (timing.active ||
+            V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
+            timing.v1190_start_ns = monotonic_ns();
+        v1190 = V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32 ?
+            read_v1190_fifo_blt32_event(v1190_data, v1190_phases,
+                                         v1190_diagnostic) :
+            read_v1190_single_event(v1190_data);
+        if (timing.active ||
+            V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
+            timing.v1190_end_ns = monotonic_ns();
+        if (v1190_diagnostic) {
+            const uint64_t measured_ns =
+                v1190_phases.fifo_status_ns +
+                v1190_phases.stored_before_ns + v1190_phases.fifo_read_ns +
+                v1190_phases.decode_ns + v1190_phases.blt_ns +
+                v1190_phases.validate_ns + v1190_phases.stored_after_ns;
+            const uint64_t total_ns =
+                timing.v1190_end_ns >= timing.v1190_start_ns ?
+                timing.v1190_end_ns - timing.v1190_start_ns : 0;
+            const uint64_t residual_ns = total_ns >= measured_ns ?
+                total_ns - measured_ns : 0;
+            cm_msg(MINFO, frontend_name,
+                   "V1190 timing: stored_before=%.3f stored_after=%.3f us",
+                   v1190_phases.stored_before_checked ?
+                       v1190_phases.stored_before_ns / 1000.0 : -1.0,
+                   v1190_phases.stored_after_checked ?
+                       v1190_phases.stored_after_ns / 1000.0 : -1.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1190 timing: fifo_read=%.3f decode=%.3f us",
+                   v1190_phases.fifo_read_ns / 1000.0,
+                   v1190_phases.decode_ns / 1000.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1190 timing: blt=%.3f validate=%.3f us",
+                   v1190_phases.blt_ns / 1000.0,
+                   v1190_phases.validate_ns / 1000.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1190 timing: status=%.3f residual=%.3f total=%.3f us",
+                   v1190_phases.fifo_status_ns / 1000.0,
+                   residual_ns / 1000.0, total_ns / 1000.0);
+        }
+    }
     if (gV1190RunSettings.enabled && (!v1190.valid || v1190.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
-               "V1190 readout disabled after error; V792 event was consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
+               "V1190 readout failed; V792 consumed. No MIDAS event sent; stop RUN.");
+        fail_single_event_busy("V1190 event readout failed");
         return 0;
     }
 
     V775EventInfo v775 = {};
-    if(gV775RunSettings.enabled) v775=read_v775_single_event(v775_data);
+    if (gV775RunSettings.enabled) {
+        if (timing.active) timing.v775_start_ns = monotonic_ns();
+        v775 = read_v775_single_event(v775_data);
+        if (timing.active) timing.v775_end_ns = monotonic_ns();
+    }
     if (gV775RunSettings.enabled && (!v775.valid || v775.words == 0)) {
         gReadoutFailed = true;
         cm_msg(MERROR, frontend_name,
                "V775 readout disabled after error; V792/V1190 events were consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
+        fail_single_event_busy("V775 event readout failed");
         return 0;
     }
 
     V1720E_EVENT_INFO v1720 = {};
     V1720E_EVENT_INFO *v1720_event = NULL;
     if (gV1720RunSettings.enabled) {
+        if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
+            timing.v1720_start_ns = monotonic_ns();
         const int v1720_status =
-            v1720e_read_event(gVme, V1720E_BASE, v1720_data,
-                              V1720E_MAX_EVENT_WORDS,
-                              gV1720ExpectedEventWords,
-                              gV1720ExpectedChannelMask, &v1720);
+            v1720e_read_event_mode(gVme, V1720E_BASE, v1720_data,
+                                   V1720E_MAX_EVENT_WORDS,
+                                   gV1720ExpectedEventWords,
+                                   gV1720ExpectedChannelMask,
+                                   V1720E_READOUT_MODE_SELECT, &v1720);
+        if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
+            timing.v1720_end_ns = monotonic_ns();
+        if (V1720E_READOUT_MODE_SELECT == BLT32 &&
+            gV1720BltDiagnosticCount.fetch_add(
+                1, std::memory_order_relaxed) < 10) {
+            const V1720E_READ_TIMING &p = v1720.timing;
+            const uint64_t measured_ns = p.header_read_ns[0] +
+                p.header_read_ns[1] + p.header_read_ns[2] +
+                p.header_read_ns[3] + p.header_decode_ns +
+                p.blt_ns + p.blt_validation_ns;
+            const uint64_t total_ns =
+                timing.v1720_end_ns >= timing.v1720_start_ns ?
+                timing.v1720_end_ns - timing.v1720_start_ns : 0;
+            const uint64_t residual_ns = total_ns >= measured_ns ?
+                total_ns - measured_ns : 0;
+            cm_msg(MINFO, frontend_name,
+                   "V1720 timing: hdr0=%.3f hdr1=%.3f us",
+                   p.header_read_ns[0] / 1000.0,
+                   p.header_read_ns[1] / 1000.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1720 timing: hdr2=%.3f hdr3=%.3f us",
+                   p.header_read_ns[2] / 1000.0,
+                   p.header_read_ns[3] / 1000.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1720 timing: blt=%.3f decode=%.3f validate=%.3f us",
+                   p.blt_ns / 1000.0, p.header_decode_ns / 1000.0,
+                   p.blt_validation_ns / 1000.0);
+            cm_msg(MINFO, frontend_name,
+                   "V1720 timing: residual=%.3f total=%.3f us",
+                   residual_ns / 1000.0, total_ns / 1000.0);
+        }
         if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
             v1720.words < 4) {
+            if (V1720E_READOUT_MODE_SELECT == BLT32 &&
+                v1720.blt_requested_bytes != 0) {
+                cm_msg(MERROR, frontend_name,
+                       "V1720E BLT32 failed: CAEN status=%d requested=%d bytes actual=%d bytes",
+                       v1720.blt_status, v1720.blt_requested_bytes,
+                       v1720.blt_actual_bytes);
+                gBltStopRequested.store(true, std::memory_order_relaxed);
+            }
             if (v1720_status != MVME_SUCCESS)
                 gV1720Runtime.communication_ok = FALSE;
             gV1720Runtime.dirty = true;
@@ -4127,24 +4920,66 @@ INT read_vme_event(char *pevent, INT off)
                    " events "
                    "were consumed but no partial MIDAS event was sent.",
                    v1720_status, v1720.words, v1720.header_valid);
+            fail_single_event_busy("V1720E event readout failed");
             return 0;
         }
         v1720_event = &v1720;
-        update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
+        const bool v1720_integrity =
+            update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
+        if (!v1720_integrity) {
+            gReadoutFailed = true;
+            fail_single_event_busy("V1720E event consistency failure");
+            return 0;
+        }
         gV1720Runtime.event_counter = v1720.event_counter;
         gV1720Runtime.trigger_time_tag = v1720.trigger_time_tag;
         gV1720Runtime.dirty = true;
     }
 
-    if (!check_event_counter_match(v792, v1190, v775, v1720_event))
+    if (!check_event_counter_match(v792, v1190, v775, v1720_event)) {
+        if (gSingleEventBusyEnabledForRun) {
+            fail_single_event_busy("participating module event counters differ");
+            return 0;
+        }
         log_event_counter_mismatch(v792, v1190, v775, v1720_event,
                                    SERIAL_NUMBER(pevent));
+    }
+    if (timing.active) {
+        timing.consistency_end_ns = monotonic_ns();
+        timing.build_start_ns = timing.consistency_end_ns;
+    }
 
-    return build_midas_event(pevent,
+    const INT event_size = build_midas_event(pevent,
                              v792_data, v792,
                              v1190_data, v1190,
                              v775_data, v775,
                              v1720_data, v1720_event);
+    if (timing.active) timing.build_end_ns = monotonic_ns();
+    if (gSingleEventBusyEnabledForRun) {
+        if (event_size <= 0) {
+            fail_single_event_busy("MIDAS event construction failed");
+            return 0;
+        }
+        uint8_t csr1 = 0;
+        if (timing.active) timing.clear_call_ns = monotonic_ns();
+        const int clear_status = timing.active ?
+            rpv130_clear_busy1_and_rearm_timed(
+                gVme, RPV130_BASE_ADDRESS, &csr1, &timing.writes) :
+            rpv130_clear_busy1_and_rearm(
+                gVme, RPV130_BASE_ADDRESS, &csr1);
+        if (timing.active) timing.clear_return_ns = monotonic_ns();
+        if (clear_status != MVME_SUCCESS) {
+            fail_single_event_busy("CLR1/re-arm or CSR1 readback failed");
+            return 0;
+        }
+        if (!publish_rpv130_busy_state(
+                (csr1 & RPV130_CSR1_BUSY1) != 0, true)) {
+            fail_single_event_busy("RPV130 ODB BUSY status update failed");
+            return 0;
+        }
+    }
+    timing.outcome = "OK";
+    return event_size;
 }
 
 INT read_vme_configuration_event(char *pevent, INT)

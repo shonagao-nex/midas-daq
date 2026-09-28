@@ -16,6 +16,13 @@ static int fail_event_stored_read;
 static int current_am = MVME_AM_A24_ND;
 static int current_mode = MVME_DMODE_D16;
 
+int caenvme_blt_read32(int handle, mvme_addr_t address, void *destination,
+                       int requested_bytes, int *actual_bytes) {
+    (void)handle; (void)address; (void)destination;
+    (void)requested_bytes; (void)actual_bytes;
+    return -1;
+}
+
 int mvme_get_am(MVME_INTERFACE *vme, int *am) {
     (void)vme; *am = current_am; return MVME_SUCCESS;
 }
