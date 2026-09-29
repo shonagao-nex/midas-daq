@@ -90,7 +90,7 @@ int main() {
              clear_js.find("BufferClearRequestId") != std::string::npos,
          "buffer-clear WebGUI lacks STOPPED check or request mailbox");
   expect(clear_html.find("Clear VME event buffers") != std::string::npos &&
-             clear_html.find("Clear EASIROC receive/event buffer") !=
+             clear_html.find("Clear EASI receive/event buffer") !=
                  std::string::npos,
          "buffer-clear controls are missing");
   std::cout << "easiroc_web_gui_contract_test: " << checks

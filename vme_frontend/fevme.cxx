@@ -168,7 +168,7 @@ static bool gRpv130EnabledForRun = true;
 static bool gSingleEventBusyEnabledForRun = false;
 static bool gRpv130BusyConfigured = false;
 
-/* First ten physics events per run only. Logging runs on function exit. */
+/* Retain first-ten-event timing probes to preserve the readout sequence. */
 static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
 static std::atomic<unsigned> gRpv130TimingEventCount(0);
 static std::atomic<uint64_t> gRpv130PollReadyNs(0);
@@ -180,12 +180,6 @@ static uint64_t monotonic_ns()
     struct timespec ts = {};
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
-}
-
-static double interval_us(uint64_t first, uint64_t second)
-{
-    return first && second && second >= first ?
-        static_cast<double>(second - first) / 1000.0 : -1.0;
 }
 
 struct Rpv130EventTiming {
@@ -211,85 +205,7 @@ struct Rpv130EventTiming {
     uint64_t clear_call_ns = 0, clear_return_ns = 0;
     RPV130_BUSY_TIMING writes = {};
 
-    ~Rpv130EventTiming()
-    {
-        if (!active) return;
-        const uint64_t return_ns = monotonic_ns();
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u serial=%u %s: poll_ready_monotonic_ns=%llu",
-               index, serial, outcome,
-               static_cast<unsigned long long>(poll_ready_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: prior miss->ready=%.3f us poll->read=%.3f us",
-               index,
-               interval_us(poll_previous_miss_ns, poll_ready_ns),
-               interval_us(poll_ready_ns, read_start_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: CSR1 read=%.3f us peer ready=%.3f us",
-               index,
-               interval_us(read_start_ns, csr_confirm_ns),
-               interval_us(peers_start_ns, peers_end_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u monotonic_ns: read=%llu BUSY1_CSR1=%llu",
-               index,
-               static_cast<unsigned long long>(read_start_ns),
-               static_cast<unsigned long long>(csr_confirm_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u monotonic_ns: CLR1_before=%llu CLR1_after=%llu",
-               index,
-               static_cast<unsigned long long>(writes.clr1_before_ns),
-               static_cast<unsigned long long>(writes.clr1_after_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u monotonic_ns: rearm_after=%llu",
-               index,
-               static_cast<unsigned long long>(writes.rearm_after_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: V1190 wait=%.3f us read=%.3f us",
-               index,
-               interval_us(v1190_ready_start_ns, v1190_ready_end_ns),
-               interval_us(v1190_start_ns, v1190_end_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: V775 wait=%.3f us read=%.3f us",
-               index,
-               interval_us(v775_ready_start_ns, v775_ready_end_ns),
-               interval_us(v775_start_ns, v775_end_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: V1720E wait=%.3f us read=%.3f us",
-               index,
-               interval_us(v1720_ready_start_ns, v1720_ready_end_ns),
-               interval_us(v1720_start_ns, v1720_end_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: V792 read=%.3f us mode=%s",
-               index, interval_us(v792_start_ns, v792_end_ns),
-               V792_READOUT_MODE_SELECT == V792_BLT32 ? "BLT32" : "SINGLE_D32");
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: peer_end->consistency=%.3f us build=%.3f us",
-               index, interval_us(peers_end_ns, consistency_end_ns),
-               interval_us(build_start_ns, build_end_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: build_end->CLR1=%.3f us CLR1 write=%.3f us",
-               index, interval_us(build_end_ns, writes.clr1_before_ns),
-               interval_us(writes.clr1_before_ns, writes.clr1_after_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: CLR1->rearm=%.3f us build_end->driver=%.3f us",
-               index, interval_us(writes.clr1_after_ns, writes.rearm_after_ns),
-               interval_us(build_end_ns, clear_call_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: driver->CLR1=%.3f us rearm->driver_return=%.3f us",
-               index,
-               interval_us(clear_call_ns, writes.clr1_before_ns),
-               interval_us(writes.rearm_after_ns, clear_return_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: driver_return->read_return=%.3f us "
-               "poll->CLR1=%.3f us",
-               index,
-               interval_us(clear_return_ns, return_ns),
-               interval_us(poll_ready_ns, writes.clr1_before_ns));
-        cm_msg(MINFO, frontend_name,
-               "RPV130 timing %u: poll->read_return=%.3f us "
-               "(-1=unavailable/disabled)",
-               index, interval_us(poll_ready_ns, return_ns));
-    }
+
 };
 
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
@@ -4802,36 +4718,7 @@ INT read_vme_event(char *pevent, INT off)
         if (timing.active ||
             V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
             timing.v1190_end_ns = monotonic_ns();
-        if (v1190_diagnostic) {
-            const uint64_t measured_ns =
-                v1190_phases.fifo_status_ns +
-                v1190_phases.stored_before_ns + v1190_phases.fifo_read_ns +
-                v1190_phases.decode_ns + v1190_phases.blt_ns +
-                v1190_phases.validate_ns + v1190_phases.stored_after_ns;
-            const uint64_t total_ns =
-                timing.v1190_end_ns >= timing.v1190_start_ns ?
-                timing.v1190_end_ns - timing.v1190_start_ns : 0;
-            const uint64_t residual_ns = total_ns >= measured_ns ?
-                total_ns - measured_ns : 0;
-            cm_msg(MINFO, frontend_name,
-                   "V1190 timing: stored_before=%.3f stored_after=%.3f us",
-                   v1190_phases.stored_before_checked ?
-                       v1190_phases.stored_before_ns / 1000.0 : -1.0,
-                   v1190_phases.stored_after_checked ?
-                       v1190_phases.stored_after_ns / 1000.0 : -1.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1190 timing: fifo_read=%.3f decode=%.3f us",
-                   v1190_phases.fifo_read_ns / 1000.0,
-                   v1190_phases.decode_ns / 1000.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1190 timing: blt=%.3f validate=%.3f us",
-                   v1190_phases.blt_ns / 1000.0,
-                   v1190_phases.validate_ns / 1000.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1190 timing: status=%.3f residual=%.3f total=%.3f us",
-                   v1190_phases.fifo_status_ns / 1000.0,
-                   residual_ns / 1000.0, total_ns / 1000.0);
-        }
+
     }
     if (gV1190RunSettings.enabled && (!v1190.valid || v1190.words == 0)) {
         gReadoutFailed = true;
@@ -4868,35 +4755,6 @@ INT read_vme_event(char *pevent, INT off)
                                    V1720E_READOUT_MODE_SELECT, &v1720);
         if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
             timing.v1720_end_ns = monotonic_ns();
-        if (V1720E_READOUT_MODE_SELECT == BLT32 &&
-            gV1720BltDiagnosticCount.fetch_add(
-                1, std::memory_order_relaxed) < 10) {
-            const V1720E_READ_TIMING &p = v1720.timing;
-            const uint64_t measured_ns = p.header_read_ns[0] +
-                p.header_read_ns[1] + p.header_read_ns[2] +
-                p.header_read_ns[3] + p.header_decode_ns +
-                p.blt_ns + p.blt_validation_ns;
-            const uint64_t total_ns =
-                timing.v1720_end_ns >= timing.v1720_start_ns ?
-                timing.v1720_end_ns - timing.v1720_start_ns : 0;
-            const uint64_t residual_ns = total_ns >= measured_ns ?
-                total_ns - measured_ns : 0;
-            cm_msg(MINFO, frontend_name,
-                   "V1720 timing: hdr0=%.3f hdr1=%.3f us",
-                   p.header_read_ns[0] / 1000.0,
-                   p.header_read_ns[1] / 1000.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1720 timing: hdr2=%.3f hdr3=%.3f us",
-                   p.header_read_ns[2] / 1000.0,
-                   p.header_read_ns[3] / 1000.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1720 timing: blt=%.3f decode=%.3f validate=%.3f us",
-                   p.blt_ns / 1000.0, p.header_decode_ns / 1000.0,
-                   p.blt_validation_ns / 1000.0);
-            cm_msg(MINFO, frontend_name,
-                   "V1720 timing: residual=%.3f total=%.3f us",
-                   residual_ns / 1000.0, total_ns / 1000.0);
-        }
         if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
             v1720.words < 4) {
             if (V1720E_READOUT_MODE_SELECT == BLT32 &&
