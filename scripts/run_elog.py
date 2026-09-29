@@ -114,6 +114,29 @@ def event_text(value):
     return "N/A (not participating)" if number == -1 else str(number)
 
 
+def display_time(value):
+    try:
+        return datetime.datetime.strptime(value, "%a %b %d %H:%M:%S %Y").strftime(
+            "%Y/%m/%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def scaler_text(values):
+    if not isinstance(values, dict):
+        raise ValueError("Runlog Scaler 64ch is not an object")
+    if not values:
+        return "Scaler     : N/A\n"
+    channels = []
+    for name, value in values.items():
+        if (len(name) != 4 or not name.startswith("ch") or
+                not name[2:].isdigit() or int(name[2:]) >= 64):
+            raise ValueError(f"Invalid Runlog scaler channel: {name}")
+        channels.append((int(name[2:]), name, value))
+    return "Scaler\n" + "".join(
+        f"  {name} : {value}\n" for _, name, value in sorted(channels))
+
+
 def format_entry(run, record):
     bor, eor = record["BOR"], record["EOR"]
     if parse_integer(bor["Run number"]) != run:
@@ -129,12 +152,14 @@ def format_entry(run, record):
     body = (f"Run #{run} Summary\n\n"
             f"Type       : {run_type}\n"
             f"Comment    : {comment}\n\n"
-            f"Start      : {bor['Start time']}\n"
-            f"Stop       : {eor['Stop time']}\n"
+            f"Start      : {display_time(bor['Start time'])}\n"
+            f"Stop       : {display_time(eor['Stop time'])}\n"
             f"Duration   : {parse_integer(eor['Duration'])} s\n\n"
             f"Events\n"
             f"  VME      : {event_text(eor['VME events'])}\n"
-            f"  EASIROC  : {event_text(eor['EASIROC events'])}\n\n"
+            f"  EASI     : {event_text(eor['EASIROC events'])}\n"
+            f"  HUL      : {event_text(eor['HUL events'])}\n\n"
+            f"{scaler_text(eor['Scaler 64ch'])}\n"
             f"DAQ Status : {status}\n"
             f"DAQ Summary: {eor['DAQ Summary']}\n"
             f"Event Slip : {parse_integer(eor['EventSlipCount'])}\n")

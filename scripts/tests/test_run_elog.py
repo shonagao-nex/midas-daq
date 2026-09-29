@@ -48,10 +48,11 @@ class FakeOdb:
 class RunElogTest(unittest.TestCase):
     def setUp(self):
         self.record = {
-            "BOR": {"Run number": 53, "Start time": "start", "Type": "Test"},
-            "EOR": {"Stop time": "stop", "Comment": "   ",
+            "BOR": {"Run number": 53, "Start time": "Tue Sep 29 12:00:00 2026", "Type": "Test"},
+            "EOR": {"Stop time": "Tue Sep 29 12:00:07 2026", "Comment": "   ",
                     "Duration": "0x0000000000000007",
                     "VME events": "10", "EASIROC events": "-1",
+                    "HUL events": "-1", "Scaler 64ch": {},
                     "DAQ Status": "WARNING", "DAQ Summary": "VME disconnected",
                     "EventSlipCount": "0x0000000000000002"},
         }
@@ -60,9 +61,21 @@ class RunElogTest(unittest.TestCase):
         subject, body = run_elog.format_entry(53, self.record)
         self.assertEqual(subject, "Run #53 - Test - WARNING")
         for expected in ("Comment    : (empty)", "Duration   : 7 s",
-                         "VME      : 10", "EASIROC  : N/A (not participating)",
+                         "Start      : 2026/09/29 12:00:00",
+                         "Stop       : 2026/09/29 12:00:07",
+                         "VME      : 10", "EASI     : N/A (not participating)",
+                         "HUL      : N/A (not participating)", "Scaler     : N/A",
                          "DAQ Summary: VME disconnected", "Event Slip : 2"):
             self.assertIn(expected, body)
+
+    def test_scaler_displays_only_present_channels_in_order(self):
+        self.record["EOR"]["HUL events"] = "12"
+        self.record["EOR"]["Scaler 64ch"] = {
+            "ch63": "0x0000000a", "ch01": 7, "ch00": 0}
+        _, body = run_elog.format_entry(53, self.record)
+        self.assertIn("  HUL      : 12\n\nScaler\n"
+                      "  ch00 : 0\n  ch01 : 7\n  ch63 : 0x0000000a\n", body)
+        self.assertNotIn("ch02", body)
 
     def test_format_uses_final_eor_comment(self):
         self.record["BOR"]["Comment"] = "old BOR comment"
