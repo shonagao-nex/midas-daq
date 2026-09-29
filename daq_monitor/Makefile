@@ -13,7 +13,8 @@ BIN_DIR := bin
 TARGET := $(BIN_DIR)/daq_monitor
 TEST_TARGET := $(BIN_DIR)/tests/status_policy_test
 OBJECTS := $(BUILD_DIR)/daq_monitor.o $(BUILD_DIR)/status_policy.o \
-	$(BUILD_DIR)/alarm_policy.o $(BUILD_DIR)/runlog_edit.o \
+	$(BUILD_DIR)/alarm_policy.o $(BUILD_DIR)/monitor_alarms.o \
+	$(BUILD_DIR)/runlog_edit.o \
 	$(BUILD_DIR)/runlog_edit_rpc.o
 TEST_OBJECTS := $(BUILD_DIR)/tests/status_policy_test.o $(BUILD_DIR)/status_policy.o
 ALARM_TEST_OBJECTS := $(BUILD_DIR)/tests/alarm_policy_test.o \
@@ -56,6 +57,10 @@ $(BUILD_DIR)/status_policy.o: status_policy.cxx status_policy.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/alarm_policy.o: alarm_policy.cxx alarm_policy.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/monitor_alarms.o: monitor_alarms.cxx monitor_alarms.h alarm_policy.h status_policy.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
