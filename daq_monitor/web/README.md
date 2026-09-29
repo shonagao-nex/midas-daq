@@ -1,5 +1,46 @@
 # DAQ general-user Custom page
 
+## Run Summary (development)
+
+`run-summary.html` is registered as `/Custom/Run Summary` in the development
+ODB on port 8181. It reads `/runlogs/runlog_index.json`, applies
+`/runlogs/runlog_selection.json`, and requests ten listed JSON Runlog
+files per page through mhttpd, with four requests in flight. The `runlogs`
+symlink in this directory points to the development Runlog directory. It does
+not probe missing run numbers or modify Runlogs.
+
+`scripts/update_runlog_index.py` rescans the Runlog directory and atomically
+replaces `runlog_index.json`. `daq_monitor` launches it after a completed STOP,
+outside the transition. It can also be run manually with the Runlog directory
+as its argument, for example after removing or recovering files. A failed
+refresh leaves the previous index intact and cannot fail STOP. The index is
+derived data; never edit the standard MIDAS JSON Runlogs to change the list.
+The monitor finds the index script relative to its own `bin/daq_monitor`
+executable, so deployments need both the binary and `scripts/` in the same
+repository layout. Restart the development monitor to activate a rebuilt
+binary; rebuilding alone does not replace the running process. A separate
+deployment must point its `web/runlogs` link at that environment's own Runlog
+directory and regenerate the index there.
+
+Keep `runlog_selection.json` in the same directory. Its default content is
+`{"runs":[]}`: an empty array selects every indexed run. To filter, edit it
+manually to e.g. `{"runs":[63,61,60]}`. The index generator never changes
+this file. Unknown runs are ignored, duplicates are removed, and the result
+is sorted newest first. Invalid or unreadable selection falls back to the
+full index with a page warning. Deploy the default file before opening the
+page so normal operation never requests a missing selection resource.
+
+MIDAS BOR-only files can end with a comma until Logger appends EOR. The page
+displays these as `INCOMPLETE`. Scaler details show only channels present in
+the EOR object. Unknown additional Runlog fields are ignored.
+
+`Export CSV` reads the same selected run list as the table, in batches of 50
+with four concurrent requests. It uses the same Runlog parser and normalized
+values as the table, skips files removed after indexing, and
+includes BOR-only runs. The download has a UTF-8 BOM for spreadsheet programs,
+quotes CSV fields containing commas, line breaks, or double quotes, and writes
+only recorded scaler channels into the 64 `Scaler00`–`Scaler63` columns.
+
 `daq.html` is the general-user MIDAS dashboard. It reads status from
 `/DAQ/Status` and the standard MIDAS equipment statistics records. Start and
 Stop use the existing MIDAS transitions. The only direct ODB writes are module

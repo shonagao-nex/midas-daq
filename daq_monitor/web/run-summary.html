@@ -1,0 +1,33 @@
+<!doctype html>
+<html class="mcss" lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Run Summary</title>
+  <link rel="stylesheet" href="midas.css">
+  <link rel="stylesheet" href="daq.css">
+  <link rel="stylesheet" href="run-summary.css">
+  <script src="midas.js"></script>
+  <script src="mhttpd.js"></script>
+  <script src="run-summary.js" defer></script>
+</head>
+<body class="mcss" onload="initializeRunSummary()">
+  <div id="mheader"></div><div id="msidenav"></div>
+  <main id="mmain" class="dashboard-main summary-main">
+    <section class="dashboard-section" aria-labelledby="summary-heading">
+      <h1 id="summary-heading" class="section-heading">Run Summary</h1>
+      <div class="summary-toolbar"><p class="summary-intro">Completed and incomplete runs from the MIDAS JSON Runlog. Newest runs appear first.</p><button id="export-csv" type="button">Export CSV</button></div>
+      <div id="summary-error" class="connection-error" role="alert" hidden></div>
+      <p id="export-status" class="export-status" role="status" hidden></p>
+      <div class="summary-table-scroll">
+        <table class="summary-table">
+          <thead><tr><th>Run</th><th>Type</th><th>Start</th><th>Stop</th><th>Duration</th><th>VME</th><th>EASI</th><th>HUL</th><th>Slip</th><th>Status</th><th>Comment</th><th>Scaler</th></tr></thead>
+          <tbody id="run-summary-rows"><tr><td colspan="12">Loading Runlogs…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="summary-footer"><span id="summary-count" role="status"></span><button id="older-runs" type="button" disabled>Older runs</button></div>
+    </section>
+    <nav class="page-links"><a href="daq.html">DAQ dashboard</a><a href="/?cmd=Messages">MIDAS Messages</a></nav>
+  </main>
+</body>
+</html>

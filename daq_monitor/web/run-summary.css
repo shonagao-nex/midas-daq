@@ -1,0 +1,136 @@
+.summary-main {
+  max-width: 1800px;
+}
+.summary-intro {
+  color: var(--muted);
+  margin: 4px 8px;
+}
+.summary-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.summary-toolbar button {
+  background: var(--section-blue);
+  border: 0;
+  border-radius: 7px;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 7px 14px;
+}
+.summary-toolbar button:disabled {
+  background: var(--rule-gray);
+  cursor: default;
+}
+.export-status {
+  color: var(--muted);
+  font-size: .82rem;
+  margin: 0 8px 10px;
+}
+.summary-table-scroll {
+  overflow-x: auto;
+}
+.summary-table {
+  border-collapse: collapse;
+  font-size: .78rem;
+  table-layout: auto;
+  width: 100%;
+}
+.summary-table th,
+.summary-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 9px 5px;
+  text-align: left;
+  vertical-align: top;
+}
+.summary-table thead th {
+  background: var(--table-head);
+  position: sticky;
+  top: 0;
+}
+.summary-table tbody tr:nth-child(even) {
+  background: var(--table-cell);
+}
+.summary-table th:nth-child(-n+10),
+.summary-table td:nth-child(-n+10),
+.summary-table th:nth-child(12),
+.summary-table td:nth-child(12) {
+  white-space: nowrap;
+  width: 1%;
+}
+.summary-table th:nth-child(3),
+.summary-table td:nth-child(3),
+.summary-table th:nth-child(4),
+.summary-table td:nth-child(4) {
+  padding-inline: calc(5px + 1ch);
+}
+.summary-table td:nth-child(n+5):nth-child(-n+9) {
+  font-variant-numeric: tabular-nums;
+}
+.summary-table th:nth-child(11),
+.summary-table td:nth-child(11) {
+  min-width: 180px;
+  overflow-wrap: anywhere;
+  width: auto;
+}
+.summary-table details summary {
+  color: var(--link);
+  cursor: pointer;
+}
+.summary-table details p {
+  margin: 7px 0 0;
+  white-space: pre-wrap;
+}
+.summary-table .status-badge {
+  min-width: 0;
+  padding: 4px 8px;
+}
+.summary-table .state-incomplete {
+  background: var(--table-head);
+}
+.summary-table .state-unknown {
+  color: #fff;
+}
+.scaler-list {
+  display: grid;
+  gap: 4px;
+  grid-template-columns: repeat(2, max-content);
+  margin-top: 8px;
+}
+.scaler-list dt {
+  font-weight: 700;
+}
+.scaler-list dd {
+  margin: 0;
+  text-align: right;
+}
+.summary-footer {
+  align-items: center;
+  display: flex;
+  gap: 15px;
+  justify-content: flex-end;
+  padding: 14px 4px 2px;
+}
+.summary-footer span {
+  color: var(--muted);
+  font-size: .82rem;
+}
+.summary-footer button {
+  background: var(--section-blue);
+  border: 0;
+  border-radius: 7px;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 7px 14px;
+}
+.summary-footer button:disabled {
+  background: var(--rule-gray);
+  cursor: default;
+}
