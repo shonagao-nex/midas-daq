@@ -33,6 +33,9 @@ const char* severity_name(Severity severity) {
   return "ERROR";
 }
 
+//************************************//
+// Evaluate available disk space
+//************************************//
 ComponentStatus evaluate_disk(double free_gb) {
   if (free_gb < 0.0)
     return status(Severity::kError, "Disk free unavailable");
@@ -43,12 +46,18 @@ ComponentStatus evaluate_disk(double free_gb) {
   return status(Severity::kOk, "Disk OK");
 }
 
+//************************************//
+// Evaluate logger connectivity
+//************************************//
 ComponentStatus evaluate_logger(bool connected) {
   if (!connected)
     return status(Severity::kWarning, "Logger disconnected");
   return status(Severity::kOk, "Logger OK");
 }
 
+//************************************//
+// Evaluate VME health for the current run state
+//************************************//
 ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw,
                              bool stop_transition_in_progress) {
   if (is_run_active(run_state) && !raw.participating)
@@ -92,6 +101,9 @@ ComponentStatus evaluate_vme(RunState run_state, const VmeRawStatus& raw,
   return status(Severity::kWarning, "VME disconnected outside running");
 }
 
+//************************************//
+// Evaluate EASIROC health for the current run state
+//************************************//
 ComponentStatus evaluate_easiroc(RunState run_state,
                                  const EasirocRawStatus& raw,
                                  bool stop_transition_in_progress) {
@@ -133,6 +145,9 @@ ComponentStatus evaluate_easiroc(RunState run_state,
                 "EASIROC disconnected outside running");
 }
 
+//************************************//
+// Check whether DAQ prerequisites permit START
+//************************************//
 CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   if (!raw.monitor_status_fresh)
     return {false, "Monitor status stale"};
@@ -149,6 +164,9 @@ CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   return {true, {}};
 }
 
+//************************************//
+// Resolve frontend participation for status checks
+//************************************//
 ActiveParticipation resolve_run_participation(
     RunState run_state, std::int32_t current_run_number,
     const RunParticipation& recorded) {
@@ -174,6 +192,9 @@ std::int64_t runlog_event_count(bool participating, double latest,
   return static_cast<std::int64_t>(count);
 }
 
+//************************************//
+// Combine component health into the DAQ status
+//************************************//
 StatusEvaluation evaluate_status(const RawStatus& raw) {
   StatusEvaluation evaluation;
   evaluation.disk = evaluate_disk(raw.disk_free_gb);

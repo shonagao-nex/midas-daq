@@ -53,7 +53,7 @@ int main() {
           "START 400 must disable readout before ODB or BUSY work");
 
   const auto start500 = section(frontend, "INT begin_of_run(INT run_number, char *error)\n{",
-                                "/* Handle the end of a MIDAS run. */");
+                                "INT end_of_run(INT run_number, char *error)\n{");
   require(start500.find("readout_allowed") == std::string::npos &&
               start500.find("physics_readout_allowed") == std::string::npos,
           "START 500 must leave readout disabled");
@@ -69,10 +69,10 @@ int main() {
   const auto stop400 = section(busy, "INT before_stop(", "INT start_abort(");
   const auto busy_abort = section(busy, "INT start_abort(", "\n}\n}");
   const auto eor = section(frontend, "INT end_of_run(INT run_number, char *error)\n{",
-                           "/* Roll back hardware");
+                           "static INT start_abort(INT run_number, char *error)\n{");
   const auto frontend_abort = section(frontend, "static INT start_abort(INT run_number, char *error)\n{",
-                                      "/* Handle a MIDAS run pause. */");
-  const auto init = section(frontend, "INT frontend_init()\n{", "/* Close the MIDAS VME interface");
+                                      "INT pause_run(INT run_number, char *error)");
+  const auto init = section(frontend, "INT frontend_init()\n{", "INT frontend_exit()\n{");
   require(stop400.find("disable_readout();") < stop400.find("set_global_busy(true)"),
           "STOP 400 must disable readout first");
   require(busy_abort.find("disable_readout();") < busy_abort.find("publish_ready("),

@@ -82,6 +82,9 @@ bool ready(const char* client, const char* base, bool participating, INT run) {
 }
 }
 
+//************************************//
+// Initialize Global BUSY control and ODB state
+//************************************//
 bool initialize() {
   HNDLE db = 0, key = 0;
   INT effective = kProvisionalSetMeansBusy;
@@ -118,6 +121,9 @@ void attach(MVME_INTERFACE* vme) { bridge = vme; }
 bool readout_allowed() { return physics_readout_allowed; }
 void disable_readout() { physics_readout_allowed = false; }
 
+//************************************//
+// Publish VME participation and DAQ readiness
+//************************************//
 bool publish_ready(bool participates, bool is_ready, INT run) {
   const BOOL p = participates ? TRUE : FALSE, r = is_ready ? TRUE : FALSE;
   return put("/Equipment/VME/Status/ParticipatesInGlobalBusy", &p, sizeof(p), TID_BOOL) &&
@@ -125,6 +131,9 @@ bool publish_ready(bool participates, bool is_ready, INT run) {
          put("/Equipment/VME/Status/ReadyRunNumber", &run, sizeof(run), TID_INT);
 }
 
+//************************************//
+// Set and verify the experiment-wide Global BUSY signal
+//************************************//
 bool set_global_busy(bool busy) {
   INT set_means_busy = -1;
   if (!bridge || !get(kPolarity, &set_means_busy, sizeof(set_means_busy), TID_INT) ||
@@ -180,6 +189,9 @@ bool set_global_busy(bool busy) {
   return status(busy ? "ON" : "OFF");
 }
 
+//************************************//
+// Handle stopped-state Global BUSY diagnostics
+//************************************//
 void process_diagnostic_request(bool run_stopped) {
   static DWORD last_check = 0;
   const DWORD now = ss_millitime();
@@ -205,6 +217,9 @@ void process_diagnostic_request(bool run_stopped) {
            busy ? "ON" : "OFF");
 }
 
+//************************************//
+// Assert Global BUSY before run initialization
+//************************************//
 INT before_start(INT, char* error) {
   disable_readout();
   cm_msg(MINFO, "global_busy", "START 400 enter");
@@ -223,6 +238,9 @@ INT before_start(INT, char* error) {
   cm_msg(MINFO, "global_busy", "START 400 exit ERROR: %s", error);
   return asserted ? FE_ERR_ODB : FE_ERR_HW;
 }
+//************************************//
+// Release Global BUSY after all frontends are ready
+//************************************//
 INT after_start(INT run, char* error) {
   cm_msg(MINFO, "global_busy", "START 600 enter run %d", run);
   RunParticipants participants = {};
@@ -261,6 +279,9 @@ INT after_start(INT run, char* error) {
   cm_msg(MINFO, "global_busy", "START 600 exit SUCCESS");
   return SUCCESS;
 }
+//************************************//
+// Assert Global BUSY before stopping acquisition
+//************************************//
 INT before_stop(INT, char* error) {
   disable_readout();
   if (!set_global_busy(true))
@@ -268,6 +289,9 @@ INT before_stop(INT, char* error) {
   if (error) error[0] = '\0';
   return SUCCESS;
 }
+//************************************//
+// Restore Global BUSY after a failed START
+//************************************//
 INT start_abort(INT, char*) {
   disable_readout();
   publish_ready(true, false, 0);

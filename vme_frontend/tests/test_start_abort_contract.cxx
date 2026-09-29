@@ -58,7 +58,7 @@ int main() {
 
   const std::string abort = functionBody(
       source, "static INT start_abort(INT run_number, char *error)\n{",
-      "/* Handle a MIDAS run pause. */");
+      "INT pause_run(INT run_number, char *error)");
   require(abort.find("readout_enable(FALSE)") != std::string::npos,
           "STARTABORT does not disable frontend readout");
   require(abort.find("stop_v1720e_and_publish_state(") !=
@@ -75,18 +75,18 @@ int main() {
 
   const std::string eor = functionBody(
       source, "INT end_of_run(INT run_number, char *error)",
-      "/* Roll back hardware");
+      "static INT start_abort(INT run_number, char *error)\n{");
   require(eor.find("stop_v1720e_and_publish_state(\"EOR\")") !=
               std::string::npos,
           "normal EOR no longer uses the common stop path");
 
   const std::string init = functionBody(
-      source, "INT frontend_init()\n{", "/* Close the MIDAS VME interface");
+      source, "INT frontend_init()\n{", "INT frontend_exit()\n{");
   require(init.find("current_run_state == STATE_STOPPED") != std::string::npos &&
               init.find("STOPPED frontend startup recovery") != std::string::npos,
           "startup recovery is not limited to MIDAS STOPPED");
   const std::string exit = functionBody(
-      source, "INT frontend_exit()\n{", "/* Begin a run:");
+      source, "INT frontend_exit()\n{", "INT begin_of_run(INT run_number, char *error)");
   require(exit.find("gV1720StartupRunState != STATE_STOPPED || midas_active") !=
               std::string::npos &&
               exit.find("V1720E hardware stop failed during frontend exit") !=

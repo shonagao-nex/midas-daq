@@ -656,6 +656,9 @@ static bool publish_buffer_clear_status()
     return ok;
 }
 
+//************************************//
+// Initialize the VME buffer-clear request mailbox
+//************************************//
 static bool initialize_buffer_clear_mailbox()
 {
     const DWORD zero = 0;
@@ -977,6 +980,9 @@ static bool publish_vme_run_snapshot()
     return ok;
 }
 
+//************************************//
+// Initialize RPV130 settings and status in ODB
+//************************************//
 static bool initialize_rpv130_odb()
 {
     const BOOL default_enabled = TRUE;
@@ -1382,6 +1388,9 @@ static void set_module_readback_valid(const char *path, bool valid)
     set_module_output(path,"Valid",&v,sizeof(v),1,TID_BOOL);
 }
 
+//************************************//
+// Initialize VME module output records in ODB
+//************************************//
 static void initialize_module_output_schema()
 {
     WORD zword=0, thresholds[32]={}; DWORD zdword=0; BOOL zbool=FALSE;
@@ -1437,6 +1446,9 @@ static void initialize_module_output_schema()
     publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
 }
 
+//************************************//
+// Initialize enabled VME module records in ODB
+//************************************//
 static bool initialize_other_module_odb()
 {
     if (!ensure_v792_settings_schema() || !ensure_v1190_settings_schema() ||
@@ -1601,6 +1613,9 @@ static void publish_v1720e_board_state(const V1720E_BOARD_INFO &info)
 static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
                                     bool valid);
 
+//************************************//
+// Initialize V1720E output records in ODB
+//************************************//
 static void initialize_v1720e_output_schema()
 {
     const V1720E_CONFIG_READBACK empty_readback = {};
@@ -1610,6 +1625,9 @@ static void initialize_v1720e_output_schema()
     publish_v1720e_variables();
 }
 
+//************************************//
+// Initialize V1720E settings and status in ODB
+//************************************//
 static bool initialize_v1720e_odb()
 {
     if (!ensure_v1720e_settings_schema() || !publish_v1720e_info())
@@ -1681,6 +1699,9 @@ static void mark_run_counters_dirty()
     gRunCountersDirty = true;
 }
 
+//************************************//
+// Initialize per-run VME counters in ODB
+//************************************//
 static bool initialize_run_counters_odb()
 {
     return publish_run_counters();
@@ -3516,6 +3537,9 @@ static bool verify_v775_configuration()
 #undef RB775
     set_module_output(V775_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD); set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD); set_module_readback_valid(V775_READBACK_PATH,ok); return ok;
 }
+//************************************//
+// Clear participating module event buffers
+//************************************//
 static bool clear_module_buffers()
 {
     if (gV792RunSettings.enabled &&
@@ -3907,9 +3931,11 @@ static void refresh_enabled_module_variables()
 }
 
 
-/* Open VME, check modules, and initialize frontend-owned hardware settings. */
 static INT start_abort(INT run_number, char *error);
 
+//************************************//
+// Initialize the VME frontend and hardware interface
+//************************************//
 INT frontend_init()
 {
     global_busy::disable_readout();
@@ -4099,7 +4125,9 @@ INT frontend_init()
 }
 
 
-/* Close the MIDAS VME interface when the frontend terminates. */
+//************************************//
+// Shut down the VME frontend safely
+//************************************//
 INT frontend_exit()
 {
     global_busy::publish_ready(true, false, 0);
@@ -4139,7 +4167,9 @@ INT frontend_exit()
     return rpv130_stopped ? SUCCESS : FE_ERR_HW;
 }
 
-/* Begin a run: reset software state, prepare normal operation, then arm diagnostics. */
+//************************************//
+// Prepare VME modules for a new run
+//************************************//
 INT begin_of_run(INT run_number, char *error)
 {
     const auto finish = [run_number](INT result) {
@@ -4277,7 +4307,9 @@ INT begin_of_run(INT run_number, char *error)
     return finish(SUCCESS);
 }
 
-/* Handle the end of a MIDAS run. */
+//************************************//
+// Stop VME acquisition and publish final status
+//************************************//
 INT end_of_run(INT run_number, char *error)
 {
     global_busy::disable_readout();
@@ -4318,7 +4350,9 @@ INT end_of_run(INT run_number, char *error)
 }
 
 
-/* Roll back hardware and framework state after any failed START transition. */
+//************************************//
+// Restore safe VME state after a failed START
+//************************************//
 static INT start_abort(INT run_number, char *error)
 {
     global_busy::disable_readout();
@@ -4370,7 +4404,9 @@ INT resume_run(INT run_number, char *error)
 }
 
 
-/* Poll RPV130 status outside the DAQ event readout path. */
+//************************************//
+// Maintain VME status and handle stopped-state requests
+//************************************//
 INT frontend_loop()
 {
     if (gBltStopRequested.exchange(false, std::memory_order_relaxed) &&
@@ -4436,7 +4472,9 @@ INT frontend_loop()
 }
 
 
-/* Poll without consuming FIFO words; test mode performs timing iterations only. */
+//************************************//
+// Detect a ready VME event without consuming data
+//************************************//
 INT poll_event(INT source, INT count, BOOL test)
 {
     if (!global_busy::readout_allowed())
@@ -4475,7 +4513,9 @@ INT interrupt_configure(INT cmd, INT source, PTYPE adr)
     return SUCCESS;
 }
 
-/* Event synchronization layer. Readers expose native counters; pairing uses low 22 bits. */
+//************************************//
+// Check counters across participating VME modules
+//************************************//
 static bool check_event_counter_match(const V792EventInfo &v792,
                                       const V1190EventInfo &v1190,
                                       const V775EventInfo &v775,
@@ -4532,6 +4572,9 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
     }
 }
 
+//************************************//
+// Validate V1720E event continuity and structure
+//************************************//
 static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
                                     DWORD midas_serial)
 {
@@ -4585,7 +4628,9 @@ static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
     return valid;
 }
 
-/* MIDAS publishing layer. Hardware access and counter pairing stay outside. */
+//************************************//
+// Build a MIDAS event from enabled VME banks
+//************************************//
 static INT build_midas_event(char *pevent,
                              const DWORD *v792_data, const V792EventInfo &v792,
                              const DWORD *v1190_data, const V1190EventInfo &v1190,
@@ -4611,7 +4656,9 @@ static INT build_midas_event(char *pevent,
 }
 
 
-/* Acquire one event per module, check pairing, and publish one MIDAS event. */
+//************************************//
+// Read one synchronized VME event
+//************************************//
 INT read_vme_event(char *pevent, INT off)
 {
     Rpv130EventTiming timing;
@@ -4840,6 +4887,9 @@ INT read_vme_event(char *pevent, INT off)
     return event_size;
 }
 
+//************************************//
+// Write the VME run configuration bank
+//************************************//
 INT read_vme_configuration_event(char *pevent, INT)
 {
     if (gVmeRunSnapshot.frontend_bor_complete != TRUE)

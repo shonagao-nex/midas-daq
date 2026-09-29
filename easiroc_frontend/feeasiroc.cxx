@@ -173,6 +173,9 @@ bool set_odb_value(const std::string& path, const void* value, INT size,
   return status == DB_SUCCESS;
 }
 
+//************************************//
+// Publish EASIROC participation and DAQ readiness
+//************************************//
 bool publish_global_busy_ready(bool participates, bool ready, INT run_number) {
   const BOOL p = participates ? TRUE : FALSE;
   const BOOL r = ready ? TRUE : FALSE;
@@ -514,6 +517,9 @@ bool publish_run_snapshot() {
   return ok;
 }
 
+//************************************//
+// Publish EASIROC runtime status in ODB
+//************************************//
 bool publish_runtime_variables() {
   const BOOL enabled_for_run =
       g_state.runtime.enabled_for_run ? TRUE : FALSE;
@@ -867,6 +873,9 @@ bool initialize_last_applied_odb() {
              sizeof(no), 1, TID_BOOL);
 }
 
+//************************************//
+// Initialize EASIROC settings and status in ODB
+//************************************//
 bool initialize_odb() {
   char default_ip[64] = {};
   std::snprintf(default_ip, sizeof(default_ip), "%s", kDefaultIpAddress);
@@ -1207,6 +1216,9 @@ bool publish_last_applied_settings(
   return ok;
 }
 
+//************************************//
+// Read and validate EASIROC run settings
+//************************************//
 INT read_settings(FrontendSettings* settings) {
   char ip_address[64] = {};
   INT size = sizeof(ip_address);
@@ -1327,6 +1339,9 @@ easiroc::ManualApplyRunState read_manual_apply_run_state(bool* ok) {
 
 void publish_completed_diagnostic();
 
+//************************************//
+// Apply requested EASIROC settings while stopped
+//************************************//
 void process_manual_apply_request() {
   const std::string request_path =
       odb_path(kCommandsPath, "ASICSlowControl/ApplyRequestId");
@@ -1429,6 +1444,9 @@ void process_manual_apply_request() {
   }
 }
 
+//************************************//
+// Handle an EASIROC buffer-clear request
+//************************************//
 void process_manual_buffer_clear_request() {
   const std::string request_path =
       odb_path(kCommandsPath, "BufferClearRequestId");
@@ -1706,6 +1724,9 @@ CleanupResult stop_acquisition(const char* caller, bool drain_after_stop) {
   return result;
 }
 
+//************************************//
+// Handle an EASIROC acquisition failure
+//************************************//
 void handle_acquisition_error(const std::string& message) {
   if (g_state.runtime.acquisition_fault) return;
   g_state.runtime.acquisition_fault = true;
@@ -1737,6 +1758,9 @@ void populate_run_snapshot(const FrontendSettings& settings) {
           : FirmwareObservation{};
 }
 
+//************************************//
+// Complete the EASIROC run configuration snapshot
+//************************************//
 bool finalize_run_snapshot(const FrontendSettings& settings) {
   auto& snapshot = g_state.run_snapshot;
   populate_run_snapshot(settings);
@@ -1778,6 +1802,9 @@ void warn_for_bor_consistency(
   }
 }
 
+//************************************//
+// Check EASIROC configuration readiness
+//************************************//
 bool configuration_ready(const FrontendSettings& settings) {
   if (!g_state.run_snapshot.frontend_bor_complete) return false;
   if (!settings.enabled) return true;
@@ -1830,6 +1857,9 @@ EQUIPMENT equipment[] = {
 #pragma GCC diagnostic pop
 #endif
 
+//************************************//
+// Initialize the EASIROC frontend
+//************************************//
 INT frontend_init() {
   if (!initialize_odb()) return FE_ERR_ODB;
 
@@ -1864,6 +1894,9 @@ INT frontend_init() {
   return SUCCESS;
 }
 
+//************************************//
+// Shut down the EASIROC frontend safely
+//************************************//
 INT frontend_exit() {
   publish_global_busy_ready(false, false, 0);
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
@@ -1877,6 +1910,9 @@ INT frontend_exit() {
   return cleanup.drain_succeeded ? SUCCESS : FE_ERR_HW;
 }
 
+//************************************//
+// Prepare EASIROC acquisition for a new run
+//************************************//
 INT begin_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
   if (!publish_global_busy_ready(false, false, 0)) return FE_ERR_ODB;
@@ -2122,6 +2158,9 @@ INT begin_of_run(INT run_number, char* error) {
   }
 }
 
+//************************************//
+// Stop EASIROC acquisition and publish status
+//************************************//
 INT end_of_run(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
   publish_global_busy_ready(g_state.runtime.enabled_for_run, false, 0);
@@ -2151,6 +2190,9 @@ INT end_of_run(INT run_number, char* error) {
   return SUCCESS;
 }
 
+//************************************//
+// Restore EASIROC state after a failed START
+//************************************//
 static INT start_abort(INT run_number, char* error) {
   if (error != nullptr) error[0] = '\0';
   publish_global_busy_ready(g_state.runtime.enabled_for_run, false, 0);
@@ -2193,6 +2235,9 @@ INT resume_run(INT, char* error) {
 
 INT frontend_loop() { return SUCCESS; }
 
+//************************************//
+// Detect a complete EASIROC event
+//************************************//
 INT poll_event(INT, INT, BOOL test) {
   if (test) return FALSE;
   if (!g_state.run_active || !g_state.runtime.enabled_for_run) {
@@ -2249,6 +2294,9 @@ INT poll_event(INT, INT, BOOL test) {
 
 INT interrupt_configure(INT, INT, PTYPE) { return SUCCESS; }
 
+//************************************//
+// Publish one EASIROC physics event
+//************************************//
 INT read_physics_event(char* pevent, INT) {
   if (!g_state.run_active || !g_state.runtime.enabled_for_run ||
       g_state.pending_events.empty())
@@ -2288,6 +2336,9 @@ INT read_physics_event(char* pevent, INT) {
   return bk_size(pevent);
 }
 
+//************************************//
+// Refresh EASIROC status without a data event
+//************************************//
 INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
   process_manual_buffer_clear_request();
@@ -2313,6 +2364,9 @@ INT read_status_event(char*, INT) {
   return 0;
 }
 
+//************************************//
+// Write the EASIROC run configuration bank
+//************************************//
 INT read_configuration_event(char* pevent, INT) {
   if (!g_state.run_snapshot.frontend_bor_complete) return 0;
 

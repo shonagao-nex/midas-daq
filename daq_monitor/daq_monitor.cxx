@@ -74,6 +74,9 @@ bool is_owned_status_path(const char* path) {
          (path[root_length] == '\0' || path[root_length] == '/');
 }
 
+//************************************//
+// Publish monitor-owned status to ODB
+//************************************//
 bool write_value(const char* path, const void* value, INT size, DWORD type) {
   if (!is_owned_status_path(path)) {
     cm_msg(MERROR, kClientName, "Refusing write outside %s: %s", kStatusRoot,
@@ -212,6 +215,9 @@ daq_monitor::RunParticipation read_run_participation() {
   return {valid != FALSE, run_number, vme != FALSE, easiroc != FALSE};
 }
 
+//************************************//
+// Record frontend participation for the current run
+//************************************//
 bool record_run_participation(INT run_number, bool vme, bool easiroc) {
   const BOOL invalid = FALSE;
   const BOOL valid = TRUE;
@@ -366,6 +372,9 @@ bool update_component_alarm(
   return true;
 }
 
+//************************************//
+// Synchronize DAQ component alarms with current status
+//************************************//
 bool update_alarms() {
   const std::time_t now = std::time(nullptr);
   const std::uint64_t now_unix =
@@ -580,6 +589,9 @@ std::string disk_path_for(const LoggerSource& source) {
   return parent_directory(combined);
 }
 
+//************************************//
+// Refresh cached logger disk information
+//************************************//
 void update_disk_cache(const LoggerSource& source, DWORD now_ms) {
   const std::string path = disk_path_for(source);
   const DWORD elapsed = now_ms - gDiskCache.last_update_ms;
@@ -602,6 +614,9 @@ void update_disk_cache(const LoggerSource& source, DWORD now_ms) {
   gDiskCache.initialized = true;
 }
 
+//************************************//
+// Evaluate and publish DAQ status in ODB
+//************************************//
 bool publish_status(bool synchronous_start_check = false) {
   INT run_number = 0;
   INT run_state = 0;
@@ -927,6 +942,9 @@ bool publish_status(bool synchronous_start_check = false) {
   return publish_can_start(can_start) && ok;
 }
 
+//************************************//
+// Reject START when DAQ prerequisites are not met
+//************************************//
 INT validate_start_transition(INT run_number, char* error) {
   daq_monitor::CanStartEvaluation evaluation;
   BOOL can_start = FALSE;
@@ -971,7 +989,9 @@ INT validate_start_transition(INT run_number, char* error) {
   return CM_TRANSITION_CANCELED;
 }
 
-// Logger reads EOR links at sequence 800. Capture the finished run first.
+//************************************//
+// Capture completed run values for the JSON Runlog
+//************************************//
 INT capture_runlog_eor(INT run_number, char*) {
   const daq_monitor::RunParticipation participation = read_run_participation();
   if (!participation.valid || participation.run_number != run_number) {
@@ -1034,6 +1054,9 @@ INT capture_runlog_eor(INT run_number, char*) {
   return CM_SUCCESS;
 }
 
+//************************************//
+// Submit a completed run to the built-in ELOG
+//************************************//
 void maybe_spawn_run_elog(INT* last_spawned_run) {
   INT state = 0, transition = 0, eor_run = 0, last_attempt = 0, last_run = 0;
   if (!read_value("/Runinfo/State", TID_INT32, &state) ||
@@ -1070,8 +1093,9 @@ void maybe_spawn_run_elog(INT* last_spawned_run) {
   }
 }
 
-// Run after the STOP transition, outside its callback. A failed index refresh
-// must never affect Logger's JSON EOR or the independent ELOG post.
+//************************************//
+// Refresh the Runlog index after a completed run
+//************************************//
 void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
                              INT* active_run) {
   INT state = 0, transition = 0, eor_run = 0;
@@ -1150,6 +1174,9 @@ std::optional<std::filesystem::path> edit_runlog_directory() {
   return path;
 }
 
+//************************************//
+// Check whether a Runlog may still be written
+//************************************//
 bool runlog_edit_is_active(std::int64_t target_run) {
   INT current_run = 0, state = 0, transition = 0;
   const bool valid =
@@ -1160,6 +1187,9 @@ bool runlog_edit_is_active(std::int64_t target_run) {
       target_run, current_run, state, transition, valid);
 }
 
+//************************************//
+// Handle the limited Runlog metadata edit RPC
+//************************************//
 INT edit_runlog_rpc_callback(INT, void* parameters[]) {
   if (!parameters || !parameters[2]) return RPC_INVALID_ID;
   auto* reply = static_cast<std::string*>(parameters[2]);
@@ -1183,6 +1213,9 @@ void print_usage(const char* program) {
 
 }  // namespace
 
+//************************************//
+// Run the DAQ status monitor
+//************************************//
 int main(int argc, char** argv) {
   char host_name[HOST_NAME_LENGTH] = {};
   char experiment_name[NAME_LENGTH] = {};

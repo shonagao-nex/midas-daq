@@ -39,6 +39,9 @@ const char* alarm_class_for_level(AlarmLevel level) {
   return "";
 }
 
+//************************************//
+// Suppress expected stopped-state disconnect alarms
+//************************************//
 bool suppress_frontend_disconnect_alarm(RunState run_state, bool connected,
                                         const std::string& severity,
                                         const std::string& reason) {
@@ -48,6 +51,9 @@ bool suppress_frontend_disconnect_alarm(RunState run_state, bool connected,
              std::string::npos;
 }
 
+//************************************//
+// Format a bounded MIDAS alarm message
+//************************************//
 std::string format_alarm_message(const AlarmObservation& observation) {
   std::string message = "[" + observation_time(observation.observed_unix) +
                         "] " + observation.component + " " +
@@ -78,6 +84,9 @@ std::string format_alarm_message(const AlarmObservation& observation) {
   return message;
 }
 
+//************************************//
+// Choose the next alarm state and action
+//************************************//
 AlarmDecision decide_alarm_transition(
     const AlarmRuntimeState& current,
     const AlarmObservation& observation,

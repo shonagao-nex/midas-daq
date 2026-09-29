@@ -16,8 +16,9 @@ struct RegisterValue {
   std::uint8_t value;
 };
 
-// Pure DAQ-control policy. This class owns no transport and performs no I/O.
-// startValue()/stopValue() only describe a future explicit register write.
+//************************************//
+// Describe EASIROC DAQ control register values
+//************************************//
 class DaqControl {
  public:
   static constexpr std::uint32_t kStatusRegisterAddress = 0x00000077;
