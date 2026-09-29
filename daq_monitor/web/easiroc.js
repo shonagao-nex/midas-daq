@@ -300,7 +300,7 @@ async function applySettings() {
   try {
     clearMessage();
     requireStopped();
-    if (!truth(statusValue("enabled"))) throw new Error("EASIROC Enabled must be TRUE");
+    if (!truth(statusValue("enabled"))) throw new Error("EASI Enabled must be TRUE");
     if (unsaved()) throw new Error("Save to ODB before Apply to hardware");
     if (truth(statusValue("inProgress")) || !statusAvailable()) throw new Error("Frontend apply status is not ready");
     const requestId = nextRequestId(); state.applyPending = true; state.requestedId = requestId; updateUi();
@@ -358,7 +358,7 @@ function initializeEasirocPage() {
     const requestedScenario = query.get("mock");
     selectMockScenario(window.EASIROC_MOCK_SCENARIOS[requestedScenario] ? requestedScenario : "match");
   } else {
-    mhttpd_init("EASIROC Slow Control", REFRESH_INTERVAL_MS);
+    mhttpd_init("EASI Slow Control", REFRESH_INTERVAL_MS);
   }
   refresh();
 }
