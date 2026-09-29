@@ -3959,38 +3959,33 @@ static void refresh_enabled_module_variables()
 static INT start_abort(INT run_number, char *error);
 
 //************************************//
-// Initialize the VME frontend and hardware interface
+// Verify the MIDAS run state before VME startup recovery
 //************************************//
-INT frontend_init()
+static INT verify_startup_run_state(INT *current_run_state)
 {
-    global_busy::disable_readout();
-    INT current_run_state = 0;
-    if (!get_absolute_odb_value("/Runinfo/State", &current_run_state,
-                                sizeof(current_run_state), TID_INT)) {
+    if (!get_absolute_odb_value("/Runinfo/State", current_run_state,
+                                sizeof(*current_run_state), TID_INT)) {
         cm_msg(MERROR, frontend_name,
                "Cannot verify MIDAS Run state for V1720E startup recovery");
         return FE_ERR_ODB;
     }
-    if (current_run_state != STATE_STOPPED &&
-        current_run_state != STATE_RUNNING &&
-        current_run_state != STATE_PAUSED) {
+    if (*current_run_state != STATE_STOPPED &&
+        *current_run_state != STATE_RUNNING &&
+        *current_run_state != STATE_PAUSED) {
         cm_msg(MERROR, frontend_name,
                "Unknown MIDAS Run state %d; refusing V1720E startup recovery",
-               current_run_state);
+               *current_run_state);
         return FE_ERR_ODB;
     }
-    gV1720StartupRunState = current_run_state;
-#if ENABLE_V792_SW_TRIGGER_TEST || ENABLE_V1190_SOFT_TRIGGER_TEST || ENABLE_V775_SW_TRIGGER_TEST
-    printf("============================================================\n"
-           " WARNING: SOFTWARE-TRIGGER DIAGNOSTIC BUILD\n"
-           " V792 SW trigger    : ENABLED\n"
-           " V1190 Soft trigger : ENABLED\n"
-           " V775 SW trigger    : ENABLED\n"
-           "============================================================\n");
-#else
-    printf("Software-trigger diagnostics: disabled\n");
-#endif
+    gV1720StartupRunState = *current_run_state;
+    return SUCCESS;
+}
 
+//************************************//
+// Initialize VME ODB schemas and startup status
+//************************************//
+static INT initialize_frontend_odb_schema()
+{
     if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
         !initialize_v1720e_odb() || !initialize_run_counters_odb() ||
         !initialize_buffer_clear_mailbox()) {
@@ -4009,7 +4004,14 @@ INT frontend_init()
                "Cannot initialize VME RunSnapshot ODB schema");
         return FE_ERR_ODB;
     }
-    if (!global_busy::initialize()) return FE_ERR_ODB;
+    return SUCCESS;
+}
+
+//************************************//
+// Register VME startup and BUSY transitions
+//************************************//
+static INT register_frontend_transitions()
+{
     const INT transition_status =
         cm_register_transition(TR_STARTABORT, start_abort, 500);
     if (transition_status != CM_SUCCESS) {
@@ -4023,6 +4025,34 @@ INT frontend_init()
         cm_register_transition(TR_STOP, global_busy::before_stop, 400) != CM_SUCCESS ||
         cm_register_transition(TR_STARTABORT, global_busy::start_abort, 400) != CM_SUCCESS)
         return FE_ERR_ODB;
+    return SUCCESS;
+}
+
+//************************************//
+// Initialize the VME frontend and hardware interface
+//************************************//
+INT frontend_init()
+{
+    global_busy::disable_readout();
+    INT current_run_state = 0;
+    const INT startup_state_status = verify_startup_run_state(&current_run_state);
+    if (startup_state_status != SUCCESS) return startup_state_status;
+#if ENABLE_V792_SW_TRIGGER_TEST || ENABLE_V1190_SOFT_TRIGGER_TEST || ENABLE_V775_SW_TRIGGER_TEST
+    printf("============================================================\n"
+           " WARNING: SOFTWARE-TRIGGER DIAGNOSTIC BUILD\n"
+           " V792 SW trigger    : ENABLED\n"
+           " V1190 Soft trigger : ENABLED\n"
+           " V775 SW trigger    : ENABLED\n"
+           "============================================================\n");
+#else
+    printf("Software-trigger diagnostics: disabled\n");
+#endif
+
+    const INT schema_status = initialize_frontend_odb_schema();
+    if (schema_status != SUCCESS) return schema_status;
+    if (!global_busy::initialize()) return FE_ERR_ODB;
+    const INT transition_status = register_frontend_transitions();
+    if (transition_status != SUCCESS) return transition_status;
 
     printf("Opening VME interface...\n");
 
