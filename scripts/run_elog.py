@@ -147,9 +147,11 @@ def format_entry(run, record):
     status = eor["DAQ Status"]
     if status not in ("OK", "WARNING", "ERROR"):
         raise ValueError(f"Invalid DAQ Status: {status}")
+    experiment = bor.get("experiment_label") or ""
     comment = eor["Comment"] if str(eor["Comment"]).strip() else "(empty)"
     subject = f"Run #{run} - {run_type} - {status}"
     body = (f"Run #{run} Summary\n\n"
+            f"Experiment : {experiment}\n"
             f"Type       : {run_type}\n"
             f"Comment    : {comment}\n\n"
             f"Start      : {display_time(bor['Start time'])}\n"

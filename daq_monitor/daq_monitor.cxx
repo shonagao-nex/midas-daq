@@ -1,5 +1,7 @@
 #include "midas.h"
+#include "mrpc.h"
 #include "alarm_policy.h"
+#include "runlog_edit_rpc.h"
 #include "status_policy.h"
 
 #include <algorithm>
@@ -11,6 +13,7 @@
 #include <ctime>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <spawn.h>
 #include <string>
 #include <sys/statvfs.h>
@@ -35,6 +38,8 @@ constexpr char kEasirocClientName[] = "feeasiroc";
 constexpr char kLoggerClientName[] = "Logger";
 constexpr char kRunElogScript[] =
     "/home/nagao/midas/midas/online/scripts/run_elog.py";
+constexpr char kDevelopmentRunlogDirectory[] =
+    "/home/nagao/midas/midas/daq-dev/runlogs";
 
 volatile std::sig_atomic_t gStopRequested = 0;
 HNDLE gDatabase = 0;
@@ -1128,6 +1133,50 @@ void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
   }
 }
 
+std::optional<std::filesystem::path> edit_runlog_directory() {
+  std::string directory, subdir;
+  if (!read_string("/Logger/Message dir", &directory) || directory.empty()) {
+    if (!read_string("/Logger/Data dir", &directory) || directory.empty())
+      return std::nullopt;
+  }
+  if (!read_string("/Logger/Runlog/JSON/Subdir", &subdir) || subdir.empty() ||
+      std::filesystem::path(subdir).is_absolute())
+    return std::nullopt;
+  std::error_code error;
+  const auto path = std::filesystem::weakly_canonical(
+      std::filesystem::path(directory) / subdir, error);
+  if (error || path != std::filesystem::path(kDevelopmentRunlogDirectory))
+    return std::nullopt;
+  return path;
+}
+
+bool runlog_edit_is_active(std::int64_t target_run) {
+  INT current_run = 0, state = 0, transition = 0;
+  const bool valid =
+      read_value("/Runinfo/Run number", TID_INT32, &current_run) &&
+      read_value("/Runinfo/State", TID_INT32, &state) &&
+      read_value("/Runinfo/Transition in progress", TID_INT32, &transition);
+  return daq_monitor::runlog_edit_target_active(
+      target_run, current_run, state, transition, valid);
+}
+
+INT edit_runlog_rpc_callback(INT, void* parameters[]) {
+  if (!parameters || !parameters[2]) return RPC_INVALID_ID;
+  auto* reply = static_cast<std::string*>(parameters[2]);
+  const char* command = static_cast<const char*>(parameters[0]);
+  const char* arguments = static_cast<const char*>(parameters[1]);
+  const auto directory = edit_runlog_directory();
+  if (!directory) {
+    *reply = daq_monitor::runlog_edit_rpc_response(
+        {daq_monitor::RunlogEditCode::kIoError, "Runlog directory unavailable"}, 0);
+    return RPC_SUCCESS;
+  }
+  const daq_monitor::RunlogEditor editor(*directory, runlog_edit_is_active);
+  *reply = daq_monitor::handle_runlog_edit_rpc(
+      command ? command : "", arguments ? arguments : "", editor);
+  return RPC_SUCCESS;
+}
+
 void print_usage(const char* program) {
   std::printf("Usage: %s [-h host] [-e experiment]\n", program);
 }
@@ -1196,6 +1245,14 @@ int main(int argc, char** argv) {
   const INT stop_status = cm_register_transition(TR_STOP, capture_runlog_eor, 700);
   if (stop_status != CM_SUCCESS) {
     std::fprintf(stderr, "Cannot register EOR runlog capture: status %d\n", stop_status);
+    cm_disconnect_experiment();
+    return 1;
+  }
+  const INT edit_rpc_status =
+      cm_register_function(RPC_JRPC_CXX, edit_runlog_rpc_callback);
+  if (edit_rpc_status != CM_SUCCESS) {
+    std::fprintf(stderr, "Cannot register Runlog edit RPC: status %d\n",
+                 edit_rpc_status);
     cm_disconnect_experiment();
     return 1;
   }

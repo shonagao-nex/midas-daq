@@ -8,6 +8,10 @@ ODB on port 8181. It reads `/runlogs/runlog_index.json`, applies
 files per page through mhttpd, with four requests in flight. The `runlogs`
 symlink in this directory points to the development Runlog directory. It does
 not probe missing run numbers or modify Runlogs.
+The `experiment_label` field in each Runlog's BOR section records
+`/Experiment/Run Parameters/ExperimentLabel` when Logger starts that run.
+Run Summary and its CSV export read this saved value, so later GUI edits do
+not change older runs. Older Runlogs without the field show an empty value.
 
 `scripts/update_runlog_index.py` rescans the Runlog directory and atomically
 replaces `runlog_index.json`. `daq_monitor` launches it after a completed STOP,
@@ -43,8 +47,11 @@ only recorded scaler channels into the 64 `Scaler00`–`Scaler63` columns.
 
 `daq.html` is the general-user MIDAS dashboard. It reads status from
 `/DAQ/Status` and the standard MIDAS equipment statistics records. Start and
-Stop use the existing MIDAS transitions. The only direct ODB writes are module
-Enable settings while the run state is STOPPED; the page never writes hardware.
+Stop use the existing MIDAS transitions. Settings are stored in ODB; the page
+never writes hardware directly.
+The Run settings use `/Experiment/Run Parameters/ExperimentLabel` (a 1024-byte
+ODB STRING), alongside the existing `Type` and `Comment` keys. The Experiment
+field is editable while STOPPED and is separate from `/Experiment/Name`.
 
 ## Offline preview
 

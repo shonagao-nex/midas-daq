@@ -84,6 +84,13 @@ class RunElogTest(unittest.TestCase):
         self.assertIn("Comment    : During run: detector adjusted", body)
         self.assertNotIn("old BOR comment", body)
 
+    def test_experiment_uses_bor_snapshot_and_old_runs_remain_valid(self):
+        _, old_body = run_elog.format_entry(53, self.record)
+        self.assertIn("Experiment : \nType       : Test", old_body)
+        self.record["BOR"]["experiment_label"] = "KEK beamtime 2026"
+        _, body = run_elog.format_entry(53, self.record)
+        self.assertIn("Experiment : KEK beamtime 2026\nType       : Test", body)
+
     def test_disabled_and_duplicate_attempt(self):
         odb = FakeOdb(enabled=False)
         self.assertEqual(run_elog.process_run(odb, 53), "DISABLED")

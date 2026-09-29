@@ -1,12 +1,24 @@
 "use strict";
 
-const RUN_SUMMARY_BATCH = 10;
+const RUN_SUMMARY_BATCH = 30;
 const RUN_SUMMARY_CONCURRENCY = 4;
+const MIDAS_SUCCESS = 1;
 let targetRuns = [];
 let nextTargetIndex = 0;
 let displayedRuns = 0;
 let loadingRuns = false;
 let exportingRuns = false;
+let editSession = null;
+const RUN_EDIT_TYPES = new Set(["Data", "Clock", "Cosmic", "Test"]);
+const RUN_EDIT_ERRORS = {
+  invalid_request: "The edit request was rejected. Reload the page and try again.",
+  invalid_value: "One or more values are invalid. Check Experiment, Type, and Comment.",
+  run_not_found: "This Runlog is no longer available.",
+  incomplete_run: "This run has no completed EOR and cannot be edited.",
+  run_active: "This run is acquiring data or in a transition and cannot be edited yet.",
+  invalid_runlog: "This Runlog is invalid or unsafe to edit.",
+  write_failed: "The Runlog could not be saved. No change was confirmed."
+};
 
 function runSummaryInteger(value) {
   if (value === null || value === undefined || value === "") return "N/A";
@@ -47,6 +59,22 @@ function summaryCell(row, value) {
   return cell;
 }
 
+function summaryExpandableCell(row, value, limit) {
+  const cell = row.insertCell();
+  if (value.length <= limit) {
+    cell.textContent = value;
+    return cell;
+  }
+  const details = document.createElement("details");
+  const teaser = document.createElement("summary");
+  teaser.textContent = `${value.slice(0, limit - 3)}…`;
+  const full = document.createElement("p");
+  full.textContent = value;
+  details.append(teaser, full);
+  cell.append(details);
+  return cell;
+}
+
 function normalizedRunSummary(number, record) {
   const bor = record && typeof record.BOR === "object" && record.BOR || {};
   const eor = record && typeof record.EOR === "object" && record.EOR || null;
@@ -60,6 +88,7 @@ function normalizedRunSummary(number, record) {
   };
   return {
     run: numeric(bor["Run number"]) || String(number),
+    experiment: bor.experiment_label ?? null,
     type: bor.Type ?? null,
     start: time(bor["Start time"]),
     stop: eor ? time(eor["Stop time"]) : null,
@@ -76,10 +105,184 @@ function normalizedRunSummary(number, record) {
   };
 }
 
+function editableRunlog(record) {
+  return record && record.BOR && typeof record.BOR === "object" &&
+    !Array.isArray(record.BOR) && record.EOR && typeof record.EOR === "object" &&
+    !Array.isArray(record.EOR) && typeof record.EOR["Stop time"] === "string" &&
+    record.EOR["Stop time"].length > 0;
+}
+
+function originalRunMetadata(record) {
+  const value = (section, key) => {
+    if (!Object.prototype.hasOwnProperty.call(section, key)) return null;
+    if (typeof section[key] !== "string") throw new Error("Invalid Runlog metadata");
+    return section[key];
+  };
+  return {
+    Experiment: value(record.BOR, "experiment_label"),
+    Type: value(record.BOR, "Type"),
+    Comment: value(record.EOR, "Comment")
+  };
+}
+
+function editControl(id) { return document.getElementById(`run-edit-${id}`); }
+
+function editMessage(message, kind = "error") {
+  const element = editControl("message");
+  element.textContent = message;
+  element.className = `run-edit-message ${kind}`;
+  element.hidden = !message;
+}
+
+function populateRunEditDialog(record) {
+  const original = originalRunMetadata(record);
+  editSession.original = original;
+  editSession.typeTouched = false;
+  editControl("number").textContent = String(editSession.number);
+  editControl("experiment").value = original.Experiment ?? "";
+  const type = editControl("type");
+  type.options[0].textContent = original.Type === null ? "Select Type" :
+    "Current Type unavailable — select to change";
+  type.value = RUN_EDIT_TYPES.has(original.Type) ? original.Type : "";
+  editControl("comment").value = original.Comment ?? "";
+  editMessage("");
+}
+
+function openRunSummaryEditor(number, record, row) {
+  if (!editableRunlog(record)) return;
+  try {
+    originalRunMetadata(record);
+  } catch (_) { return; }
+  editSession = {number, record, row, original: null, typeTouched: false, saving: false};
+  populateRunEditDialog(record);
+  editControl("dialog").showModal();
+  editControl("experiment").focus();
+}
+
+function closeRunSummaryEditor() {
+  if (editSession && editSession.saving) return;
+  editControl("dialog").close();
+  editSession = null;
+}
+
+function changedRunMetadata() {
+  const changes = {};
+  const original = editSession.original;
+  const experiment = editControl("experiment").value;
+  const type = editControl("type").value;
+  const comment = editControl("comment").value;
+  if (experiment !== (original.Experiment ?? ""))
+    changes.Experiment = {current: original.Experiment, value: experiment};
+  if (type !== original.Type && (RUN_EDIT_TYPES.has(original.Type) || editSession.typeTouched))
+    changes.Type = {current: original.Type, value: type};
+  if (comment !== (original.Comment ?? ""))
+    changes.Comment = {current: original.Comment, value: comment};
+  return changes;
+}
+
+function validateRunEdit(changes) {
+  if (changes.Experiment &&
+      (changes.Experiment.value.length > 255 || /[\u0000-\u001f\u007f-\u009f]/.test(changes.Experiment.value)))
+    return "Experiment must be at most 255 characters and contain no newlines or control characters.";
+  if (changes.Type && !RUN_EDIT_TYPES.has(changes.Type.value))
+    return "Choose Data, Clock, Cosmic, or Test for Type.";
+  if (changes.Comment && changes.Comment.value.length > 1024)
+    return "Comment must be at most 1024 characters.";
+  return null;
+}
+
+function setRunEditBusy(busy) {
+  for (const id of ["experiment", "type", "comment", "save", "cancel"])
+    editControl(id).disabled = busy;
+  if (editSession) editSession.saving = busy;
+}
+
+async function refreshEditedRun(session) {
+  const record = await fetchRunSummary(session.number);
+  if (!record) throw new Error("Runlog unavailable after edit");
+  const replacement = renderRunSummaryRow(session.number, record);
+  session.row.replaceWith(replacement);
+  session.row = replacement;
+  session.record = record;
+  return record;
+}
+
+async function saveRunSummaryEdit(event) {
+  event.preventDefault();
+  if (!editSession || editSession.saving) return;
+  const session = editSession;
+  const changes = changedRunMetadata();
+  if (!Object.keys(changes).length) { closeRunSummaryEditor(); return; }
+  const problem = validateRunEdit(changes);
+  if (problem) { editMessage(problem); return; }
+  setRunEditBusy(true);
+  editMessage("");
+  try {
+    const rpc = await mjsonrpc_call("jrpc_cxx", {
+      client_name: "daq_monitor",
+      cmd: "edit_runlog_metadata",
+      args: JSON.stringify({run: session.number, changes})
+    });
+    if (!rpc || !rpc.result || rpc.result.status !== MIDAS_SUCCESS ||
+        typeof rpc.result.reply !== "string")
+      throw new Error("Invalid RPC response");
+    const reply = JSON.parse(rpc.result.reply);
+    if (reply && reply.ok === true && reply.run === session.number) {
+      try {
+        await refreshEditedRun(session);
+      } catch (_) {
+        editMessage("Saved, but the updated Runlog could not be reloaded. Close the dialog and reload the page.", "warning");
+        return;
+      }
+      setRunEditBusy(false);
+      closeRunSummaryEditor();
+      return;
+    }
+    if (!reply || reply.ok !== false || typeof reply.code !== "string")
+      throw new Error("Invalid RPC reply");
+    if (reply.code === "stale_value" || reply.code === "saved_but_sync_uncertain") {
+      try {
+        const latest = await refreshEditedRun(session);
+        if (!editableRunlog(latest)) {
+          setRunEditBusy(false);
+          closeRunSummaryEditor();
+          return;
+        }
+        populateRunEditDialog(latest);
+        editMessage(reply.code === "stale_value" ?
+          "Values changed in another session. Latest values were loaded; review them before saving again." :
+          "Save confirmation is uncertain. Latest Runlog values were loaded; verify them before retrying.",
+          "warning");
+      } catch (_) {
+        editMessage("Could not reload this Runlog. Close the dialog and try again.");
+      }
+      return;
+    }
+    editMessage(RUN_EDIT_ERRORS[reply.code] || "The edit request failed.");
+  } catch (_) {
+    editMessage("Could not complete the edit request. No change was confirmed.");
+  } finally {
+    if (editSession === session) setRunEditBusy(false);
+  }
+}
+
 function renderRunSummaryRow(number, record) {
   const data = normalizedRunSummary(number, record);
   const row = document.createElement("tr");
-  summaryCell(row, data.run);
+  const runCell = summaryCell(row, data.run);
+  if (editableRunlog(record)) {
+    try {
+      originalRunMetadata(record);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "run-edit-button";
+      button.textContent = "Edit";
+      button.setAttribute("aria-label", `Edit run ${number}`);
+      button.addEventListener("click", () => openRunSummaryEditor(number, record, row));
+      runCell.append(button);
+    } catch (_) { /* Malformed metadata remains read-only. */ }
+  }
+  summaryExpandableCell(row, data.experiment === null ? "" : String(data.experiment), 28);
   summaryCell(row, summaryText(data.type));
   summaryCell(row, summaryText(data.start));
   summaryCell(row, summaryText(data.stop));
@@ -94,17 +297,8 @@ function renderRunSummaryRow(number, record) {
   badge.textContent = status;
   badge.title = status === "INCOMPLETE" ? "End of run has not been recorded" : summaryText(data.statusSummary);
   statusCell.append(badge);
-  const commentCell = row.insertCell();
   const comment = summaryText(data.comment);
-  if (comment.length > 80) {
-    const details = document.createElement("details");
-    const teaser = document.createElement("summary");
-    teaser.textContent = `${comment.slice(0, 77)}…`;
-    const full = document.createElement("p");
-    full.textContent = comment;
-    details.append(teaser, full);
-    commentCell.append(details);
-  } else commentCell.textContent = comment;
+  summaryExpandableCell(row, comment, 80);
   const scalerCell = row.insertCell();
   const channels = data.scaler;
   if (!channels.length) scalerCell.textContent = "N/A";
@@ -172,7 +366,7 @@ async function loadRunTargets() {
   return [...new Set(selected)].sort((a, b) => b - a);
 }
 
-const CSV_COLUMNS = ["Run", "Type", "Start", "Stop", "Duration", "VME",
+const CSV_COLUMNS = ["Run", "Experiment", "Type", "Start", "Stop", "Duration", "VME",
   "EASI", "HUL", "Slip", "Status", "Comment",
   ...Array.from({length: 64}, (_, channel) => `Scaler${String(channel).padStart(2, "0")}`)];
 
@@ -184,7 +378,7 @@ function csvQuote(value) {
 function csvRunSummaryRow(number, record) {
   const data = normalizedRunSummary(number, record);
   const channels = new Map(data.scaler);
-  const values = [data.run, data.type, data.start, data.stop, data.duration,
+  const values = [data.run, data.experiment, data.type, data.start, data.stop, data.duration,
     data.vme, data.easi, data.hul, data.slip, data.status, data.comment,
     ...Array.from({length: 64}, (_, channel) =>
       channels.get(`ch${String(channel).padStart(2, "0")}`) ?? null)];
@@ -267,7 +461,7 @@ async function loadOlderRuns() {
     displayedRuns++;
   }
   nextTargetIndex += numbers.length;
-  if (!displayedRuns) body.innerHTML = '<tr><td colspan="12">No Runlog files found in this range.</td></tr>';
+  if (!displayedRuns) body.innerHTML = '<tr><td colspan="13">No Runlog files found in this range.</td></tr>';
   document.getElementById("summary-count").textContent = `${displayedRuns} runs shown`;
   button.disabled = nextTargetIndex >= targetRuns.length;
   loadingRuns = false;
@@ -277,17 +471,26 @@ async function initializeRunSummary() {
   mhttpd_init("Run Summary");
   document.getElementById("older-runs").addEventListener("click", loadOlderRuns);
   document.getElementById("export-csv").addEventListener("click", exportRunSummaryCsv);
+  editControl("form").addEventListener("submit", saveRunSummaryEdit);
+  editControl("cancel").addEventListener("click", closeRunSummaryEditor);
+  editControl("type").addEventListener("change", () => {
+    if (editSession) editSession.typeTouched = true;
+  });
+  editControl("dialog").addEventListener("cancel", event => {
+    if (editSession && editSession.saving) event.preventDefault();
+    else editSession = null;
+  });
   try {
     targetRuns = await loadRunTargets();
     if (targetRuns.length) await loadOlderRuns();
     else {
-      document.getElementById("run-summary-rows").innerHTML = '<tr><td colspan="12">No Runlogs selected.</td></tr>';
+      document.getElementById("run-summary-rows").innerHTML = '<tr><td colspan="13">No Runlogs selected.</td></tr>';
       document.getElementById("summary-count").textContent = "0 runs shown";
     }
   } catch (failure) {
     const error = document.getElementById("summary-error");
     error.textContent = `Cannot load Run Summary: ${failure.message}`;
     error.hidden = false;
-    document.getElementById("run-summary-rows").innerHTML = '<tr><td colspan="12">Run Summary unavailable.</td></tr>';
+    document.getElementById("run-summary-rows").innerHTML = '<tr><td colspan="13">Run Summary unavailable.</td></tr>';
   }
 }

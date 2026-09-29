@@ -1,7 +1,7 @@
 "use strict";
 const REFRESH_INTERVAL_MS=1000,MESSAGE_INTERVAL_MS=5000,MIDAS_SUCCESS=1,HISTORY_MAX_MS=24*60*60*1000,COMMENT_SAVE_DELAY_MS=400;
 const ODB=Object.freeze({
- globalSeverity:"/DAQ/Status/Global/Severity",globalSummary:"/DAQ/Status/Global/Summary",canStart:"/DAQ/Status/Global/CanStart",canStartReason:"/DAQ/Status/Global/CanStartReason",alarmSystemActive:"/Alarms/Alarm system active",acquisitionTime:"/Logger/Run duration",vmeEventLimit:"/Equipment/VME/Common/Event limit",easirocEventLimit:"/Equipment/NIM-EASIROC Physics/Common/Event limit",runNumber:"/DAQ/Status/Run/RunNumber",runState:"/DAQ/Status/Run/State",controlRunState:"/Runinfo/State",transitionInProgress:"/Runinfo/Transition in progress",runDuration:"/DAQ/Status/Run/DurationSec",startTime:"/Runinfo/Start time",stopTime:"/Runinfo/Stop time",runType:"/Experiment/Run Parameters/Type",runComment:"/Experiment/Run Parameters/Comment",
+ globalSeverity:"/DAQ/Status/Global/Severity",globalSummary:"/DAQ/Status/Global/Summary",canStart:"/DAQ/Status/Global/CanStart",canStartReason:"/DAQ/Status/Global/CanStartReason",alarmSystemActive:"/Alarms/Alarm system active",acquisitionTime:"/Logger/Run duration",vmeEventLimit:"/Equipment/VME/Common/Event limit",easirocEventLimit:"/Equipment/NIM-EASIROC Physics/Common/Event limit",runNumber:"/DAQ/Status/Run/RunNumber",runState:"/DAQ/Status/Run/State",controlRunState:"/Runinfo/State",transitionInProgress:"/Runinfo/Transition in progress",runDuration:"/DAQ/Status/Run/DurationSec",startTime:"/Runinfo/Start time",stopTime:"/Runinfo/Stop time",runExperiment:"/Experiment/Run Parameters/ExperimentLabel",runType:"/Experiment/Run Parameters/Type",runComment:"/Experiment/Run Parameters/Comment",
  vmeSeverity:"/DAQ/Status/Frontends/VME/Severity",vmeReason:"/DAQ/Status/Frontends/VME/Reason",vmeConnected:"/DAQ/Status/Frontends/VME/Connected",vmeParticipating:"/DAQ/Status/Frontends/VME/Participating",vmeEventSlip:"/DAQ/Status/Frontends/VME/EventSlipCount",easirocSeverity:"/DAQ/Status/Frontends/EASIROC/Severity",easirocReason:"/DAQ/Status/Frontends/EASIROC/Reason",easirocConnected:"/DAQ/Status/Frontends/EASIROC/Connected",easirocParticipating:"/DAQ/Status/Frontends/EASIROC/Participating",
  currentFilename:"/DAQ/Status/Logger/CurrentFilename",diskSeverity:"/DAQ/Status/Disk/Severity",diskPath:"/DAQ/Status/Disk/Path",diskFree:"/DAQ/Status/Disk/FreeGB",diskTotal:"/DAQ/Status/Disk/TotalGB",
  vmeEventRate:"/Equipment/VME/Statistics/Events per sec.",vmeDataRate:"/Equipment/VME/Statistics/kBytes per sec.",vmeEventCount:"/Equipment/VME/Statistics/Events sent",easirocEventRate:"/Equipment/NIM-EASIROC Physics/Statistics/Events per sec.",easirocDataRate:"/Equipment/NIM-EASIROC Physics/Statistics/kBytes per sec.",easirocEventCount:"/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
@@ -75,7 +75,7 @@ function renderEventLimit(force=false){
  const matches=available&&Number(vme)===Number(easiroc);
  input.disabled=!available;
  warning.hidden=matches;
- warning.textContent=available?"VME/EASI limits differ":"VME/EASI limits unavailable";
+ warning.textContent=available?"VME/EASIROC limits differ":"VME/EASIROC limits unavailable";
  if(force||document.activeElement!==input)input.value=matches?String(Number(vme)):"";
 }
 async function saveLimit(id){
@@ -100,7 +100,7 @@ async function saveLimit(id){
    if(write.result.status.some(status=>status!==MIDAS_SUCCESS)||
       readback.result.status.some(status=>status!==MIDAS_SUCCESS)||
       paths.some(key=>Number(currentValues[key])!==value))
-    throw new Error("VME/EASI write or readback did not match requested value");
+    throw new Error("VME/EASIROC write or readback did not match requested value");
   }else{
    if(mockMode){mockValues[path]=value;currentValues[path]=value;return}
    const write=await mjsonrpc_db_set_value(path,value);
@@ -145,27 +145,29 @@ async function toggleAlarmSystem(){
 }
 function renderMetadata(){
  const ready=!transitionPending&&valid(lastTransitionInProgress)&&Number(lastTransitionInProgress)===0;
- for(const [id,key] of [["run-type","runType"],["run-comment","runComment"]]){
+ for(const [id,key] of [["run-experiment","runExperiment"],["run-type","runType"],["run-comment","runComment"]]){
   const input=element(id),value=currentValues[ODB[key]];
   const exists=value!==null&&value!==undefined;
-  const editable=id==="run-type"?lastControlRunState==="STOPPED":
+  const requiresStopped=id==="run-type"||id==="run-experiment";
+  const editable=requiresStopped?lastControlRunState==="STOPPED":
    ["STOPPED","RUNNING","PAUSED"].includes(lastControlRunState);
-  input.disabled=!ready||!editable||!exists||(id==="run-type"&&metadataPending>0);
+  input.disabled=!ready||!editable||!exists||(requiresStopped&&metadataPending>0);
   if(document.activeElement!==input&&metadataPending===0&&exists)input.value=String(value);
  }
 }
 function saveMetadata(id,requestedValue){
- const input=element(id),key=id==="run-type"?"runType":"runComment",path=ODB[key],value=requestedValue===undefined?input.value:requestedValue;
+ const input=element(id),key=id==="run-experiment"?"runExperiment":id==="run-type"?"runType":"runComment",path=ODB[key],value=requestedValue===undefined?input.value:requestedValue;
+ const requiresStopped=id==="run-type"||id==="run-experiment";
  if(id==="run-comment"&&commentSaveTimer!==null){clearTimeout(commentSaveTimer);commentSaveTimer=null}
  if(mockMode){mockValues[path]=value;currentValues[path]=value;renderMetadata();return Promise.resolve(true)}
  metadataPending++;renderMetadata();updateButtons();
  const operation=metadataWrite.catch(()=>false).then(async()=>{
-  const stateAllowed=id==="run-type"?lastControlRunState==="STOPPED":
+  const stateAllowed=requiresStopped?lastControlRunState==="STOPPED":
    ["STOPPED","RUNNING","PAUSED"].includes(lastControlRunState);
   if(!stateAllowed||transitionPending)return false;
   const state=await mjsonrpc_db_get_values([ODB.controlRunState,ODB.transitionInProgress]);
   const stateCode=Number(state.result.data[0]);
-  if((id==="run-type"?stateCode!==1:![1,2,3].includes(stateCode))||Number(state.result.data[1])!==0)
+  if((requiresStopped?stateCode!==1:![1,2,3].includes(stateCode))||Number(state.result.data[1])!==0)
    throw new Error("Run state changed before metadata could be saved");
   if(currentValues[path]===value)return true;
   const write=await mjsonrpc_db_set_value(path,value);
@@ -209,7 +211,7 @@ async function requestTransition(transition){
 }
 function requestManualBufferClear(){window.location.assign(mockMode?"buffer-clear.html?mock=1":"/buffer-clear.html")}
 function seedMockHistory(){if(rateHistory.length>1)return;const now=Date.now(),vme=Number(mockValues[ODB.vmeEventRate])||0,easiroc=Number(mockValues[ODB.easirocEventRate])||0;rateHistory.length=0;for(let i=1440;i>0;i--)rateHistory.push({time:now-i*60000,vme:Math.max(0,vme+Math.sin(i/17)*55),easiroc:Math.max(0,easiroc+Math.cos(i/23)*42)})}
-function selectMockScenario(name){if(!window.DAQ_MOCK_SCENARIOS[name])return;mockScenario=name;mockValues={...window.DAQ_MOCK_SCENARIOS[name]};mockValues[ODB.controlRunState]=mockValues[ODB.runState];mockValues[ODB.transitionInProgress]=0;mockValues[ODB.alarmSystemActive]=true;mockValues[ODB.acquisitionTime]=currentValues[ODB.acquisitionTime]??0;mockValues[ODB.vmeEventLimit]=currentValues[ODB.vmeEventLimit]??0;mockValues[ODB.easirocEventLimit]=currentValues[ODB.easirocEventLimit]??0;document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.classList.toggle("active",button.dataset.mockScenario===name));seedMockHistory();render(mockValues);renderMessages(window.DAQ_MOCK_MESSAGES)}
+function selectMockScenario(name){if(!window.DAQ_MOCK_SCENARIOS[name])return;mockScenario=name;mockValues={...window.DAQ_MOCK_SCENARIOS[name]};mockValues[ODB.controlRunState]=mockValues[ODB.runState];mockValues[ODB.transitionInProgress]=0;mockValues[ODB.alarmSystemActive]=true;mockValues[ODB.runExperiment]=currentValues[ODB.runExperiment]??"";mockValues[ODB.acquisitionTime]=currentValues[ODB.acquisitionTime]??0;mockValues[ODB.vmeEventLimit]=currentValues[ODB.vmeEventLimit]??0;mockValues[ODB.easirocEventLimit]=currentValues[ODB.easirocEventLimit]??0;document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.classList.toggle("active",button.dataset.mockScenario===name));seedMockHistory();render(mockValues);renderMessages(window.DAQ_MOCK_MESSAGES)}
 function mockRefresh(){if(!mockMode)return;const running=runState(mockValues[ODB.runState])==="RUNNING",phase=Date.now()/3500;if(running){mockValues[ODB.vmeEventRate]=1248+55*Math.sin(phase);mockValues[ODB.easirocEventRate]=1244+42*Math.cos(phase*.9);mockValues[ODB.runDuration]=Number(mockValues[ODB.runDuration])+1}render(mockValues);window.setTimeout(mockRefresh,REFRESH_INTERVAL_MS)}
-function setupLinksAndEvents(){MODULES.forEach(module=>{element(`${module.id}-link`).href=`?cmd=odb&odb_path=${encodeURIComponent(module.link)}`;element(`${module.id}-toggle`).addEventListener("click",()=>setModuleEnabled(module))});element("upper-run-button").addEventListener("click",()=>lastControlRunState==="STOPPED"?requestStart():requestTransition("TR_STOP"));element("lower-run-button").addEventListener("click",()=>{if(lastControlRunState==="STOPPED")requestManualBufferClear();else if(lastControlRunState==="RUNNING")requestTransition("TR_PAUSE");else if(lastControlRunState==="PAUSED")requestTransition("TR_RESUME")});element("alarm-toggle").addEventListener("click",toggleAlarmSystem);["run-type","run-comment"].forEach(id=>element(id).addEventListener("change",()=>saveMetadata(id)));element("run-comment").addEventListener("input",()=>{if(commentSaveTimer!==null)clearTimeout(commentSaveTimer);commentSaveTimer=setTimeout(()=>{commentSaveTimer=null;saveMetadata("run-comment")},COMMENT_SAVE_DELAY_MS)});element("cancel-empty-comment").addEventListener("click",()=>element("empty-comment-dialog").close());element("start-anyway").addEventListener("click",()=>{element("empty-comment-dialog").close();requestTransition("TR_START")});["acquisition-time","event-limit"].forEach(id=>{element(id).addEventListener("change",()=>saveLimit(id));element(id).addEventListener("input",event=>event.target.setCustomValidity(""))});document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.addEventListener("click",()=>selectMockScenario(button.dataset.mockScenario)));document.querySelectorAll("[data-history-minutes]").forEach(button=>button.addEventListener("click",()=>setHistoryWindow(Number(button.dataset.historyMinutes))));document.querySelectorAll("[data-history-seconds]").forEach(button=>button.addEventListener("click",()=>setHistoryUpdate(Number(button.dataset.historySeconds))));window.addEventListener("resize",drawRateHistory)}
+function setupLinksAndEvents(){MODULES.forEach(module=>{element(`${module.id}-link`).href=`?cmd=odb&odb_path=${encodeURIComponent(module.link)}`;element(`${module.id}-toggle`).addEventListener("click",()=>setModuleEnabled(module))});element("upper-run-button").addEventListener("click",()=>lastControlRunState==="STOPPED"?requestStart():requestTransition("TR_STOP"));element("lower-run-button").addEventListener("click",()=>{if(lastControlRunState==="STOPPED")requestManualBufferClear();else if(lastControlRunState==="RUNNING")requestTransition("TR_PAUSE");else if(lastControlRunState==="PAUSED")requestTransition("TR_RESUME")});element("alarm-toggle").addEventListener("click",toggleAlarmSystem);["run-experiment","run-type","run-comment"].forEach(id=>element(id).addEventListener("change",()=>saveMetadata(id)));element("run-comment").addEventListener("input",()=>{if(commentSaveTimer!==null)clearTimeout(commentSaveTimer);commentSaveTimer=setTimeout(()=>{commentSaveTimer=null;saveMetadata("run-comment")},COMMENT_SAVE_DELAY_MS)});element("cancel-empty-comment").addEventListener("click",()=>element("empty-comment-dialog").close());element("start-anyway").addEventListener("click",()=>{element("empty-comment-dialog").close();requestTransition("TR_START")});["acquisition-time","event-limit"].forEach(id=>{element(id).addEventListener("change",()=>saveLimit(id));element(id).addEventListener("input",event=>event.target.setCustomValidity(""))});document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.addEventListener("click",()=>selectMockScenario(button.dataset.mockScenario)));document.querySelectorAll("[data-history-minutes]").forEach(button=>button.addEventListener("click",()=>setHistoryWindow(Number(button.dataset.historyMinutes))));document.querySelectorAll("[data-history-seconds]").forEach(button=>button.addEventListener("click",()=>setHistoryUpdate(Number(button.dataset.historySeconds))));window.addEventListener("resize",drawRateHistory)}
 function initializeDashboard(){mhttpdConfigSet("speakTalk",false);mhttpdConfigSet("alarmSound",true);updateAlarmButton();setupLinksAndEvents();setHistoryWindow(10);setHistoryUpdate(1);const query=new URLSearchParams(window.location.search);mockMode=query.has("mock");if(mockMode){document.body.classList.add("mock-mode");element("mock-notice").hidden=false;const requested=query.get("mock"),scenario=requested==="stopped"?"stopped_warning":requested==="error"?"running_error":"running_ok";selectMockScenario(scenario);window.setTimeout(mockRefresh,REFRESH_INTERVAL_MS);return}mhttpd_init("DAQ",REFRESH_INTERVAL_MS);refreshDashboard()}

@@ -121,6 +121,8 @@ def main():
     # UTF-8 can use four bytes per character, plus the terminating NUL.
     ensure_key(f"{RUN_PARAMETERS}/Comment", 12, string_length=4097)
     ensure_string_size(f"{RUN_PARAMETERS}/Comment", 4097)
+    ensure_key(f"{RUN_PARAMETERS}/ExperimentLabel", 12, string_length=1024)
+    ensure_string_size(f"{RUN_PARAMETERS}/ExperimentLabel", 1024)
 
     root = "/DAQ/Status/Runlog"
     ensure_key(root, 15)
@@ -136,7 +138,8 @@ def main():
     for name, target in (
             ("Run number", "/Runinfo/Run number"),
             ("Start time", "/Runinfo/Start time"),
-            ("Type", f"{RUN_PARAMETERS}/Type")):
+            ("Type", f"{RUN_PARAMETERS}/Type"),
+            ("experiment_label", f"{RUN_PARAMETERS}/ExperimentLabel")):
         ensure_link(name, target, "BOR")
     eor_links = (
             ("Stop time", "/Runinfo/Stop time"),
