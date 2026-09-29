@@ -40,7 +40,8 @@ def ensure_key(path, tid, **options):
 
 def set_value(path, value):
     result = rpc("db_paste", {"paths": [path], "values": [value]})
-    if result["status"] != [1] or get(path) != (1, value):
+    status, actual = get(path)
+    if result["status"] != [1] or status != 1 or str(actual) != str(value):
         raise RuntimeError(f"Cannot set {path}: {result}")
 
 
@@ -75,6 +76,31 @@ def remove_link(name, phase):
         raise RuntimeError(f"Cannot remove {path}: {result}")
 
 
+def reorder_eor_links(links):
+    """MIDAS preserves ODB insertion order in the generated JSON."""
+    path = f"{JSON_ROOT}/Links EOR"
+    result = rpc("db_get_values", {"paths": [path]})
+    if result["status"] != [1]:
+        raise RuntimeError(f"Cannot inspect {path}")
+    present = [value for key, value in result["data"][0].items()
+               if key.endswith("/name")]
+    if [name.lower() for name in present] == [name.lower() for name, _ in links]:
+        return
+    expected = set(name.lower() for name, _ in links)
+    stale = {"durationsec", "vmeevents", "easirocevents",
+             "daqstatus", "daqsummary"}
+    unexpected = set(name.lower() for name in present) - expected - stale
+    if unexpected:
+        raise RuntimeError(f"Unexpected EOR links: {sorted(unexpected)}")
+    for name in present:
+        if name.lower() in stale and get(f"{path}/{name}") != (1, {}):
+            raise RuntimeError(f"Cannot remove nonempty legacy EOR key {name}")
+    for name in present:
+        remove_link(name, "EOR")
+    for name, target in links:
+        ensure_link(name, target, "EOR")
+
+
 def main():
     if get("/Experiment/Name") != (1, "daq-dev"):
         raise RuntimeError("Port 8181 is not daq-dev")
@@ -86,6 +112,8 @@ def main():
         raise RuntimeError("Configure only while STOPPED")
     if get("/Logger/Write data") != (1, True):
         raise RuntimeError("Logger/Write data must already be enabled")
+    if get("/Equipment/HUL")[0] == 1:
+        raise RuntimeError("HUL equipment exists; implement participation and event count first")
 
     ensure_key(RUN_PARAMETERS, 15)
     if ensure_key(f"{RUN_PARAMETERS}/Type", 12, string_length=32) is None:
@@ -98,26 +126,34 @@ def main():
     ensure_key(root, 15)
     for name, tid, length in (
             ("DurationSec", 18, 0), ("VMEEvents", 17, 0),
-            ("EASIROCEvents", 17, 0), ("EventSlipCount", 18, 0),
+            ("EASIROCEvents", 17, 0), ("HULEvents", 17, 0),
+            ("EventSlipCount", 18, 0),
             ("DAQStatus", 12, 512), ("DAQSummary", 12, 512)):
         ensure_key(f"{root}/{name}", tid,
                    **({"string_length": length} if length else {}))
+    set_value(f"{root}/HULEvents", -1)
 
     for name, target in (
             ("Run number", "/Runinfo/Run number"),
             ("Start time", "/Runinfo/Start time"),
             ("Type", f"{RUN_PARAMETERS}/Type")):
         ensure_link(name, target, "BOR")
-    for name, target in (
+    eor_links = (
             ("Stop time", "/Runinfo/Stop time"),
             ("Comment", f"{RUN_PARAMETERS}/Comment"),
             ("Duration", f"{root}/DurationSec"),
             ("VME events", f"{root}/VMEEvents"),
             ("EASIROC events", f"{root}/EASIROCEvents"),
+            ("HUL events", f"{root}/HULEvents"),
             ("EventSlipCount", f"{root}/EventSlipCount"),
             ("DAQ Status", f"{root}/DAQStatus"),
-            ("DAQ Summary", f"{root}/DAQSummary")):
-        ensure_link(name, target, "EOR")
+            ("DAQ Summary", f"{root}/DAQSummary"),
+            ("Scaler 64ch", f"{root}/Scaler64ch"))
+    # No scaler count is published today. An empty directory serializes as
+    # an empty object; future real ch00..ch63 keys can be added without a
+    # change to the Runlog link or a fabricated channel value.
+    ensure_key(f"{root}/Scaler64ch", 15)
+    reorder_eor_links(eor_links)
     remove_link("Comment", "BOR")
     set_value(f"{JSON_ROOT}/Write data", True)
     print("Configured daq-dev JSON Runlog on port 8181")

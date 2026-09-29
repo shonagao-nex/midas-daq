@@ -75,7 +75,7 @@ function renderEventLimit(force=false){
  const matches=available&&Number(vme)===Number(easiroc);
  input.disabled=!available;
  warning.hidden=matches;
- warning.textContent=available?"VME/EASIROC limits differ":"VME/EASIROC limits unavailable";
+ warning.textContent=available?"VME/EASI limits differ":"VME/EASI limits unavailable";
  if(force||document.activeElement!==input)input.value=matches?String(Number(vme)):"";
 }
 async function saveLimit(id){
@@ -100,7 +100,7 @@ async function saveLimit(id){
    if(write.result.status.some(status=>status!==MIDAS_SUCCESS)||
       readback.result.status.some(status=>status!==MIDAS_SUCCESS)||
       paths.some(key=>Number(currentValues[key])!==value))
-    throw new Error("VME/EASIROC write or readback did not match requested value");
+    throw new Error("VME/EASI write or readback did not match requested value");
   }else{
    if(mockMode){mockValues[path]=value;currentValues[path]=value;return}
    const write=await mjsonrpc_db_set_value(path,value);

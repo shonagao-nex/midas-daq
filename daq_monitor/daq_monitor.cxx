@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <limits>
 #include <spawn.h>
 #include <string>
@@ -994,6 +995,9 @@ INT capture_runlog_eor(INT run_number, char*) {
       daq_monitor::runlog_event_count(participation.vme, vme_sent, 0);
   const std::int64_t easiroc_events =
       daq_monitor::runlog_event_count(participation.easiroc, easiroc_sent, 0);
+  // No HUL frontend or run participation record exists yet. -1 means absent.
+  // Once HUL is integrated, capture its participation and Events sent here.
+  const std::int64_t hul_events = -1;
   std::uint64_t slips = 0;
   if (participation.vme)
     read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
@@ -1011,6 +1015,8 @@ INT capture_runlog_eor(INT run_number, char*) {
                    sizeof(vme_events), TID_INT64) && ok;
   ok = write_value("/DAQ/Status/Runlog/EASIROCEvents", &easiroc_events,
                    sizeof(easiroc_events), TID_INT64) && ok;
+  ok = write_value("/DAQ/Status/Runlog/HULEvents", &hul_events,
+                   sizeof(hul_events), TID_INT64) && ok;
   ok = write_value("/DAQ/Status/Runlog/EventSlipCount", &slips,
                    sizeof(slips), TID_QWORD) && ok;
   // The marker identifies the run whose ODB EOR sources are complete;
@@ -1056,6 +1062,69 @@ void maybe_spawn_run_elog(INT* last_spawned_run) {
                  TID_STRING);
     cm_msg(MERROR, kClientName, "Run %d ELOG post failed: %s", eor_run,
            reason.c_str());
+  }
+}
+
+// Run after the STOP transition, outside its callback. A failed index refresh
+// must never affect Logger's JSON EOR or the independent ELOG post.
+void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
+                             INT* active_run) {
+  INT state = 0, transition = 0, eor_run = 0;
+  if (!read_value("/Runinfo/State", TID_INT32, &state) ||
+      !read_value("/Runinfo/Transition in progress", TID_INT32, &transition) ||
+      !read_value("/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
+                  &eor_run) ||
+      state != STATE_STOPPED || transition != 0 || eor_run <= 0 ||
+      eor_run <= *last_spawned_run || *active_child > 0)
+    return;
+
+  std::string directory, subdir;
+  if (!read_string("/Logger/Message dir", &directory) || directory.empty()) {
+    if (!read_string("/Logger/Data dir", &directory) || directory.empty()) {
+      cm_msg(MERROR, kClientName, "Cannot locate JSON Runlog directory for index");
+      *last_spawned_run = eor_run;
+      return;
+    }
+  }
+  if (!read_string("/Logger/Runlog/JSON/Subdir", &subdir)) {
+    cm_msg(MERROR, kClientName, "Cannot read JSON Runlog subdirectory for index");
+    *last_spawned_run = eor_run;
+    return;
+  }
+  const std::string path =
+      (std::filesystem::path(directory) / subdir).lexically_normal().string();
+  std::error_code path_error;
+  const auto executable =
+      std::filesystem::read_symlink("/proc/self/exe", path_error);
+  if (path_error) {
+    cm_msg(MERROR, kClientName, "Cannot locate Runlog index script: %s",
+           path_error.message().c_str());
+    *last_spawned_run = eor_run;
+    return;
+  }
+  const std::string script =
+      (executable.parent_path().parent_path().parent_path() /
+       "scripts/update_runlog_index.py").string();
+  if (!std::filesystem::is_regular_file(script, path_error)) {
+    cm_msg(MERROR, kClientName, "Runlog index script is unavailable: %s",
+           script.c_str());
+    *last_spawned_run = eor_run;
+    return;
+  }
+  char* const arguments[] = {
+      const_cast<char*>("/usr/bin/python3"),
+      const_cast<char*>(script.c_str()),
+      const_cast<char*>(path.c_str()), nullptr};
+  pid_t child = 0;
+  const int result = posix_spawn(&child, arguments[0], nullptr, nullptr,
+                                 arguments, environ);
+  *last_spawned_run = eor_run;
+  if (result != 0)
+    cm_msg(MERROR, kClientName, "Cannot launch Runlog index refresh for run %d: %s",
+           eor_run, std::strerror(result));
+  else {
+    *active_child = child;
+    *active_run = eor_run;
   }
 }
 
@@ -1138,11 +1207,26 @@ int main(int argc, char** argv) {
 
   INT yield_status = CM_SUCCESS;
   INT last_spawned_elog_run = 0;
+  INT last_spawned_index_run = 0;
+  INT active_index_run = 0;
+  pid_t active_index_child = 0;
   while (!gStopRequested) {
     if (publish_status() && !update_alarms())
       cm_msg(MERROR, kClientName, "DAQ alarm synchronization failed");
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+    int child_status = 0;
+    pid_t reaped = 0;
+    while ((reaped = waitpid(-1, &child_status, WNOHANG)) > 0) {
+      if (reaped == active_index_child) {
+        if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
+          cm_msg(MERROR, kClientName,
+                 "Runlog index refresh for run %d failed (child status %d)",
+                 active_index_run, child_status);
+        active_index_child = 0;
+      }
+    }
     maybe_spawn_run_elog(&last_spawned_elog_run);
+    maybe_spawn_runlog_index(&last_spawned_index_run, &active_index_child,
+                             &active_index_run);
     yield_status = cm_yield(kUpdatePeriodMs);
     if (yield_status == RPC_SHUTDOWN || yield_status == SS_ABORT)
       break;
