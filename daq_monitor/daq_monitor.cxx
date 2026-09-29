@@ -58,11 +58,17 @@ struct DiskCache {
   bool initialized = false;
 };
 
-DiskCache gDiskCache;
-daq_monitor::AlarmRuntimeState gVmeAlarmState;
-daq_monitor::AlarmRuntimeState gEasirocAlarmState;
-daq_monitor::AlarmRuntimeState gLoggerAlarmState;
-daq_monitor::AlarmRuntimeState gDiskAlarmState;
+//************************************//
+// Hold monitor disk cache and component alarm states
+//************************************//
+struct MonitorState {
+  DiskCache disk;
+  daq_monitor::AlarmRuntimeState vme_alarm;
+  daq_monitor::AlarmRuntimeState easiroc_alarm;
+  daq_monitor::AlarmRuntimeState logger_alarm;
+  daq_monitor::AlarmRuntimeState disk_alarm;
+};
+MonitorState gMonitorState;
 
 void handle_signal(int) { gStopRequested = 1; }
 
@@ -453,13 +459,13 @@ bool update_alarms() {
       disk_ok ? disk_detail : "", now_unix};
 
   bool ok = true;
-  ok = update_component_alarm("DAQ_VME", &gVmeAlarmState, vme,
+  ok = update_component_alarm("DAQ_VME", &gMonitorState.vme_alarm, vme,
                               alarm_system_active != FALSE) && ok;
-  ok = update_component_alarm("DAQ_EASIROC", &gEasirocAlarmState,
+  ok = update_component_alarm("DAQ_EASIROC", &gMonitorState.easiroc_alarm,
                               easiroc, alarm_system_active != FALSE) && ok;
-  ok = update_component_alarm("DAQ_LOGGER", &gLoggerAlarmState, logger,
+  ok = update_component_alarm("DAQ_LOGGER", &gMonitorState.logger_alarm, logger,
                               alarm_system_active != FALSE) && ok;
-  ok = update_component_alarm("DAQ_DISK", &gDiskAlarmState, disk,
+  ok = update_component_alarm("DAQ_DISK", &gMonitorState.disk_alarm, disk,
                               alarm_system_active != FALSE) && ok;
   return ok;
 }
@@ -594,24 +600,24 @@ std::string disk_path_for(const LoggerSource& source) {
 //************************************//
 void update_disk_cache(const LoggerSource& source, DWORD now_ms) {
   const std::string path = disk_path_for(source);
-  const DWORD elapsed = now_ms - gDiskCache.last_update_ms;
-  if (gDiskCache.initialized && path == gDiskCache.path &&
+  const DWORD elapsed = now_ms - gMonitorState.disk.last_update_ms;
+  if (gMonitorState.disk.initialized && path == gMonitorState.disk.path &&
       elapsed < kDiskUpdatePeriodMs)
     return;
 
-  gDiskCache.path = path;
+  gMonitorState.disk.path = path;
   const double free_bytes = ss_disk_free(path.c_str());
-  gDiskCache.free_gb = free_bytes < 0.0 ? -1.0 : free_bytes / kBytesPerGB;
+  gMonitorState.disk.free_gb = free_bytes < 0.0 ? -1.0 : free_bytes / kBytesPerGB;
   struct statvfs filesystem {};
   if (statvfs(path.c_str(), &filesystem) == 0) {
-    gDiskCache.total_gb =
+    gMonitorState.disk.total_gb =
         static_cast<double>(filesystem.f_blocks) * filesystem.f_frsize /
         kBytesPerGB;
   } else {
-    gDiskCache.total_gb = -1.0;
+    gMonitorState.disk.total_gb = -1.0;
   }
-  gDiskCache.last_update_ms = now_ms;
-  gDiskCache.initialized = true;
+  gMonitorState.disk.last_update_ms = now_ms;
+  gMonitorState.disk.initialized = true;
 }
 
 //************************************//
@@ -754,7 +760,7 @@ bool publish_status(bool synchronous_start_check = false) {
       collection_ok &&
       (synchronous_start_check ||
        timestamp_is_fresh(now_unix, previous_update_unix));
-  raw_status.disk_free_gb = gDiskCache.free_gb;
+  raw_status.disk_free_gb = gMonitorState.disk.free_gb;
   raw_status.logger_connected = logger_connected != FALSE;
   const daq_monitor::ActiveParticipation participation =
       daq_monitor::resolve_run_participation(
@@ -854,9 +860,9 @@ bool publish_status(bool synchronous_start_check = false) {
   PUBLISH("/DAQ/Status/Run/RunNumber", run_number, TID_INT32);
   PUBLISH("/DAQ/Status/Run/State", run_state, TID_INT32);
   PUBLISH("/DAQ/Status/Run/DurationSec", duration_sec, TID_QWORD);
-  ok = write_string("/DAQ/Status/Disk/Path", gDiskCache.path) && ok;
-  PUBLISH("/DAQ/Status/Disk/FreeGB", gDiskCache.free_gb, TID_DOUBLE);
-  PUBLISH("/DAQ/Status/Disk/TotalGB", gDiskCache.total_gb, TID_DOUBLE);
+  ok = write_string("/DAQ/Status/Disk/Path", gMonitorState.disk.path) && ok;
+  PUBLISH("/DAQ/Status/Disk/FreeGB", gMonitorState.disk.free_gb, TID_DOUBLE);
+  PUBLISH("/DAQ/Status/Disk/TotalGB", gMonitorState.disk.total_gb, TID_DOUBLE);
   ok = write_string("/DAQ/Status/Disk/Severity",
                     daq_monitor::severity_name(evaluation.disk.severity)) &&
        ok;

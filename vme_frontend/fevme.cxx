@@ -147,14 +147,21 @@ INT max_event_size_frag = 5 * 1024 * 1024;      // Maximum fragmented event size
 INT event_buffer_size = 10 * 1024 * 1024;       // MIDAS event buffer size [bytes]
 
 static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
-static bool gReadoutFailed = false;              // Inhibit reads after a partial/malformed event
-static std::atomic<bool> gBltStopRequested(false);
-static std::atomic<unsigned> gV1190BltDiagnosticCount(0);
-static std::atomic<unsigned> gV1720BltDiagnosticCount(0);
-static V1190_FIFO_BLT_STATE gV1190FifoBltState = {};
+//************************************//
+// Hold VME acquisition and readout state
+//************************************//
+struct VmeState {
+    bool readout_failed = false;
+    std::atomic<bool> blt_stop_requested{false};
+    V1190_FIFO_BLT_STATE v1190_fifo_blt = {};
+    DWORD rpv130_last_poll = 0;
+    bool rpv130_enabled_for_run = true;
+    bool single_event_busy_enabled_for_run = false;
+    bool rpv130_busy_configured = false;
+};
+static VmeState gVmeState;
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
-static DWORD gRpv130LastPoll = 0;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 static const char *RPV130_INFO_PATH = "/Equipment/VME/Info/RPV130";
 static const char *RPV130_VARIABLES_PATH = "/Equipment/VME/Variables/RPV130";
@@ -164,16 +171,9 @@ static const char *FRONTEND_VARIABLES_PATH =
     "/Equipment/VME/Variables/Frontend";
 static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
-static bool gRpv130EnabledForRun = true;
-static bool gSingleEventBusyEnabledForRun = false;
-static bool gRpv130BusyConfigured = false;
 
 /* Retain first-ten-event timing probes to preserve the readout sequence. */
 static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
-static std::atomic<unsigned> gRpv130TimingEventCount(0);
-static std::atomic<uint64_t> gRpv130PollReadyNs(0);
-static std::atomic<uint64_t> gRpv130LastPollMissNs(0);
-static std::atomic<uint64_t> gRpv130PollPreviousMissNs(0);
 
 static uint64_t monotonic_ns()
 {
@@ -592,16 +592,29 @@ static V775Settings default_v775_settings()
     return s;
 }
 
-static V792Settings gV792RunSettings = default_v792_settings();
-static V1190Settings gV1190RunSettings = default_v1190_settings();
-static V775Settings gV775RunSettings = default_v775_settings();
-static VmeRunSnapshot gVmeRunSnapshot = {};
-static V7xxRuntimeState gV792Runtime = {};
-static V1190RuntimeState gV1190Runtime = {};
-static V7xxRuntimeState gV775Runtime = {};
-static DWORD gV792LastVariablesPublish = 0;
-static DWORD gV1190LastVariablesPublish = 0;
-static DWORD gV775LastVariablesPublish = 0;
+//************************************//
+// Hold requested VME module settings for the run
+//************************************//
+struct VmeConfig {
+    V792Settings v792 = default_v792_settings();
+    V1190Settings v1190 = default_v1190_settings();
+    V775Settings v775 = default_v775_settings();
+};
+static VmeConfig gVmeConfig;
+
+//************************************//
+// Hold VME module status and the run snapshot
+//************************************//
+struct VmeModuleState {
+    VmeRunSnapshot snapshot = {};
+    V7xxRuntimeState v792 = {};
+    V1190RuntimeState v1190 = {};
+    V7xxRuntimeState v775 = {};
+    DWORD v792_last_publish = 0;
+    DWORD v1190_last_publish = 0;
+    DWORD v775_last_publish = 0;
+};
+static VmeModuleState gVmeModuleState;
 
 struct VmeBufferClearResults {
     std::string v792 = "Not requested";
@@ -747,23 +760,23 @@ static void format_iso8601_utc(time_t value, char *buffer, size_t capacity)
 
 static void reset_vme_run_snapshot(INT run_number)
 {
-    gVmeRunSnapshot = {};
-    gVmeRunSnapshot.schema_version = RUN_SNAPSHOT_SCHEMA_VERSION;
-    gVmeRunSnapshot.run_number = run_number;
+    gVmeModuleState.snapshot = {};
+    gVmeModuleState.snapshot.schema_version = RUN_SNAPSHOT_SCHEMA_VERSION;
+    gVmeModuleState.snapshot.run_number = run_number;
     const time_t now = time(NULL);
-    gVmeRunSnapshot.bor_unix_time =
+    gVmeModuleState.snapshot.bor_unix_time =
         now < 0 ? 0 : static_cast<uint64_t>(now);
-    format_iso8601_utc(now, gVmeRunSnapshot.bor_time_iso8601,
-                       sizeof(gVmeRunSnapshot.bor_time_iso8601));
-    snprintf(gVmeRunSnapshot.frontend_name,
-             sizeof(gVmeRunSnapshot.frontend_name), "%s", frontend_name);
-    snprintf(gVmeRunSnapshot.snapshot_id,
-             sizeof(gVmeRunSnapshot.snapshot_id), "run-%d_%llu_%s",
+    format_iso8601_utc(now, gVmeModuleState.snapshot.bor_time_iso8601,
+                       sizeof(gVmeModuleState.snapshot.bor_time_iso8601));
+    snprintf(gVmeModuleState.snapshot.frontend_name,
+             sizeof(gVmeModuleState.snapshot.frontend_name), "%s", frontend_name);
+    snprintf(gVmeModuleState.snapshot.snapshot_id,
+             sizeof(gVmeModuleState.snapshot.snapshot_id), "run-%d_%llu_%s",
              run_number,
-             static_cast<unsigned long long>(gVmeRunSnapshot.bor_unix_time),
+             static_cast<unsigned long long>(gVmeModuleState.snapshot.bor_unix_time),
              frontend_name);
-    snprintf(gVmeRunSnapshot.v1190_readback.board_type,
-             sizeof(gVmeRunSnapshot.v1190_readback.board_type), "Unknown");
+    snprintf(gVmeModuleState.snapshot.v1190_readback.board_type,
+             sizeof(gVmeModuleState.snapshot.v1190_readback.board_type), "Unknown");
 }
 
 static bool publish_vme_run_snapshot()
@@ -779,16 +792,16 @@ static bool publish_vme_run_snapshot()
         ok = set_vme_snapshot_value(path, value, sizeof(value), 1, TID_STRING) \
              && ok; \
     } while (0)
-    SNAP("Metadata/SchemaVersion", gVmeRunSnapshot.schema_version, 1,
+    SNAP("Metadata/SchemaVersion", gVmeModuleState.snapshot.schema_version, 1,
          TID_DWORD);
-    SNAP_STRING("Metadata/SnapshotId", gVmeRunSnapshot.snapshot_id);
-    SNAP("Metadata/RunNumber", gVmeRunSnapshot.run_number, 1, TID_INT);
-    SNAP("Metadata/BORUnixTime", gVmeRunSnapshot.bor_unix_time, 1,
+    SNAP_STRING("Metadata/SnapshotId", gVmeModuleState.snapshot.snapshot_id);
+    SNAP("Metadata/RunNumber", gVmeModuleState.snapshot.run_number, 1, TID_INT);
+    SNAP("Metadata/BORUnixTime", gVmeModuleState.snapshot.bor_unix_time, 1,
          TID_QWORD);
     SNAP_STRING("Metadata/BORTimeISO8601",
-                gVmeRunSnapshot.bor_time_iso8601);
-    SNAP_STRING("Metadata/FrontendName", gVmeRunSnapshot.frontend_name);
-    SNAP("Metadata/EnabledForRun", gVmeRunSnapshot.enabled_for_run, 1,
+                gVmeModuleState.snapshot.bor_time_iso8601);
+    SNAP_STRING("Metadata/FrontendName", gVmeModuleState.snapshot.frontend_name);
+    SNAP("Metadata/EnabledForRun", gVmeModuleState.snapshot.enabled_for_run, 1,
          TID_BOOL);
 
 #define SNAP_V792(base, object) \
@@ -796,7 +809,7 @@ static bool publish_vme_run_snapshot()
     SNAP(base "/Iped", object.iped, 1, TID_WORD); \
     SNAP(base "/ZeroSuppressionEnabled", object.zero_suppression_enabled, 1, TID_BOOL); \
     SNAP(base "/AllTriggerEnabled", object.all_trigger_enabled, 1, TID_BOOL)
-    SNAP_V792("Requested/V792", gVmeRunSnapshot.v792_requested);
+    SNAP_V792("Requested/V792", gVmeModuleState.snapshot.v792_requested);
 #undef SNAP_V792
 
 #define SNAP_V1190(base, object) \
@@ -816,7 +829,7 @@ static bool publish_vme_run_snapshot()
     SNAP(base "/EventFifoEnabled", object.event_fifo_enabled, 1, TID_BOOL); \
     SNAP(base "/ExtendedTriggerTimeEnabled", object.extended_trigger_time_enabled, 1, TID_BOOL); \
     SNAP(base "/ChannelEnabled", object.channel_enabled, 128, TID_BOOL)
-    SNAP_V1190("Requested/V1190", gVmeRunSnapshot.v1190_requested);
+    SNAP_V1190("Requested/V1190", gVmeModuleState.snapshot.v1190_requested);
 #undef SNAP_V1190
 
 #define SNAP_V775(base, object) \
@@ -829,55 +842,55 @@ static bool publish_vme_run_snapshot()
     SNAP(base "/ValidControlEnabled", object.valid_control_enabled, 1, TID_BOOL); \
     SNAP(base "/SlidingScaleEnabled", object.sliding_scale_enabled, 1, TID_BOOL); \
     SNAP(base "/AllTriggerEnabled", object.all_trigger_enabled, 1, TID_BOOL)
-    SNAP_V775("Requested/V775", gVmeRunSnapshot.v775_requested);
+    SNAP_V775("Requested/V775", gVmeModuleState.snapshot.v775_requested);
 #undef SNAP_V775
 
-    SNAP("Requested/V1720E/Enabled", gVmeRunSnapshot.v1720e_requested.enabled,
+    SNAP("Requested/V1720E/Enabled", gVmeModuleState.snapshot.v1720e_requested.enabled,
          1, TID_BOOL);
     SNAP("Requested/V1720E/BufferOrganization",
-         gVmeRunSnapshot.v1720e_requested.buffer_organization, 1, TID_DWORD);
+         gVmeModuleState.snapshot.v1720e_requested.buffer_organization, 1, TID_DWORD);
     SNAP("Requested/V1720E/RecordLengthSamples",
-         gVmeRunSnapshot.v1720e_requested.record_length_samples, 1,
+         gVmeModuleState.snapshot.v1720e_requested.record_length_samples, 1,
          TID_DWORD);
     SNAP("Requested/V1720E/PostTrigger",
-         gVmeRunSnapshot.v1720e_requested.post_trigger, 1, TID_DWORD);
+         gVmeModuleState.snapshot.v1720e_requested.post_trigger, 1, TID_DWORD);
     SNAP("Requested/V1720E/SoftwareTriggerEnabled",
-         gVmeRunSnapshot.v1720e_requested.software_trigger_enabled, 1,
+         gVmeModuleState.snapshot.v1720e_requested.software_trigger_enabled, 1,
          TID_BOOL);
     SNAP("Requested/V1720E/ExternalTriggerEnabled",
-         gVmeRunSnapshot.v1720e_requested.external_trigger_enabled, 1,
+         gVmeModuleState.snapshot.v1720e_requested.external_trigger_enabled, 1,
          TID_BOOL);
     SNAP("Requested/V1720E/ChannelSelfTriggerEnabled",
-         gVmeRunSnapshot.v1720e_requested.channel_self_trigger_enabled,
+         gVmeModuleState.snapshot.v1720e_requested.channel_self_trigger_enabled,
          V1720E_CHANNEL_COUNT, TID_BOOL);
     SNAP("Requested/V1720E/ChannelEnabled",
-         gVmeRunSnapshot.v1720e_requested.channel_enabled,
+         gVmeModuleState.snapshot.v1720e_requested.channel_enabled,
          V1720E_CHANNEL_COUNT, TID_BOOL);
     SNAP("Requested/V1720E/DCOffset",
-         gVmeRunSnapshot.v1720e_requested.dc_offset, V1720E_CHANNEL_COUNT,
+         gVmeModuleState.snapshot.v1720e_requested.dc_offset, V1720E_CHANNEL_COUNT,
          TID_WORD);
-    SNAP("Requested/RPV130/Enabled", gVmeRunSnapshot.rpv130_enabled, 1,
+    SNAP("Requested/RPV130/Enabled", gVmeModuleState.snapshot.rpv130_enabled, 1,
          TID_BOOL);
     SNAP("Requested/RPV130/SingleEventBusyEnabled",
-         gVmeRunSnapshot.rpv130_single_event_busy_enabled, 1, TID_BOOL);
+         gVmeModuleState.snapshot.rpv130_single_event_busy_enabled, 1, TID_BOOL);
 
-    SNAP("Readback/V792/Valid", gVmeRunSnapshot.v792_readback.valid, 1,
+    SNAP("Readback/V792/Valid", gVmeModuleState.snapshot.v792_readback.valid, 1,
          TID_BOOL);
     SNAP("Readback/V792/FirmwareRevision",
-         gVmeRunSnapshot.v792_readback.firmware_revision, 1, TID_WORD);
-    SNAP("Readback/V792/Iped", gVmeRunSnapshot.v792_readback.iped, 1,
+         gVmeModuleState.snapshot.v792_readback.firmware_revision, 1, TID_WORD);
+    SNAP("Readback/V792/Iped", gVmeModuleState.snapshot.v792_readback.iped, 1,
          TID_WORD);
     SNAP("Readback/V792/ZeroSuppressionEnabled",
-         gVmeRunSnapshot.v792_readback.zero_suppression_enabled, 1,
+         gVmeModuleState.snapshot.v792_readback.zero_suppression_enabled, 1,
          TID_BOOL);
     SNAP("Readback/V792/AllTriggerEnabled",
-         gVmeRunSnapshot.v792_readback.all_trigger_enabled, 1, TID_BOOL);
+         gVmeModuleState.snapshot.v792_readback.all_trigger_enabled, 1, TID_BOOL);
     SNAP("Readback/V792/BitSet2Raw",
-         gVmeRunSnapshot.v792_readback.bit_set2_raw, 1, TID_WORD);
+         gVmeModuleState.snapshot.v792_readback.bit_set2_raw, 1, TID_WORD);
     SNAP("Readback/V792/Threshold",
-         gVmeRunSnapshot.v792_readback.threshold, 32, TID_WORD);
+         gVmeModuleState.snapshot.v792_readback.threshold, 32, TID_WORD);
 
-    const V1190ReadbackSnapshot &r1190 = gVmeRunSnapshot.v1190_readback;
+    const V1190ReadbackSnapshot &r1190 = gVmeModuleState.snapshot.v1190_readback;
     SNAP("Readback/V1190/Valid", r1190.valid, 1, TID_BOOL);
     SNAP("Readback/V1190/FirmwareRevision", r1190.firmware_revision, 1,
          TID_WORD);
@@ -911,7 +924,7 @@ static bool publish_vme_run_snapshot()
     SNAP("Readback/V1190/AlmostFullLevelWords",
          r1190.almost_full_level_words, 1, TID_WORD);
 
-    const V775ReadbackSnapshot &r775 = gVmeRunSnapshot.v775_readback;
+    const V775ReadbackSnapshot &r775 = gVmeModuleState.snapshot.v775_readback;
     SNAP("Readback/V775/Valid", r775.valid, 1, TID_BOOL);
     SNAP("Readback/V775/FirmwareRevision", r775.firmware_revision, 1,
          TID_WORD);
@@ -932,7 +945,7 @@ static bool publish_vme_run_snapshot()
     SNAP("Readback/V775/BitSet2Raw", r775.bit_set2_raw, 1, TID_WORD);
     SNAP("Readback/V775/Threshold", r775.threshold, 32, TID_WORD);
 
-    const V1720EReadbackSnapshot &r1720 = gVmeRunSnapshot.v1720e_readback;
+    const V1720EReadbackSnapshot &r1720 = gVmeModuleState.snapshot.v1720e_readback;
     SNAP("Readback/V1720E/Valid", r1720.valid, 1, TID_BOOL);
     SNAP("Readback/V1720E/BoardInfo", r1720.board_info, 1, TID_DWORD);
     SNAP("Readback/V1720E/RocFirmwareRevision",
@@ -969,7 +982,7 @@ static bool publish_vme_run_snapshot()
      * leave the fixed subtree explicitly incomplete. */
     {
         BOOL published_complete =
-            (gVmeRunSnapshot.frontend_bor_complete && ok) ? TRUE : FALSE;
+            (gVmeModuleState.snapshot.frontend_bor_complete && ok) ? TRUE : FALSE;
         const bool complete_ok = set_vme_snapshot_value(
             "Metadata/FrontendBORComplete", &published_complete,
             sizeof(published_complete), 1, TID_BOOL);
@@ -1002,7 +1015,7 @@ static bool initialize_rpv130_odb()
     if (!get_absolute_odb_value(path, &startup_enabled,
                                 sizeof(startup_enabled), TID_BOOL))
         return false;
-    gRpv130EnabledForRun = startup_enabled != FALSE;
+    gVmeState.rpv130_enabled_for_run = startup_enabled != FALSE;
     if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH,
                        "SingleEventBusyEnabled") ||
         !ensure_odb_value(path, &default_single_event_busy,
@@ -1012,7 +1025,7 @@ static bool initialize_rpv130_odb()
     if (!get_absolute_odb_value(path, &startup_busy_enabled,
                                 sizeof(startup_busy_enabled), TID_BOOL))
         return false;
-    gSingleEventBusyEnabledForRun = startup_busy_enabled != FALSE;
+    gVmeState.single_event_busy_enabled_for_run = startup_busy_enabled != FALSE;
     if (!set_module_output(RPV130_STATUS_PATH, "Busy1",
                            &default_single_event_busy,
                            sizeof(default_single_event_busy), 1, TID_BOOL) ||
@@ -1057,7 +1070,7 @@ static bool initialize_rpv130_odb()
     SET_RPV130_VARIABLE_DEFAULT("CSR2", &default_status,
                                 sizeof(default_status), TID_BYTE);
 #undef SET_RPV130_VARIABLE_DEFAULT
-    const BOOL enabled_for_run = gRpv130EnabledForRun ? TRUE : FALSE;
+    const BOOL enabled_for_run = gVmeState.rpv130_enabled_for_run ? TRUE : FALSE;
     if (!make_odb_path(path, sizeof(path), RPV130_VARIABLES_PATH,
                        "EnabledForRun") ||
         !set_absolute_odb_value(path, &enabled_for_run,
@@ -1092,13 +1105,13 @@ static void fail_single_event_busy(const char *reason);
 
 static void publish_rpv130_status(bool force)
 {
-    if ((!gRpv130EnabledForRun && !gSingleEventBusyEnabledForRun) || !gVme)
+    if ((!gVmeState.rpv130_enabled_for_run && !gVmeState.single_event_busy_enabled_for_run) || !gVme)
         return;
     const DWORD now = ss_millitime();
     if (!force &&
-        static_cast<DWORD>(now - gRpv130LastPoll) < RPV130_POLL_PERIOD_MS)
+        static_cast<DWORD>(now - gVmeState.rpv130_last_poll) < RPV130_POLL_PERIOD_MS)
         return;
-    gRpv130LastPoll = now;
+    gVmeState.rpv130_last_poll = now;
 
     RPV130_STATUS status = {};
     const INT read_result =
@@ -1109,7 +1122,7 @@ static void publish_rpv130_status(bool force)
         cm_msg(MERROR, frontend_name,
                "RPV130 read-only status poll failed at base 0x%04X: status %d",
                RPV130_BASE_ADDRESS, read_result);
-        if (gSingleEventBusyEnabledForRun &&
+        if (gVmeState.single_event_busy_enabled_for_run &&
             global_busy::readout_allowed())
             fail_single_event_busy("RPV130 status/CSR1 poll failed");
     }
@@ -1127,7 +1140,7 @@ static void publish_rpv130_status(bool force)
     set_module_output(RPV130_VARIABLES_PATH, "CSR2", &status.csr2,
                       sizeof(status.csr2), 1, TID_BYTE);
     const BOOL busy1 = (status.csr1 & RPV130_CSR1_BUSY1) ? TRUE : FALSE;
-    const BOOL armed = communication_ok && gRpv130BusyConfigured &&
+    const BOOL armed = communication_ok && gVmeState.rpv130_busy_configured &&
         (status.csr1 & RPV130_CSR1_CHANNEL1_ARMED) ==
             RPV130_CSR1_CHANNEL1_ARMED ? TRUE : FALSE;
     // Keep the last hardware-derived BUSY1 value when CSR1 cannot be read.
@@ -1157,8 +1170,8 @@ static bool publish_rpv130_busy_state(bool busy, bool armed)
 
 static void fail_single_event_busy(const char *reason)
 {
-    if (!gSingleEventBusyEnabledForRun) return;
-    gReadoutFailed = true;
+    if (!gVmeState.single_event_busy_enabled_for_run) return;
+    gVmeState.readout_failed = true;
     global_busy::disable_readout();
     cm_msg(MERROR, frontend_name, "RPV130 Single Event BUSY held: %s", reason);
     if (!global_busy::set_global_busy(true))
@@ -1171,9 +1184,9 @@ static void fail_single_event_busy(const char *reason)
 
 static bool arm_rpv130_single_event_busy()
 {
-    if (!gSingleEventBusyEnabledForRun) return true;
+    if (!gVmeState.single_event_busy_enabled_for_run) return true;
     // A failed first write still needs a later cleanup attempt under Global BUSY.
-    gRpv130BusyConfigured = true;
+    gVmeState.rpv130_busy_configured = true;
     if (!global_busy::set_global_busy(true)) {
         cm_msg(MERROR, frontend_name,
                "Cannot verify Global BUSY before arming RPV130 FIN1");
@@ -1200,7 +1213,7 @@ static bool arm_rpv130_single_event_busy()
 
 static bool quiesce_rpv130_single_event_busy(const char *context)
 {
-    if (!gSingleEventBusyEnabledForRun || !gVme) return true;
+    if (!gVmeState.single_event_busy_enabled_for_run || !gVme) return true;
     // Never release BUSY1 before OUT0 has been asserted and verified.
     if (!global_busy::set_global_busy(true)) {
         cm_msg(MERROR, frontend_name,
@@ -1220,7 +1233,7 @@ static bool quiesce_rpv130_single_event_busy(const char *context)
                           &no, sizeof(no), 1, TID_BOOL);
         return false;
     }
-    gRpv130BusyConfigured = false;
+    gVmeState.rpv130_busy_configured = false;
     return publish_rpv130_busy_state(false, false);
 }
 
@@ -1345,14 +1358,14 @@ static void decode_v7xx_runtime(V7xxRuntimeState &r, WORD s1, WORD s2,
 
 static void decode_v1190_runtime(WORD status, DWORD stored, DWORD counter)
 {
-    gV1190Runtime.status=status;
-    gV1190Runtime.data_ready=!!(status&V1190_STATUS_DATA_READY);
-    gV1190Runtime.almost_full=!!(status&V1190_STATUS_ALMOST_FULL);
-    gV1190Runtime.full=!!(status&V1190_STATUS_FULL);
-    gV1190Runtime.trigger_matching=!!(status&V1190_STATUS_TRIGGER_MATCH);
-    gV1190Runtime.event_stored=stored;
-    gV1190Runtime.event_counter=counter;
-    gV1190Runtime.dirty=true;
+    gVmeModuleState.v1190.status=status;
+    gVmeModuleState.v1190.data_ready=!!(status&V1190_STATUS_DATA_READY);
+    gVmeModuleState.v1190.almost_full=!!(status&V1190_STATUS_ALMOST_FULL);
+    gVmeModuleState.v1190.full=!!(status&V1190_STATUS_FULL);
+    gVmeModuleState.v1190.trigger_matching=!!(status&V1190_STATUS_TRIGGER_MATCH);
+    gVmeModuleState.v1190.event_stored=stored;
+    gVmeModuleState.v1190.event_counter=counter;
+    gVmeModuleState.v1190.dirty=true;
 }
 
 static bool publish_v7xx_variables(const char *path, V7xxRuntimeState &r,
@@ -1372,14 +1385,14 @@ static bool publish_v7xx_variables(const char *path, V7xxRuntimeState &r,
 static bool publish_v1190_variables()
 {
     bool ok=true;
-#define PV1190(k,m,t) do { ok=set_module_output(V1190_VARIABLES_PATH,k,&gV1190Runtime.m,sizeof(gV1190Runtime.m),1,t)&&ok; } while(0)
+#define PV1190(k,m,t) do { ok=set_module_output(V1190_VARIABLES_PATH,k,&gVmeModuleState.v1190.m,sizeof(gVmeModuleState.v1190.m),1,t)&&ok; } while(0)
     PV1190("EnabledForRun",enabled_for_run,TID_BOOL);
     PV1190("CommunicationOK",communication_ok,TID_BOOL); PV1190("Status",status,TID_WORD);
     PV1190("DataReady",data_ready,TID_BOOL); PV1190("AlmostFull",almost_full,TID_BOOL);
     PV1190("Full",full,TID_BOOL); PV1190("TriggerMatching",trigger_matching,TID_BOOL);
     PV1190("EventStored",event_stored,TID_DWORD); PV1190("EventCounter",event_counter,TID_DWORD);
 #undef PV1190
-    gV1190Runtime.dirty=!ok; gV1190LastVariablesPublish=ss_millitime(); return ok;
+    gVmeModuleState.v1190.dirty=!ok; gVmeModuleState.v1190_last_publish=ss_millitime(); return ok;
 }
 
 static void set_module_readback_valid(const char *path, bool valid)
@@ -1439,11 +1452,11 @@ static void initialize_module_output_schema()
 #undef Z775
     set_module_output(V775_READBACK_PATH,"BitSet2Raw",&zword,sizeof(zword),1,TID_WORD);
     set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
-    gV792Runtime={}; gV1190Runtime={}; gV775Runtime={};
-    gV792Runtime.dirty=gV1190Runtime.dirty=gV775Runtime.dirty=true;
-    publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+    gVmeModuleState.v792={}; gVmeModuleState.v1190={}; gVmeModuleState.v775={};
+    gVmeModuleState.v792.dirty=gVmeModuleState.v1190.dirty=gVmeModuleState.v775.dirty=true;
+    publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
     publish_v1190_variables();
-    publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+    publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
 }
 
 //************************************//
@@ -1459,7 +1472,7 @@ static bool initialize_other_module_odb()
     initialize_module_output_schema();
     V792Settings a={}; V1190Settings b={}; V775Settings c={};
     if (!read_v792_settings(a)||!read_v1190_settings(b)||!read_v775_settings(c)) return false;
-    gV792RunSettings=a; gV1190RunSettings=b; gV775RunSettings=c;
+    gVmeConfig.v792=a; gVmeConfig.v1190=b; gVmeConfig.v775=c;
     return true;
 }
 
@@ -1660,9 +1673,21 @@ struct RunStatistics {
     bool v1720_have_previous;
 };
 
-static RunStatistics gRunStatistics = {};
-static bool gRunCountersDirty = true;
-static DWORD gRunCountersLastPublish = 0;
+//************************************//
+// Hold per-run VME statistics and diagnostic counters
+//************************************//
+struct VmeStatistics {
+    RunStatistics run = {};
+    bool run_counters_dirty = true;
+    DWORD run_counters_last_publish = 0;
+    std::atomic<unsigned> v1190_blt_diagnostics{0};
+    std::atomic<unsigned> v1720_blt_diagnostics{0};
+    std::atomic<unsigned> rpv130_timing_events{0};
+    std::atomic<uint64_t> rpv130_poll_ready_ns{0};
+    std::atomic<uint64_t> rpv130_last_poll_miss_ns{0};
+    std::atomic<uint64_t> rpv130_poll_previous_miss_ns{0};
+};
+static VmeStatistics gVmeStatistics;
 
 static bool publish_run_counters()
 {
@@ -1670,8 +1695,8 @@ static bool publish_run_counters()
 #define PUBLISH_RUN_COUNTER(name, member, type) \
     do { \
         ok = set_module_output(RUN_COUNTERS_PATH, name, \
-                               &gRunStatistics.member, \
-                               sizeof(gRunStatistics.member), 1, type) && ok; \
+                               &gVmeStatistics.run.member, \
+                               sizeof(gVmeStatistics.run.member), 1, type) && ok; \
     } while (0)
     PUBLISH_RUN_COUNTER("EventSlipCount", counter_mismatch_count, TID_QWORD);
     PUBLISH_RUN_COUNTER("V1720EMalformedEventCount", v1720_malformed_count,
@@ -1689,14 +1714,14 @@ static bool publish_run_counters()
     PUBLISH_RUN_COUNTER("LastEventSlipSerial", last_mismatch_serial,
                         TID_DWORD);
 #undef PUBLISH_RUN_COUNTER
-    gRunCountersDirty = !ok;
-    gRunCountersLastPublish = ss_millitime();
+    gVmeStatistics.run_counters_dirty = !ok;
+    gVmeStatistics.run_counters_last_publish = ss_millitime();
     return ok;
 }
 
 static void mark_run_counters_dirty()
 {
-    gRunCountersDirty = true;
+    gVmeStatistics.run_counters_dirty = true;
 }
 
 //************************************//
@@ -2041,8 +2066,8 @@ static V792EventInfo read_v792_single_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
                     event.event_counter = word & V7XX_EVENT_COUNTER_MASK;
                     event.measurements = measurements;
                     event.valid = true;
-                    gV792Runtime.event_counter=event.event_counter;
-                    gV792Runtime.dirty=true;
+                    gVmeModuleState.v792.event_counter=event.event_counter;
+                    gVmeModuleState.v792.dirty=true;
                     break;
                 }
                 if (measurements >= expected) {
@@ -2106,7 +2131,7 @@ static V792EventInfo read_v792_blt32_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
                result.caen_status, static_cast<int>(status));
     }
     if (status != V792_BLT_OK || restore_status != MVME_SUCCESS) {
-        gBltStopRequested.store(true, std::memory_order_relaxed);
+        gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
         cm_msg(MERROR, frontend_name,
                "V792 BLT32 readout failed: validation=%d CAEN status=%d requested=%d actual=%d restore=%d",
                static_cast<int>(status), result.caen_status,
@@ -2119,8 +2144,8 @@ static V792EventInfo read_v792_blt32_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
     event.measurements = result.measurements;
     event.geo = result.geo;
     event.valid = true;
-    gV792Runtime.event_counter = event.event_counter;
-    gV792Runtime.dirty = true;
+    gVmeModuleState.v792.event_counter = event.event_counter;
+    gVmeModuleState.v792.dirty = true;
     return event;
 }
 
@@ -2170,8 +2195,8 @@ static V1190EventInfo read_v1190_single_event(DWORD (&data)[V1190_MAX_EVENT_WORD
                 event.trailer_word_count = trailer_words;
                 event.words = actual_words;
                 event.valid = true;
-                gV1190Runtime.event_counter=event.event_counter;
-                gV1190Runtime.dirty=true;
+                gVmeModuleState.v1190.event_counter=event.event_counter;
+                gVmeModuleState.v1190.dirty=true;
                 break; // Trailer consumed; never pre-read the next event.
             }
 
@@ -2243,9 +2268,9 @@ static V1190EventInfo read_v1190_fifo_blt32_event(
     V1190_FIFO_BLT_RESULT result = {};
     const V1190_FIFO_BLT_STATUS status = v1190_fifo_read_blt32(
         &io, V1190_BASE, data, V1190_MAX_EVENT_WORDS,
-        V1190_FIFO_STRICT_SYNC_CHECK, &gV1190FifoBltState, &result);
+        V1190_FIFO_STRICT_SYNC_CHECK, &gVmeState.v1190_fifo_blt, &result);
     phases = result.timing;
-    diagnostic = gV1190BltDiagnosticCount.fetch_add(
+    diagnostic = gVmeStatistics.v1190_blt_diagnostics.fetch_add(
         1, std::memory_order_relaxed) < 10;
     if (diagnostic) {
         cm_msg(MINFO, frontend_name,
@@ -2266,7 +2291,7 @@ static V1190EventInfo read_v1190_fifo_blt32_event(
     }
     if (status != V1190_FIFO_BLT_OK) {
         /* The FIFO entry and/or Output Buffer may have advanced. Never retry. */
-        gBltStopRequested.store(true, std::memory_order_relaxed);
+        gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
         if (!V1190_FIFO_STRICT_SYNC_CHECK &&
             status == V1190_FIFO_BLT_STORED_MISMATCH)
             cm_msg(MERROR, frontend_name,
@@ -2284,14 +2309,14 @@ static V1190EventInfo read_v1190_fifo_blt32_event(
         cm_msg(MINFO, frontend_name,
                "V1190 FIFO check: event=%llu stored_after=%u OK",
                static_cast<unsigned long long>(
-                   gV1190FifoBltState.successful_event_count),
+                   gVmeState.v1190_fifo_blt.successful_event_count),
                static_cast<unsigned>(result.stored_after));
     event.words = result.words;
     event.event_counter = result.event_counter;
     event.trailer_word_count = result.trailer_word_count;
     event.valid = true;
-    gV1190Runtime.event_counter = event.event_counter;
-    gV1190Runtime.dirty = true;
+    gVmeModuleState.v1190.event_counter = event.event_counter;
+    gVmeModuleState.v1190.dirty = true;
     return event;
 }
 
@@ -2301,7 +2326,7 @@ static bool wait_for_v1190_data_ready()
     for (unsigned poll = 0; poll < V1190_READY_MAX_POLLS; ++poll) {
         if (!vme_read16(V1190_BASE + V1190_STATUS, status, "V1190 Status"))
             return false;
-        decode_v1190_runtime(status,gV1190Runtime.event_stored,gV1190Runtime.event_counter);
+        decode_v1190_runtime(status,gVmeModuleState.v1190.event_stored,gVmeModuleState.v1190.event_counter);
         if (status & V1190_STATUS_DATA_READY)
             return true;
         if (poll + 1 < V1190_READY_MAX_POLLS)
@@ -2377,8 +2402,8 @@ static V775EventInfo read_v775_single_event(DWORD (&data)[V775_MAX_EVENT_WORDS])
                 event.measurements = measurements;
                 event.words = i + 1;
                 event.valid = true;
-                gV775Runtime.event_counter=event.event_counter;
-                gV775Runtime.dirty=true;
+                gVmeModuleState.v775.event_counter=event.event_counter;
+                gVmeModuleState.v775.dirty=true;
                 break; // EOB consumed; never pre-read the next event.
             }
 
@@ -2445,7 +2470,7 @@ static bool wait_for_v1720e_data_ready()
         if (status != MVME_SUCCESS) {
             gV1720Runtime.communication_ok = FALSE;
             gV1720Runtime.dirty = true;
-            ++gRunStatistics.v1720_read_timeout_count;
+            ++gVmeStatistics.run.v1720_read_timeout_count;
             mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
                    "V1720E ready read failed: status %d", status);
@@ -2458,7 +2483,7 @@ static bool wait_for_v1720e_data_ready()
         if (poll + 1 < V1720E_READY_MAX_POLLS)
             ss_sleep(1);
     }
-    ++gRunStatistics.v1720_read_timeout_count;
+    ++gVmeStatistics.run.v1720_read_timeout_count;
     mark_run_counters_dirty();
     cm_msg(MERROR, frontend_name,
            "V1720E DataReady timeout after %u polls (Event Stored %u); "
@@ -2859,7 +2884,7 @@ static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
 static void capture_v1720e_run_readback(
     const V1720E_CONFIG_READBACK &readback, bool valid)
 {
-    V1720EReadbackSnapshot &snapshot = gVmeRunSnapshot.v1720e_readback;
+    V1720EReadbackSnapshot &snapshot = gVmeModuleState.snapshot.v1720e_readback;
     snapshot = {};
     snapshot.valid = valid ? TRUE : FALSE;
     snapshot.board_info = readback.board_info;
@@ -2932,45 +2957,45 @@ static bool verify_v1720e_readback(const V1720E_CONFIG &expected,
 /* Frontend initialization checks. Keep the established read-only access order. */
 static bool check_module_communication(bool check_v1720e)
 {
-    if (gV792RunSettings.enabled) {
+    if (gVmeConfig.v792.enabled) {
       printf("Checking V792 at 0x%08X...\n", V792_BASE);
       if (!v792_isPresent(gVme, V792_BASE)) {
-        gV792Runtime.communication_ok=FALSE; publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+        gVmeModuleState.v792.communication_ok=FALSE; publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
         cm_msg(MERROR, frontend_name,
                "V792 not found at 0x%08X", V792_BASE);
         return false;
       }
-      gV792Runtime.communication_ok=TRUE; gV792Runtime.dirty=true;
+      gVmeModuleState.v792.communication_ok=TRUE; gVmeModuleState.v792.dirty=true;
       printf("V792 detected.\n");
-    } else { gV792Runtime={}; gV792Runtime.dirty=true; set_module_readback_valid(V792_READBACK_PATH,false); publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish); printf("V792 disabled in ODB; communication check skipped.\n"); }
+    } else { gVmeModuleState.v792={}; gVmeModuleState.v792.dirty=true; set_module_readback_valid(V792_READBACK_PATH,false); publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish); printf("V792 disabled in ODB; communication check skipped.\n"); }
 
     WORD v1190_status = 0;
     WORD v1190_events = 0;
-    if (gV1190RunSettings.enabled) {
+    if (gVmeConfig.v1190.enabled) {
       printf("Checking V1190A at 0x%08X...\n", V1190_BASE);
       if (!vme_read16(V1190_BASE + V1190_STATUS, v1190_status, "V1190 Status") ||
         !vme_read16(V1190_BASE + V1190_EVENT_STORED, v1190_events,
                     "V1190 Event Stored")) {
-        gV1190Runtime.communication_ok=FALSE; publish_v1190_variables();
+        gVmeModuleState.v1190.communication_ok=FALSE; publish_v1190_variables();
         cm_msg(MERROR, frontend_name,
                "V1190A communication check failed at 0x%08X", V1190_BASE);
         return false;
       }
-      gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(v1190_status,v1190_events,gV1190Runtime.event_counter);
+      gVmeModuleState.v1190.communication_ok=TRUE; decode_v1190_runtime(v1190_status,v1190_events,gVmeModuleState.v1190.event_counter);
       printf("V1190A detected: Status=0x%04X Event Stored=%u.\n",
            v1190_status, v1190_events);
-    } else { gV1190Runtime={}; gV1190Runtime.dirty=true; set_module_readback_valid(V1190_READBACK_PATH,false); publish_v1190_variables(); printf("V1190 disabled in ODB; communication check skipped.\n"); }
+    } else { gVmeModuleState.v1190={}; gVmeModuleState.v1190.dirty=true; set_module_readback_valid(V1190_READBACK_PATH,false); publish_v1190_variables(); printf("V1190 disabled in ODB; communication check skipped.\n"); }
 
-    if (gV775RunSettings.enabled) {
+    if (gVmeConfig.v775.enabled) {
       printf("Checking V775 at 0x%08X...\n", V775_BASE);
       if (!v775_isPresent(gVme, V775_BASE)) {
-        gV775Runtime.communication_ok=FALSE; publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+        gVmeModuleState.v775.communication_ok=FALSE; publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
         cm_msg(MERROR, frontend_name,
                "V775 not found at 0x%08X", V775_BASE);
         return false;
       }
-      gV775Runtime.communication_ok=TRUE; gV775Runtime.dirty=true; printf("V775 detected.\n");
-    } else { gV775Runtime={}; gV775Runtime.dirty=true; set_module_readback_valid(V775_READBACK_PATH,false); publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish); printf("V775 disabled in ODB; communication check skipped.\n"); }
+      gVmeModuleState.v775.communication_ok=TRUE; gVmeModuleState.v775.dirty=true; printf("V775 detected.\n");
+    } else { gVmeModuleState.v775={}; gVmeModuleState.v775.dirty=true; set_module_readback_valid(V775_READBACK_PATH,false); publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish); printf("V775 disabled in ODB; communication check skipped.\n"); }
 
     if (!check_v1720e) {
         set_v1720e_communication_ok(false);
@@ -3053,7 +3078,7 @@ static const char *v1190_pout_function(WORD selection)
 /* POUT is a frontend hardware setting, independent of BOR run settings. */
 static bool configure_v1190_pout_startup()
 {
-    if (!gV1190RunSettings.enabled) return true;
+    if (!gVmeConfig.v1190.enabled) return true;
     if (!vme_write16(V1190_BASE + V1190_OUT_PROG,
                      V1190_POUT_ALMOST_FULL, "V1190 startup POUT ALMOST_FULL"))
         return false;
@@ -3132,7 +3157,7 @@ static bool validate_and_snapshot_module_settings()
     WORD r=0,d=0,h=0,m[V1190_CHANNEL_MASK_WORDS]={};
     if(b.enabled && !encode_v1190_semantics(b,r,d,h,m)) return false;
     if(c.enabled && c.full_scale_range>0xFF) { cm_msg(MERROR,frontend_name,"V775 FullScaleRange exceeds 8-bit range"); return false; }
-    gV792RunSettings=a; gV1190RunSettings=b; gV775RunSettings=c; return true;
+    gVmeConfig.v792=a; gVmeConfig.v1190=b; gVmeConfig.v775=c; return true;
 }
 
 static bool snapshot_rpv130_enabled_for_run()
@@ -3142,49 +3167,49 @@ static bool snapshot_rpv130_enabled_for_run()
     if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH, "Enabled") ||
         !get_absolute_odb_value(path, &enabled, sizeof(enabled), TID_BOOL))
         return false;
-    gRpv130EnabledForRun = enabled != FALSE;
+    gVmeState.rpv130_enabled_for_run = enabled != FALSE;
     if (!make_odb_path(path, sizeof(path), RPV130_SETTINGS_PATH,
                        "SingleEventBusyEnabled") ||
         !get_absolute_odb_value(path, &single_event_busy,
                                 sizeof(single_event_busy), TID_BOOL))
         return false;
-    gSingleEventBusyEnabledForRun = single_event_busy != FALSE;
+    gVmeState.single_event_busy_enabled_for_run = single_event_busy != FALSE;
     return true;
 }
 
 static void capture_vme_requested_snapshot()
 {
-    gVmeRunSnapshot.v792_requested = gV792RunSettings;
-    gVmeRunSnapshot.v1190_requested = gV1190RunSettings;
-    gVmeRunSnapshot.v775_requested = gV775RunSettings;
-    gVmeRunSnapshot.v1720e_requested = gV1720RunSettings;
-    gVmeRunSnapshot.rpv130_enabled =
-        gRpv130EnabledForRun ? TRUE : FALSE;
-    gVmeRunSnapshot.rpv130_single_event_busy_enabled =
-        gSingleEventBusyEnabledForRun ? TRUE : FALSE;
-    gVmeRunSnapshot.enabled_for_run =
-        (gV792RunSettings.enabled || gV1190RunSettings.enabled ||
-         gV775RunSettings.enabled || gV1720RunSettings.enabled ||
-         gRpv130EnabledForRun) ? TRUE : FALSE;
+    gVmeModuleState.snapshot.v792_requested = gVmeConfig.v792;
+    gVmeModuleState.snapshot.v1190_requested = gVmeConfig.v1190;
+    gVmeModuleState.snapshot.v775_requested = gVmeConfig.v775;
+    gVmeModuleState.snapshot.v1720e_requested = gV1720RunSettings;
+    gVmeModuleState.snapshot.rpv130_enabled =
+        gVmeState.rpv130_enabled_for_run ? TRUE : FALSE;
+    gVmeModuleState.snapshot.rpv130_single_event_busy_enabled =
+        gVmeState.single_event_busy_enabled_for_run ? TRUE : FALSE;
+    gVmeModuleState.snapshot.enabled_for_run =
+        (gVmeConfig.v792.enabled || gVmeConfig.v1190.enabled ||
+         gVmeConfig.v775.enabled || gV1720RunSettings.enabled ||
+         gVmeState.rpv130_enabled_for_run) ? TRUE : FALSE;
 }
 
 static void publish_vme_enabled_for_run()
 {
-    gV792Runtime.enabled_for_run = gV792RunSettings.enabled;
-    gV1190Runtime.enabled_for_run = gV1190RunSettings.enabled;
-    gV775Runtime.enabled_for_run = gV775RunSettings.enabled;
+    gVmeModuleState.v792.enabled_for_run = gVmeConfig.v792.enabled;
+    gVmeModuleState.v1190.enabled_for_run = gVmeConfig.v1190.enabled;
+    gVmeModuleState.v775.enabled_for_run = gVmeConfig.v775.enabled;
     gV1720Runtime.enabled_for_run = gV1720RunSettings.enabled;
-    gV792Runtime.dirty = true;
-    gV1190Runtime.dirty = true;
-    gV775Runtime.dirty = true;
+    gVmeModuleState.v792.dirty = true;
+    gVmeModuleState.v1190.dirty = true;
+    gVmeModuleState.v775.dirty = true;
     gV1720Runtime.dirty = true;
-    publish_v7xx_variables(V792_VARIABLES_PATH, gV792Runtime,
-                           gV792LastVariablesPublish);
+    publish_v7xx_variables(V792_VARIABLES_PATH, gVmeModuleState.v792,
+                           gVmeModuleState.v792_last_publish);
     publish_v1190_variables();
-    publish_v7xx_variables(V775_VARIABLES_PATH, gV775Runtime,
-                           gV775LastVariablesPublish);
+    publish_v7xx_variables(V775_VARIABLES_PATH, gVmeModuleState.v775,
+                           gVmeModuleState.v775_last_publish);
     publish_v1720e_variables();
-    if (gRpv130EnabledForRun) {
+    if (gVmeState.rpv130_enabled_for_run) {
         const BOOL yes = TRUE;
         set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun", &yes,
                           sizeof(yes), 1, TID_BOOL);
@@ -3195,8 +3220,8 @@ static void publish_vme_enabled_for_run()
 
 static bool validate_v792_event_source_dependency()
 {
-    if (!gV792RunSettings.enabled &&
-        (gV1190RunSettings.enabled || gV775RunSettings.enabled ||
+    if (!gVmeConfig.v792.enabled &&
+        (gVmeConfig.v1190.enabled || gVmeConfig.v775.enabled ||
          gV1720RunSettings.enabled)) {
         cm_msg(MERROR, frontend_name,
                "V792 must be enabled when any VME physics readout module "
@@ -3219,7 +3244,7 @@ static bool validate_v792_event_source_dependency()
         !vme_read16(V792_BASE + V792_BIT_SET2_RW, vb, "V792 Bit Set 2") ||
         !vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped") ||
         !read_v1190_configuration(c)) return false;
-    if (gV775RunSettings.enabled &&
+    if (gVmeConfig.v775.enabled &&
         (!vme_read16(V775_BASE + V775_FIRMWARE_REVISION, tf, "V775 Firmware") ||
          !vme_read16(V775_BASE + V775_STATUS1, ts1, "V775 Status 1") ||
          !vme_read16(V775_BASE + V775_STATUS2, ts2, "V775 Status 2") ||
@@ -3237,7 +3262,7 @@ static bool validate_v792_event_source_dependency()
            c.max_hits & 0xF, c.header & 1, c.error_mask & 0x7FF, c.fifo_size & 0xF);
     printf("  V1190 channel mask:");
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i) printf(" %04X", c.channels[i]);
-    if (gV775RunSettings.enabled) {
+    if (gVmeConfig.v775.enabled) {
         printf("\n  V775 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X FSR=0x%04X\n",
                tf, ts1, ts2, tb, fsr);
         printf("    VALID=0 datum write: %s (invalid datum %s buffer)\n",
@@ -3248,7 +3273,7 @@ static bool validate_v792_event_source_dependency()
     }
     printf("  V792 thresholds:");
     for (unsigned i = 0; i < V792_MAX_CHANNELS; ++i) printf(" %03X", vth[i]);
-    if (gV775RunSettings.enabled) {
+    if (gVmeConfig.v775.enabled) {
         printf("\n  V775 thresholds:");
         for (unsigned i = 0; i < V775_MAX_CHANNELS; ++i) printf(" %03X", tth[i]);
     }
@@ -3258,10 +3283,10 @@ static bool validate_v792_event_source_dependency()
 
 static bool configure_v792_for_run()
 {
-    if (!gV792RunSettings.enabled) return true;
-    const DWORD zsreg=gV792RunSettings.zero_suppression_enabled?V792_BIT_CLEAR2_WO:V792_BIT_SET2_RW;
-    const DWORD atreg=gV792RunSettings.all_trigger_enabled?V792_BIT_SET2_RW:V792_BIT_CLEAR2_WO;
-    return vme_write16(V792_BASE + V792_IPED_RW, gV792RunSettings.iped, "V792 Iped") &&
+    if (!gVmeConfig.v792.enabled) return true;
+    const DWORD zsreg=gVmeConfig.v792.zero_suppression_enabled?V792_BIT_CLEAR2_WO:V792_BIT_SET2_RW;
+    const DWORD atreg=gVmeConfig.v792.all_trigger_enabled?V792_BIT_SET2_RW:V792_BIT_CLEAR2_WO;
+    return vme_write16(V792_BASE + V792_IPED_RW, gVmeConfig.v792.iped, "V792 Iped") &&
            vme_write16(V792_BASE + zsreg,V792_BIT2_LOW_THRESHOLD,"V792 zero suppression") &&
            vme_write16(V792_BASE + atreg,V792_BIT2_ALL_TRIGGER,"V792 ALL TRG");
 }
@@ -3272,13 +3297,13 @@ static bool configure_v1190_control_for_run(WORD current)
                       V1190_CONTROL_EVENT_FIFO |
                       V1190_CONTROL_EXT_TRIGGER_TIME;
     WORD requested = 0;
-    if (gV1190RunSettings.empty_event_enabled)
+    if (gVmeConfig.v1190.empty_event_enabled)
         requested |= V1190_CONTROL_EMPTY_EVENT;
     /* The source-selected BLT mode requires a FIFO entry for each event. */
-    if (gV1190RunSettings.event_fifo_enabled ||
+    if (gVmeConfig.v1190.event_fifo_enabled ||
         V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
         requested |= V1190_CONTROL_EVENT_FIFO;
-    if (gV1190RunSettings.extended_trigger_time_enabled)
+    if (gVmeConfig.v1190.extended_trigger_time_enabled)
         requested |= V1190_CONTROL_EXT_TRIGGER_TIME;
     const WORD control = WORD((current & ~mask) | requested);
     if (!vme_write16(V1190_BASE + V1190_CONTROL, control,
@@ -3299,41 +3324,41 @@ static bool configure_v1190_control_for_run(WORD current)
 
 static bool configure_v1190_for_run()
 {
-    if (!gV1190RunSettings.enabled) return true;
-    const WORD width=gV1190RunSettings.window_width;
-    const WORD offset=WORD(gV1190RunSettings.window_offset)&0x0FFF;
-    const WORD extra=gV1190RunSettings.extra_search_margin, reject=gV1190RunSettings.reject_margin;
-    const WORD edge=gV1190RunSettings.edge_mode; WORD resolution=0,dead=0,hits=0;
+    if (!gVmeConfig.v1190.enabled) return true;
+    const WORD width=gVmeConfig.v1190.window_width;
+    const WORD offset=WORD(gVmeConfig.v1190.window_offset)&0x0FFF;
+    const WORD extra=gVmeConfig.v1190.extra_search_margin, reject=gVmeConfig.v1190.reject_margin;
+    const WORD edge=gVmeConfig.v1190.edge_mode; WORD resolution=0,dead=0,hits=0;
     WORD channels[V1190_CHANNEL_MASK_WORDS]={};
-    if(!encode_v1190_semantics(gV1190RunSettings,resolution,dead,hits,channels)) return false;
+    if(!encode_v1190_semantics(gVmeConfig.v1190,resolution,dead,hits,channels)) return false;
     WORD control = 0;
-    if (!v1190_micro_write_command(gV1190RunSettings.trigger_matching_enabled?V1190_OPCODE_TRIGGER_MATCH:V1190_OPCODE_CONTINUOUS,NULL,0) ||
+    if (!v1190_micro_write_command(gVmeConfig.v1190.trigger_matching_enabled?V1190_OPCODE_TRIGGER_MATCH:V1190_OPCODE_CONTINUOUS,NULL,0) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_WINDOW_WIDTH, &width, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_WINDOW_OFFSET, &offset, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_EXTRA_MARGIN, &extra, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_REJECT_MARGIN, &reject, 1) ||
-        !v1190_micro_write_command(gV1190RunSettings.trigger_subtraction_enabled?V1190_OPCODE_ENABLE_TRIGGER_SUBTRACTION:V1190_OPCODE_DISABLE_TRIGGER_SUBTRACTION,NULL,0) ||
+        !v1190_micro_write_command(gVmeConfig.v1190.trigger_subtraction_enabled?V1190_OPCODE_ENABLE_TRIGGER_SUBTRACTION:V1190_OPCODE_DISABLE_TRIGGER_SUBTRACTION,NULL,0) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_EDGE_MODE, &edge, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_RESOLUTION, &resolution, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_DEAD_TIME, &dead, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_SET_MAX_HITS, &hits, 1) ||
         !v1190_micro_write_command(V1190_OPCODE_WRITE_CHANNEL_MASK,channels,V1190_CHANNEL_MASK_WORDS) ||
-        !v1190_micro_write_command(gV1190RunSettings.tdc_header_enabled?V1190_OPCODE_ENABLE_TDC_HEADER:V1190_OPCODE_DISABLE_TDC_HEADER,NULL,0) ||
+        !v1190_micro_write_command(gVmeConfig.v1190.tdc_header_enabled?V1190_OPCODE_ENABLE_TDC_HEADER:V1190_OPCODE_DISABLE_TDC_HEADER,NULL,0) ||
         !vme_read16(V1190_BASE + V1190_CONTROL, control, "V1190 Control RMW read")) return false;
     return configure_v1190_control_for_run(control);
 }
 
 static bool configure_v775_for_run()
 {
-    if (!gV775RunSettings.enabled) return true;
+    if (!gVmeConfig.v775.enabled) return true;
     WORD set=0,clear=0;
 #define V775BIT(flag,bit) do { if(flag) set|=bit; else clear|=bit; } while(0)
-    V775BIT(gV775RunSettings.over_range_enabled,V775_BIT2_OVER_RANGE); V775BIT(gV775RunSettings.low_threshold_enabled,V775_BIT2_LOW_THRESHOLD);
-    V775BIT(gV775RunSettings.common_stop,V775_BIT2_COMMON_STOP); V775BIT(gV775RunSettings.empty_program_enabled,V775_BIT2_EMPTY_PROGRAM);
-    V775BIT(gV775RunSettings.valid_control_enabled,V775_BIT2_VALID_CONTROL); V775BIT(gV775RunSettings.sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE);
-    V775BIT(gV775RunSettings.all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
+    V775BIT(gVmeConfig.v775.over_range_enabled,V775_BIT2_OVER_RANGE); V775BIT(gVmeConfig.v775.low_threshold_enabled,V775_BIT2_LOW_THRESHOLD);
+    V775BIT(gVmeConfig.v775.common_stop,V775_BIT2_COMMON_STOP); V775BIT(gVmeConfig.v775.empty_program_enabled,V775_BIT2_EMPTY_PROGRAM);
+    V775BIT(gVmeConfig.v775.valid_control_enabled,V775_BIT2_VALID_CONTROL); V775BIT(gVmeConfig.v775.sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE);
+    V775BIT(gVmeConfig.v775.all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
 #undef V775BIT
-    return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, gV775RunSettings.full_scale_range,
+    return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, gVmeConfig.v775.full_scale_range,
                        "V775 Full Scale Range") &&
            vme_write16(V775_BASE + V775_BIT_SET2, set,
                        "V775 run bits set") &&
@@ -3407,23 +3432,23 @@ static bool verify_value(const char *module, const char *item,
 
 static bool verify_v792_configuration()
 {
-    if(!gV792RunSettings.enabled) { set_module_readback_valid(V792_READBACK_PATH,false); return true; }
+    if(!gVmeConfig.v792.enabled) { set_module_readback_valid(V792_READBACK_PATH,false); return true; }
     WORD iped=0,bits=0,firmware=0,thresholds[32]={};
     if (!vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped verify") ||
         !vme_read16(V792_BASE + V792_BIT_SET2_RW,bits,"V792 Bit Set 2 verify") ||
         !vme_read16(V792_BASE + V792_FIRM_REV,firmware,"V792 Firmware verify") ||
         v792_ThresholdRead(gVme,V792_BASE,thresholds)!=V792_MAX_CHANNELS) return false;
     const BOOL zs=!(bits&V792_BIT2_LOW_THRESHOLD), all=!!(bits&V792_BIT2_ALL_TRIGGER);
-    bool ok=verify_value("V792","Iped",gV792RunSettings.iped,iped&0xFF);
-    ok=verify_value("V792","ZeroSuppression",gV792RunSettings.zero_suppression_enabled,zs)&&ok;
-    ok=verify_value("V792","AllTrigger",gV792RunSettings.all_trigger_enabled,all)&&ok;
-    gVmeRunSnapshot.v792_readback.valid = ok ? TRUE : FALSE;
-    gVmeRunSnapshot.v792_readback.firmware_revision = firmware;
-    gVmeRunSnapshot.v792_readback.iped = iped;
-    gVmeRunSnapshot.v792_readback.zero_suppression_enabled = zs;
-    gVmeRunSnapshot.v792_readback.all_trigger_enabled = all;
-    gVmeRunSnapshot.v792_readback.bit_set2_raw = bits;
-    memcpy(gVmeRunSnapshot.v792_readback.threshold, thresholds,
+    bool ok=verify_value("V792","Iped",gVmeConfig.v792.iped,iped&0xFF);
+    ok=verify_value("V792","ZeroSuppression",gVmeConfig.v792.zero_suppression_enabled,zs)&&ok;
+    ok=verify_value("V792","AllTrigger",gVmeConfig.v792.all_trigger_enabled,all)&&ok;
+    gVmeModuleState.snapshot.v792_readback.valid = ok ? TRUE : FALSE;
+    gVmeModuleState.snapshot.v792_readback.firmware_revision = firmware;
+    gVmeModuleState.snapshot.v792_readback.iped = iped;
+    gVmeModuleState.snapshot.v792_readback.zero_suppression_enabled = zs;
+    gVmeModuleState.snapshot.v792_readback.all_trigger_enabled = all;
+    gVmeModuleState.snapshot.v792_readback.bit_set2_raw = bits;
+    memcpy(gVmeModuleState.snapshot.v792_readback.threshold, thresholds,
            sizeof(thresholds));
     set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
     set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
@@ -3436,31 +3461,31 @@ static bool verify_v792_configuration()
 
 static bool verify_v1190_configuration()
 {
-    if(!gV1190RunSettings.enabled) { set_module_readback_valid(V1190_READBACK_PATH,false); return true; }
+    if(!gVmeConfig.v1190.enabled) { set_module_readback_valid(V1190_READBACK_PATH,false); return true; }
     V1190Configuration c = {};
     if (!read_v1190_configuration(c)) return false;
     WORD er=0,ed=0,eh=0,channels[V1190_CHANNEL_MASK_WORDS]={};
-    if(!encode_v1190_semantics(gV1190RunSettings,er,ed,eh,channels)) return false;
+    if(!encode_v1190_semantics(gVmeConfig.v1190,er,ed,eh,channels)) return false;
     bool ok = true;
 #define V1190_VERIFY(item, expected, actual) \
     do { ok = verify_value("V1190", item, expected, actual) && ok; } while (0)
-    V1190_VERIFY("Acquisition mode",gV1190RunSettings.trigger_matching_enabled,c.mode&1);
-    V1190_VERIFY("Window width",gV1190RunSettings.window_width,c.trigger[0]&0xFFF);
-    V1190_VERIFY("Window offset",WORD(gV1190RunSettings.window_offset)&0xFFF,c.trigger[1]&0xFFF);
-    V1190_VERIFY("Extra search margin",gV1190RunSettings.extra_search_margin,c.trigger[2]&0xFFF);
-    V1190_VERIFY("Reject margin",gV1190RunSettings.reject_margin,c.trigger[3]&0xFFF);
-    V1190_VERIFY("Trigger subtraction",gV1190RunSettings.trigger_subtraction_enabled,c.trigger[4]&1);
-    V1190_VERIFY("Edge mode",gV1190RunSettings.edge_mode,c.edge&3);
+    V1190_VERIFY("Acquisition mode",gVmeConfig.v1190.trigger_matching_enabled,c.mode&1);
+    V1190_VERIFY("Window width",gVmeConfig.v1190.window_width,c.trigger[0]&0xFFF);
+    V1190_VERIFY("Window offset",WORD(gVmeConfig.v1190.window_offset)&0xFFF,c.trigger[1]&0xFFF);
+    V1190_VERIFY("Extra search margin",gVmeConfig.v1190.extra_search_margin,c.trigger[2]&0xFFF);
+    V1190_VERIFY("Reject margin",gVmeConfig.v1190.reject_margin,c.trigger[3]&0xFFF);
+    V1190_VERIFY("Trigger subtraction",gVmeConfig.v1190.trigger_subtraction_enabled,c.trigger[4]&1);
+    V1190_VERIFY("Edge mode",gVmeConfig.v1190.edge_mode,c.edge&3);
     V1190_VERIFY("Resolution",er,c.resolution&3); V1190_VERIFY("Dead time",ed,c.dead_time&3);
-    V1190_VERIFY("Maximum hits",eh,c.max_hits&0xF); V1190_VERIFY("TDC Header/Trailer",gV1190RunSettings.tdc_header_enabled,c.header&1);
+    V1190_VERIFY("Maximum hits",eh,c.max_hits&0xF); V1190_VERIFY("TDC Header/Trailer",gVmeConfig.v1190.tdc_header_enabled,c.header&1);
     for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i)
         V1190_VERIFY("Channel mask word",channels[i],c.channels[i]);
-    V1190_VERIFY("Empty Event",gV1190RunSettings.empty_event_enabled,!!(c.control&V1190_CONTROL_EMPTY_EVENT));
+    V1190_VERIFY("Empty Event",gVmeConfig.v1190.empty_event_enabled,!!(c.control&V1190_CONTROL_EMPTY_EVENT));
     V1190_VERIFY("Event FIFO",
-                 gV1190RunSettings.event_fifo_enabled ||
+                 gVmeConfig.v1190.event_fifo_enabled ||
                      V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32,
                  !!(c.control&V1190_CONTROL_EVENT_FIFO));
-    V1190_VERIFY("Extended Trigger Time Tag",gV1190RunSettings.extended_trigger_time_enabled,
+    V1190_VERIFY("Extended Trigger Time Tag",gVmeConfig.v1190.extended_trigger_time_enabled,
                  !!(c.control & V1190_CONTROL_EXT_TRIGGER_TIME));
     V1190_VERIFY("POUT selection", V1190_POUT_ALMOST_FULL,
                  c.pout_selection);
@@ -3477,21 +3502,21 @@ static bool verify_v1190_configuration()
     rb.empty_event_enabled=!!(c.control&V1190_CONTROL_EMPTY_EVENT); rb.event_fifo_enabled=!!(c.control&V1190_CONTROL_EVENT_FIFO); rb.extended_trigger_time_enabled=!!(c.control&V1190_CONTROL_EXT_TRIGGER_TIME);
     for(unsigned i=0;i<128;++i) rb.channel_enabled[i]=!!(c.channels[i/16]&(1u<<(i%16)));
     const char *board=(c.rom_version&0xFF)==0?"V1190A":((c.rom_version&0xFF)==1?"V1190B":"Unknown");
-    gVmeRunSnapshot.v1190_readback.valid = ok ? TRUE : FALSE;
-    gVmeRunSnapshot.v1190_readback.firmware_revision = c.firmware;
-    gVmeRunSnapshot.v1190_readback.configuration_rom_version = c.rom_version;
-    snprintf(gVmeRunSnapshot.v1190_readback.board_type,
-             sizeof(gVmeRunSnapshot.v1190_readback.board_type), "%s", board);
-    gVmeRunSnapshot.v1190_readback.settings = rb;
-    gVmeRunSnapshot.v1190_readback.error_mask = c.error_mask & 0x7FF;
-    gVmeRunSnapshot.v1190_readback.effective_fifo_size_words =
+    gVmeModuleState.snapshot.v1190_readback.valid = ok ? TRUE : FALSE;
+    gVmeModuleState.snapshot.v1190_readback.firmware_revision = c.firmware;
+    gVmeModuleState.snapshot.v1190_readback.configuration_rom_version = c.rom_version;
+    snprintf(gVmeModuleState.snapshot.v1190_readback.board_type,
+             sizeof(gVmeModuleState.snapshot.v1190_readback.board_type), "%s", board);
+    gVmeModuleState.snapshot.v1190_readback.settings = rb;
+    gVmeModuleState.snapshot.v1190_readback.error_mask = c.error_mask & 0x7FF;
+    gVmeModuleState.snapshot.v1190_readback.effective_fifo_size_words =
         (c.fifo_size & 0xF) <= 7 ? (1u << ((c.fifo_size & 0xF) + 1)) : 0;
-    gVmeRunSnapshot.v1190_readback.control_raw = c.control;
-    gVmeRunSnapshot.v1190_readback.pout_selection = c.pout_selection;
-    snprintf(gVmeRunSnapshot.v1190_readback.pout_function,
-             sizeof(gVmeRunSnapshot.v1190_readback.pout_function), "%s",
+    gVmeModuleState.snapshot.v1190_readback.control_raw = c.control;
+    gVmeModuleState.snapshot.v1190_readback.pout_selection = c.pout_selection;
+    snprintf(gVmeModuleState.snapshot.v1190_readback.pout_function,
+             sizeof(gVmeModuleState.snapshot.v1190_readback.pout_function), "%s",
              v1190_pout_function(c.pout_selection));
-    gVmeRunSnapshot.v1190_readback.almost_full_level_words =
+    gVmeModuleState.snapshot.v1190_readback.almost_full_level_words =
         c.almost_full_level_words;
 #define P1190(k,m,cnt,t) set_module_output(V1190_READBACK_PATH,k,&rb.m,sizeof(rb.m),cnt,t)
     set_module_output(V1190_READBACK_PATH,"FirmwareRevision",&c.firmware,sizeof(c.firmware),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"ConfigurationRomVersion",&c.rom_version,sizeof(c.rom_version),1,TID_WORD); set_module_output(V1190_READBACK_PATH,"BoardType",board,strlen(board)+1,1,TID_STRING);
@@ -3509,15 +3534,15 @@ static bool verify_v1190_configuration()
 
 static bool verify_v775_configuration()
 {
-    if(!gV775RunSettings.enabled) { set_module_readback_valid(V775_READBACK_PATH,false); return true; }
+    if(!gVmeConfig.v775.enabled) { set_module_readback_valid(V775_READBACK_PATH,false); return true; }
     WORD fsr=0,bits=0,firmware=0,fclr=0,thresholds[32]={};
     if (!vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR verify") ||
         !vme_read16(V775_BASE+V775_BIT_SET2,bits,"V775 Bit Set 2 verify") || !vme_read16(V775_BASE+V775_FIRMWARE_REVISION,firmware,"V775 Firmware") || !vme_read16(V775_BASE+V775_FCLR_WINDOW,fclr,"V775 Fast Clear") || v775_ThresholdRead(gVme,V775_BASE,thresholds)!=V775_MAX_CHANNELS) return false;
-    bool ok=verify_value("V775","Full Scale Range",gV775RunSettings.full_scale_range,fsr&0xFF);
-#define VV775(name,member,bit) ok=verify_value("V775",name,gV775RunSettings.member,!!(bits&bit))&&ok
+    bool ok=verify_value("V775","Full Scale Range",gVmeConfig.v775.full_scale_range,fsr&0xFF);
+#define VV775(name,member,bit) ok=verify_value("V775",name,gVmeConfig.v775.member,!!(bits&bit))&&ok
     VV775("OverRange",over_range_enabled,V775_BIT2_OVER_RANGE); VV775("LowThreshold",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); VV775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); VV775("EmptyProgram",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); VV775("ValidControl",valid_control_enabled,V775_BIT2_VALID_CONTROL); VV775("SlidingScale",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); VV775("AllTrigger",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
 #undef VV775
-    V775ReadbackSnapshot &snapshot = gVmeRunSnapshot.v775_readback;
+    V775ReadbackSnapshot &snapshot = gVmeModuleState.snapshot.v775_readback;
     snapshot.valid = ok ? TRUE : FALSE;
     snapshot.firmware_revision = firmware;
     snapshot.full_scale_range = fsr;
@@ -3542,16 +3567,16 @@ static bool verify_v775_configuration()
 //************************************//
 static bool clear_module_buffers()
 {
-    if (gV792RunSettings.enabled &&
+    if (gVmeConfig.v792.enabled &&
         (!vme_write16(V792_BASE + V792_BIT_SET2_RW,0x0004,"V792 Data Clear set") || !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO,0x0004,"V792 Data Clear clear"))) return false;
-    if (gV1190RunSettings.enabled && !vme_write16(V1190_BASE+V1190_SOFT_CLEAR,0,"V1190 Software Clear")) return false;
-    if (gV775RunSettings.enabled &&
+    if (gVmeConfig.v1190.enabled && !vme_write16(V1190_BASE+V1190_SOFT_CLEAR,0,"V1190 Software Clear")) return false;
+    if (gVmeConfig.v775.enabled &&
         (!vme_write16(V775_BASE + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, "V775 Data Clear set") ||
          !vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, "V775 Data Clear clear"))) return false;
     WORD status = 0;
-    if (gV1190RunSettings.enabled && !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 Status after clear")) return false;
-    if ((gV792RunSettings.enabled && v792_DataReady(gVme,V792_BASE)) || (gV1190RunSettings.enabled && (status&V1190_STATUS_DATA_READY))
-        || (gV775RunSettings.enabled && v775_DataReady(gVme,V775_BASE))
+    if (gVmeConfig.v1190.enabled && !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 Status after clear")) return false;
+    if ((gVmeConfig.v792.enabled && v792_DataReady(gVme,V792_BASE)) || (gVmeConfig.v1190.enabled && (status&V1190_STATUS_DATA_READY))
+        || (gVmeConfig.v775.enabled && v775_DataReady(gVme,V775_BASE))
         ) {
         cm_msg(MERROR, frontend_name, "Buffer clear verify failed: DataReady remains asserted");
         return false;
@@ -3751,20 +3776,20 @@ static bool verify_run_start_state()
 {
     WORD status = 0;
     DWORD v792_counter = 0, v1190_counter = 0;
-    if(gV792RunSettings.enabled) v792_EvtCntRead(gVme,V792_BASE,&v792_counter);
+    if(gVmeConfig.v792.enabled) v792_EvtCntRead(gVme,V792_BASE,&v792_counter);
     DWORD v775_counter = 0;
-    if(gV775RunSettings.enabled) v775_EvtCntRead(gVme,V775_BASE,&v775_counter);
-    if(gV1190RunSettings.enabled && (!vme_read32(V1190_BASE+V1190_EVENT_COUNTER,v1190_counter,"V1190 Event Counter") || !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 run-start Status"))) return false;
-    printf("BOR event counters: V792=%s0x%06X V1190=%s0x%08X",gV792RunSettings.enabled?"":"DISABLED/",v792_counter&V7XX_EVENT_COUNTER_MASK,gV1190RunSettings.enabled?"":"DISABLED/",v1190_counter);
-    printf(" V775=%s0x%06X",gV775RunSettings.enabled?"":"DISABLED/",v775_counter&V7XX_EVENT_COUNTER_MASK);
+    if(gVmeConfig.v775.enabled) v775_EvtCntRead(gVme,V775_BASE,&v775_counter);
+    if(gVmeConfig.v1190.enabled && (!vme_read32(V1190_BASE+V1190_EVENT_COUNTER,v1190_counter,"V1190 Event Counter") || !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 run-start Status"))) return false;
+    printf("BOR event counters: V792=%s0x%06X V1190=%s0x%08X",gVmeConfig.v792.enabled?"":"DISABLED/",v792_counter&V7XX_EVENT_COUNTER_MASK,gVmeConfig.v1190.enabled?"":"DISABLED/",v1190_counter);
+    printf(" V775=%s0x%06X",gVmeConfig.v775.enabled?"":"DISABLED/",v775_counter&V7XX_EVENT_COUNTER_MASK);
     printf("\n");
-    if ((gV792RunSettings.enabled&&v792_DataReady(gVme,V792_BASE)) || (gV1190RunSettings.enabled&&(status&V1190_STATUS_DATA_READY))
-        || (gV775RunSettings.enabled&&v775_DataReady(gVme,V775_BASE))
+    if ((gVmeConfig.v792.enabled&&v792_DataReady(gVme,V792_BASE)) || (gVmeConfig.v1190.enabled&&(status&V1190_STATUS_DATA_READY))
+        || (gVmeConfig.v775.enabled&&v775_DataReady(gVme,V775_BASE))
         ) {
         cm_msg(MERROR, frontend_name, "BOR run-start verify failed: module buffer is not empty");
         return false;
     }
-    if (gV1190RunSettings.enabled &&
+    if (gVmeConfig.v1190.enabled &&
         V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32) {
         WORD fifo_status = 0, fifo_stored = 0;
         if (!vme_read16(V1190_BASE + V1190_EVENT_FIFO_STATUS,
@@ -3783,8 +3808,8 @@ static bool verify_run_start_state()
            "  V775  : %s\n"
            "  V1720E: %s\n  Buffers empty\n"
            "  Event counters reset\n  Run may start\n",
-           gV792RunSettings.enabled?"READY":"DISABLED",gV1190RunSettings.enabled?"READY":"DISABLED",
-           gV775RunSettings.enabled?"READY":"DISABLED",
+           gVmeConfig.v792.enabled?"READY":"DISABLED",gVmeConfig.v1190.enabled?"READY":"DISABLED",
+           gVmeConfig.v775.enabled?"READY":"DISABLED",
            gV1720RunSettings.enabled ? "READY" : "DISABLED");
     return true;
 }
@@ -3840,15 +3865,15 @@ static bool prepare_modules_for_run()
 
 static bool vme_configuration_ready()
 {
-    return gVmeRunSnapshot.frontend_bor_complete == TRUE &&
-           (!gV792RunSettings.enabled ||
-            gVmeRunSnapshot.v792_readback.valid == TRUE) &&
-           (!gV1190RunSettings.enabled ||
-            gVmeRunSnapshot.v1190_readback.valid == TRUE) &&
-           (!gV775RunSettings.enabled ||
-            gVmeRunSnapshot.v775_readback.valid == TRUE) &&
+    return gVmeModuleState.snapshot.frontend_bor_complete == TRUE &&
+           (!gVmeConfig.v792.enabled ||
+            gVmeModuleState.snapshot.v792_readback.valid == TRUE) &&
+           (!gVmeConfig.v1190.enabled ||
+            gVmeModuleState.snapshot.v1190_readback.valid == TRUE) &&
+           (!gVmeConfig.v775.enabled ||
+            gVmeModuleState.snapshot.v775_readback.valid == TRUE) &&
            (!gV1720RunSettings.enabled ||
-            (gVmeRunSnapshot.v1720e_readback.valid == TRUE &&
+            (gVmeModuleState.snapshot.v1720e_readback.valid == TRUE &&
              gV1720Started));
 }
 
@@ -3877,56 +3902,56 @@ static void setup_v792_sw_trigger_test()
 
 static void reset_run_statistics()
 {
-    gReadoutFailed = false;
-    gBltStopRequested.store(false, std::memory_order_relaxed);
-    gRunStatistics = {};
-    gRunStatistics.v1720_min_ttt_delta = 0x7FFFFFFFu;
+    gVmeState.readout_failed = false;
+    gVmeState.blt_stop_requested.store(false, std::memory_order_relaxed);
+    gVmeStatistics.run = {};
+    gVmeStatistics.run.v1720_min_ttt_delta = 0x7FFFFFFFu;
 }
 
 static void log_run_statistics()
 {
     printf("Event counter mismatches during run: %llu\n",
-           static_cast<unsigned long long>(gRunStatistics.counter_mismatch_count));
-    if (gRunStatistics.counter_mismatch_count != 0) {
-        printf("First mismatch serial: %u\n", gRunStatistics.first_mismatch_serial);
-        printf("Last mismatch serial : %u\n", gRunStatistics.last_mismatch_serial);
+           static_cast<unsigned long long>(gVmeStatistics.run.counter_mismatch_count));
+    if (gVmeStatistics.run.counter_mismatch_count != 0) {
+        printf("First mismatch serial: %u\n", gVmeStatistics.run.first_mismatch_serial);
+        printf("Last mismatch serial : %u\n", gVmeStatistics.run.last_mismatch_serial);
     }
     printf("V1720E integrity: malformed=%llu size-errors=%llu mask-errors=%llu "
            "read-timeouts=%llu counter-discontinuities=%llu\n",
-           static_cast<unsigned long long>(gRunStatistics.v1720_malformed_count),
-           static_cast<unsigned long long>(gRunStatistics.v1720_size_error_count),
-           static_cast<unsigned long long>(gRunStatistics.v1720_mask_error_count),
-           static_cast<unsigned long long>(gRunStatistics.v1720_read_timeout_count),
+           static_cast<unsigned long long>(gVmeStatistics.run.v1720_malformed_count),
+           static_cast<unsigned long long>(gVmeStatistics.run.v1720_size_error_count),
+           static_cast<unsigned long long>(gVmeStatistics.run.v1720_mask_error_count),
+           static_cast<unsigned long long>(gVmeStatistics.run.v1720_read_timeout_count),
            static_cast<unsigned long long>(
-               gRunStatistics.v1720_counter_discontinuity_count));
-    if (gRunStatistics.v1720_have_previous) {
+               gVmeStatistics.run.v1720_counter_discontinuity_count));
+    if (gVmeStatistics.run.v1720_have_previous) {
         printf("V1720E counters: first=%u last=%u; TTT delta count=%llu",
-               gRunStatistics.v1720_first_counter,
-               gRunStatistics.v1720_last_counter,
-               static_cast<unsigned long long>(gRunStatistics.v1720_ttt_count));
-        if (gRunStatistics.v1720_ttt_count != 0)
-            printf(" min=%u max=%u", gRunStatistics.v1720_min_ttt_delta,
-                   gRunStatistics.v1720_max_ttt_delta);
+               gVmeStatistics.run.v1720_first_counter,
+               gVmeStatistics.run.v1720_last_counter,
+               static_cast<unsigned long long>(gVmeStatistics.run.v1720_ttt_count));
+        if (gVmeStatistics.run.v1720_ttt_count != 0)
+            printf(" min=%u max=%u", gVmeStatistics.run.v1720_min_ttt_delta,
+                   gVmeStatistics.run.v1720_max_ttt_delta);
         printf("\n");
     }
 }
 
 static void refresh_enabled_module_variables()
 {
-    if(gV792RunSettings.enabled) {
-        WORD s1=0,s2=0; DWORD counter=gV792Runtime.event_counter;
-        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 final Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 final Status2")) { v792_EvtCntRead(gVme,V792_BASE,&counter); gV792Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV792Runtime,s1,s2,counter); } else gV792Runtime.communication_ok=FALSE;
-        publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+    if(gVmeConfig.v792.enabled) {
+        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v792.event_counter;
+        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 final Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 final Status2")) { v792_EvtCntRead(gVme,V792_BASE,&counter); gVmeModuleState.v792.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v792,s1,s2,counter); } else gVmeModuleState.v792.communication_ok=FALSE;
+        publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
     }
-    if(gV1190RunSettings.enabled) {
-        WORD status=0,stored=0; DWORD counter=gV1190Runtime.event_counter;
-        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 final Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 final Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 final Event Counter")) { gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter); } else gV1190Runtime.communication_ok=FALSE;
+    if(gVmeConfig.v1190.enabled) {
+        WORD status=0,stored=0; DWORD counter=gVmeModuleState.v1190.event_counter;
+        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 final Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 final Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 final Event Counter")) { gVmeModuleState.v1190.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter); } else gVmeModuleState.v1190.communication_ok=FALSE;
         publish_v1190_variables();
     }
-    if(gV775RunSettings.enabled) {
-        WORD s1=0,s2=0; DWORD counter=gV775Runtime.event_counter;
-        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 final Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 final Status2")) { v775_EvtCntRead(gVme,V775_BASE,&counter); gV775Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV775Runtime,s1,s2,counter); } else gV775Runtime.communication_ok=FALSE;
-        publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+    if(gVmeConfig.v775.enabled) {
+        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v775.event_counter;
+        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 final Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 final Status2")) { v775_EvtCntRead(gVme,V775_BASE,&counter); gVmeModuleState.v775.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v775,s1,s2,counter); } else gVmeModuleState.v775.communication_ok=FALSE;
+        publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
     }
 }
 
@@ -4088,7 +4113,7 @@ INT frontend_init()
                "V1720E startup auto-stop skipped: MIDAS state %d",
                current_run_state);
     }
-    if (gV1190RunSettings.enabled) {
+    if (gVmeConfig.v1190.enabled) {
         INT state_before_pout = 0;
         INT transition_in_progress = 0;
         if (!get_absolute_odb_value("/Runinfo/State", &state_before_pout,
@@ -4150,11 +4175,11 @@ INT frontend_exit()
         }
         refresh_enabled_module_variables();
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-        if (gV1190RunSettings.enabled && !restore_v1190_diagnostic_settings())
+        if (gVmeConfig.v1190.enabled && !restore_v1190_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V1190 diagnostic restoration failed during frontend exit");
 #endif
 #if ENABLE_V775_SW_TRIGGER_TEST
-        if (gV775RunSettings.enabled && !restore_v775_diagnostic_settings())
+        if (gVmeConfig.v775.enabled && !restore_v775_diagnostic_settings())
             cm_msg(MERROR, frontend_name, "V775 diagnostic restoration failed during frontend exit");
 #endif
         mvme_close(gVme);
@@ -4186,13 +4211,13 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_ODB);
     }
     reset_run_statistics();
-    gV1190BltDiagnosticCount.store(0, std::memory_order_relaxed);
-    gV1720BltDiagnosticCount.store(0, std::memory_order_relaxed);
-    v1190_fifo_blt_state_reset(&gV1190FifoBltState);
-    gRpv130TimingEventCount.store(0, std::memory_order_relaxed);
-    gRpv130PollReadyNs.store(0, std::memory_order_relaxed);
-    gRpv130LastPollMissNs.store(0, std::memory_order_relaxed);
-    gRpv130PollPreviousMissNs.store(0, std::memory_order_relaxed);
+    gVmeStatistics.v1190_blt_diagnostics.store(0, std::memory_order_relaxed);
+    gVmeStatistics.v1720_blt_diagnostics.store(0, std::memory_order_relaxed);
+    v1190_fifo_blt_state_reset(&gVmeState.v1190_fifo_blt);
+    gVmeStatistics.rpv130_timing_events.store(0, std::memory_order_relaxed);
+    gVmeStatistics.rpv130_poll_ready_ns.store(0, std::memory_order_relaxed);
+    gVmeStatistics.rpv130_last_poll_miss_ns.store(0, std::memory_order_relaxed);
+    gVmeStatistics.rpv130_poll_previous_miss_ns.store(0, std::memory_order_relaxed);
     mark_run_counters_dirty();
     if (!publish_run_counters()) {
         cm_msg(MERROR, frontend_name,
@@ -4236,10 +4261,10 @@ INT begin_of_run(INT run_number, char *error)
     }
 
 #if ENABLE_V792_SW_TRIGGER_TEST
-    if(gV792RunSettings.enabled) setup_v792_sw_trigger_test();
+    if(gVmeConfig.v792.enabled) setup_v792_sw_trigger_test();
 #endif
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-    if (gV1190RunSettings.enabled && (!restore_v1190_diagnostic_settings() ||
+    if (gVmeConfig.v1190.enabled && (!restore_v1190_diagnostic_settings() ||
         !setup_v1190_soft_trigger_test())) {
         snprintf(error, 256, "V1190 soft-trigger diagnostic setup failed");
         restore_v1190_diagnostic_settings();
@@ -4249,7 +4274,7 @@ INT begin_of_run(INT run_number, char *error)
     }
 #endif
 #if ENABLE_V775_SW_TRIGGER_TEST
-    if (gV775RunSettings.enabled && (!restore_v775_diagnostic_settings() ||
+    if (gVmeConfig.v775.enabled && (!restore_v775_diagnostic_settings() ||
         !setup_v775_sw_trigger_test())) {
         snprintf(error, 256, "V775 SW trigger diagnostic setup failed");
         restore_v775_diagnostic_settings();
@@ -4265,9 +4290,9 @@ INT begin_of_run(INT run_number, char *error)
         mark_configuration_failed(run_number);
         return finish(FE_ERR_HW);
     }
-    gVmeRunSnapshot.frontend_bor_complete = TRUE;
+    gVmeModuleState.snapshot.frontend_bor_complete = TRUE;
     if (!vme_configuration_ready()) {
-        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        gVmeModuleState.snapshot.frontend_bor_complete = FALSE;
         quiesce_rpv130_single_event_busy("BOR readiness failure");
         stop_v1720e_and_publish_state("BOR readiness failure");
         cm_msg(MERROR, frontend_name,
@@ -4277,7 +4302,7 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_HW);
     }
     if (!publish_vme_run_snapshot()) {
-        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        gVmeModuleState.snapshot.frontend_bor_complete = FALSE;
         quiesce_rpv130_single_event_busy("BOR RunSnapshot publish failure");
         stop_v1720e_and_publish_state("BOR RunSnapshot publish failure");
         cm_msg(MERROR, frontend_name,
@@ -4288,7 +4313,7 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_ODB);
     }
     if (!publish_configuration_status(true, run_number)) {
-        gVmeRunSnapshot.frontend_bor_complete = FALSE;
+        gVmeModuleState.snapshot.frontend_bor_complete = FALSE;
         publish_vme_run_snapshot();
         quiesce_rpv130_single_event_busy("BOR status publish failure");
         stop_v1720e_and_publish_state("BOR status publish failure");
@@ -4335,11 +4360,11 @@ INT end_of_run(INT run_number, char *error)
     refresh_enabled_module_variables();
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
-    if (gV1190RunSettings.enabled && !restore_v1190_diagnostic_settings())
+    if (gVmeConfig.v1190.enabled && !restore_v1190_diagnostic_settings())
         restore_failed = true;
 #endif
 #if ENABLE_V775_SW_TRIGGER_TEST
-    if (gV775RunSettings.enabled && !restore_v775_diagnostic_settings())
+    if (gVmeConfig.v775.enabled && !restore_v775_diagnostic_settings())
         restore_failed = true;
 #endif
     if (restore_failed) {
@@ -4369,7 +4394,7 @@ static INT start_abort(INT run_number, char *error)
     const bool stopped = stop_v1720e_and_publish_state(
         "STARTABORT rollback", &stop_outcome);
 
-    gVmeRunSnapshot.frontend_bor_complete = FALSE;
+    gVmeModuleState.snapshot.frontend_bor_complete = FALSE;
     publish_vme_run_snapshot();
     mark_configuration_failed(run_number);
 
@@ -4409,7 +4434,7 @@ INT resume_run(INT run_number, char *error)
 //************************************//
 INT frontend_loop()
 {
-    if (gBltStopRequested.exchange(false, std::memory_order_relaxed) &&
+    if (gVmeState.blt_stop_requested.exchange(false, std::memory_order_relaxed) &&
         run_state == STATE_RUNNING) {
         char error[TRANSITION_ERROR_STRING_LENGTH] = {};
         const INT status = cm_transition(TR_STOP, 0, error, sizeof(error),
@@ -4418,7 +4443,7 @@ INT frontend_loop()
             cm_msg(MERROR, frontend_name,
                    "BLT32 failure: RUN stop request failed: status %d %s",
                    status, error);
-            gBltStopRequested.store(true, std::memory_order_relaxed);
+            gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
         } else {
             cm_msg(MERROR, frontend_name,
                    "BLT32 failure: RUN stop requested");
@@ -4432,28 +4457,28 @@ INT frontend_loop()
         const DWORD elapsed=static_cast<DWORD>(now-last);
         return (dirty&&elapsed>=MODULE_VARIABLES_MIN_PUBLISH_INTERVAL_MS)||elapsed>=MODULE_VARIABLES_HEARTBEAT_INTERVAL_MS;
     };
-    if (due(now, gRunCountersLastPublish, gRunCountersDirty))
+    if (due(now, gVmeStatistics.run_counters_last_publish, gVmeStatistics.run_counters_dirty))
         publish_run_counters();
-    if(gV792RunSettings.enabled && due(now,gV792LastVariablesPublish,gV792Runtime.dirty)) {
-        WORD s1=0,s2=0; DWORD counter=gV792Runtime.event_counter;
+    if(gVmeConfig.v792.enabled && due(now,gVmeModuleState.v792_last_publish,gVmeModuleState.v792.dirty)) {
+        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v792.event_counter;
         if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 runtime Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 runtime Status2")) {
-            v792_EvtCntRead(gVme,V792_BASE,&counter); gV792Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV792Runtime,s1,s2,counter);
-        } else gV792Runtime.communication_ok=FALSE;
-        publish_v7xx_variables(V792_VARIABLES_PATH,gV792Runtime,gV792LastVariablesPublish);
+            v792_EvtCntRead(gVme,V792_BASE,&counter); gVmeModuleState.v792.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v792,s1,s2,counter);
+        } else gVmeModuleState.v792.communication_ok=FALSE;
+        publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
     }
-    if(gV1190RunSettings.enabled && due(now,gV1190LastVariablesPublish,gV1190Runtime.dirty)) {
-        WORD status=0,stored=0; DWORD counter=gV1190Runtime.event_counter;
+    if(gVmeConfig.v1190.enabled && due(now,gVmeModuleState.v1190_last_publish,gVmeModuleState.v1190.dirty)) {
+        WORD status=0,stored=0; DWORD counter=gVmeModuleState.v1190.event_counter;
         if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 runtime Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 runtime Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 runtime Event Counter")) {
-            gV1190Runtime.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter);
-        } else gV1190Runtime.communication_ok=FALSE;
+            gVmeModuleState.v1190.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter);
+        } else gVmeModuleState.v1190.communication_ok=FALSE;
         publish_v1190_variables();
     }
-    if(gV775RunSettings.enabled && due(now,gV775LastVariablesPublish,gV775Runtime.dirty)) {
-        WORD s1=0,s2=0; DWORD counter=gV775Runtime.event_counter;
+    if(gVmeConfig.v775.enabled && due(now,gVmeModuleState.v775_last_publish,gVmeModuleState.v775.dirty)) {
+        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v775.event_counter;
         if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 runtime Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 runtime Status2")) {
-            v775_EvtCntRead(gVme,V775_BASE,&counter); gV775Runtime.communication_ok=TRUE; decode_v7xx_runtime(gV775Runtime,s1,s2,counter);
-        } else gV775Runtime.communication_ok=FALSE;
-        publish_v7xx_variables(V775_VARIABLES_PATH,gV775Runtime,gV775LastVariablesPublish);
+            v775_EvtCntRead(gVme,V775_BASE,&counter); gVmeModuleState.v775.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v775,s1,s2,counter);
+        } else gVmeModuleState.v775.communication_ok=FALSE;
+        publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
     }
     const DWORD elapsed =
         static_cast<DWORD>(now - gV1720LastVariablesPublish);
@@ -4479,29 +4504,29 @@ INT poll_event(INT source, INT count, BOOL test)
 {
     if (!global_busy::readout_allowed())
         return 0;
-    if (!gVme || gReadoutFailed ||
-        !gV792RunSettings.enabled ||
+    if (!gVme || gVmeState.readout_failed ||
+        !gVmeConfig.v792.enabled ||
         (gV1720RunSettings.enabled && !gV1720Started))
         return 0;
     for (INT i = 0; i < count; ++i) {
         if (v792_DataReady(gVme, V792_BASE) && !test) {
-            if (gSingleEventBusyEnabledForRun &&
-                gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+            if (gVmeState.single_event_busy_enabled_for_run &&
+                gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
                     RPV130_TIMING_EVENT_LIMIT) {
                 uint64_t empty = 0;
-                if (gRpv130PollReadyNs.compare_exchange_strong(
+                if (gVmeStatistics.rpv130_poll_ready_ns.compare_exchange_strong(
                         empty, monotonic_ns(), std::memory_order_relaxed))
-                    gRpv130PollPreviousMissNs.store(
-                        gRpv130LastPollMissNs.load(std::memory_order_relaxed),
+                    gVmeStatistics.rpv130_poll_previous_miss_ns.store(
+                        gVmeStatistics.rpv130_last_poll_miss_ns.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
             }
             return 1;
         }
     }
-    if (!test && gSingleEventBusyEnabledForRun &&
-        gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+    if (!test && gVmeState.single_event_busy_enabled_for_run &&
+        gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
             RPV130_TIMING_EVENT_LIMIT)
-        gRpv130LastPollMissNs.store(monotonic_ns(),
+        gVmeStatistics.rpv130_last_poll_miss_ns.store(monotonic_ns(),
                                     std::memory_order_relaxed);
     return 0;
 }
@@ -4523,8 +4548,8 @@ static bool check_event_counter_match(const V792EventInfo &v792,
 {
     bool have=false; DWORD reference=0;
 #define CMP(enabled,value) do { if(enabled) { DWORD n=(value)&V1190_EVENT_COUNTER_MASK; if(have&&n!=reference)return false; reference=n; have=true; } } while(0)
-    CMP(gV792RunSettings.enabled,v792.event_counter); CMP(gV1190RunSettings.enabled,v1190.event_counter);
-    CMP(gV775RunSettings.enabled,v775.event_counter);
+    CMP(gVmeConfig.v792.enabled,v792.event_counter); CMP(gVmeConfig.v1190.enabled,v1190.event_counter);
+    CMP(gVmeConfig.v775.enabled,v775.event_counter);
     CMP(v1720!=NULL,v1720?v1720->event_counter:0);
 #undef CMP
     return true;
@@ -4536,13 +4561,13 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
                                        const V1720E_EVENT_INFO *v1720,
                                        DWORD midas_serial)
 {
-    if (gRunStatistics.counter_mismatch_count == 0)
-        gRunStatistics.first_mismatch_serial = midas_serial;
-    ++gRunStatistics.counter_mismatch_count;
-    gRunStatistics.last_mismatch_serial = midas_serial;
+    if (gVmeStatistics.run.counter_mismatch_count == 0)
+        gVmeStatistics.run.first_mismatch_serial = midas_serial;
+    ++gVmeStatistics.run.counter_mismatch_count;
+    gVmeStatistics.run.last_mismatch_serial = midas_serial;
     mark_run_counters_dirty();
 
-    const uint64_t count = gRunStatistics.counter_mismatch_count;
+    const uint64_t count = gVmeStatistics.run.counter_mismatch_count;
     if (count <= 10) {
         if (v1720) {
             cm_msg(MINFO, frontend_name,
@@ -4581,7 +4606,7 @@ static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
     bool valid = true;
     if (!event.size_valid) {
         valid = false;
-        ++gRunStatistics.v1720_size_error_count;
+        ++gVmeStatistics.run.v1720_size_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
@@ -4589,42 +4614,42 @@ static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
     }
     if (!event.channel_mask_valid) {
         valid = false;
-        ++gRunStatistics.v1720_mask_error_count;
+        ++gVmeStatistics.run.v1720_mask_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0x%02X",
                midas_serial, event.channel_mask, gV1720ExpectedChannelMask);
     }
-    if (!gRunStatistics.v1720_have_previous) {
-        gRunStatistics.v1720_first_counter = event.event_counter;
-        gRunStatistics.v1720_have_previous = true;
+    if (!gVmeStatistics.run.v1720_have_previous) {
+        gVmeStatistics.run.v1720_first_counter = event.event_counter;
+        gVmeStatistics.run.v1720_have_previous = true;
     } else {
         const DWORD counter_delta =
-            (event.event_counter - gRunStatistics.v1720_previous_counter) &
+            (event.event_counter - gVmeStatistics.run.v1720_previous_counter) &
             V7XX_EVENT_COUNTER_MASK;
         const DWORD ttt_delta =
-            (event.trigger_time_tag - gRunStatistics.v1720_previous_ttt) &
+            (event.trigger_time_tag - gVmeStatistics.run.v1720_previous_ttt) &
             0x7FFFFFFFu;
         if (counter_delta != 1) {
             valid = false;
-            ++gRunStatistics.v1720_counter_discontinuity_count;
+            ++gVmeStatistics.run.v1720_counter_discontinuity_count;
             mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
                    "V1720E counter discontinuity at MIDAS serial %u: "
                    "previous=%u current=%u delta=%u",
-                   midas_serial, gRunStatistics.v1720_previous_counter,
+                   midas_serial, gVmeStatistics.run.v1720_previous_counter,
                    event.event_counter, counter_delta);
         }
-        if (gRunStatistics.v1720_ttt_count == 0 ||
-            ttt_delta < gRunStatistics.v1720_min_ttt_delta)
-            gRunStatistics.v1720_min_ttt_delta = ttt_delta;
-        if (ttt_delta > gRunStatistics.v1720_max_ttt_delta)
-            gRunStatistics.v1720_max_ttt_delta = ttt_delta;
-        ++gRunStatistics.v1720_ttt_count;
+        if (gVmeStatistics.run.v1720_ttt_count == 0 ||
+            ttt_delta < gVmeStatistics.run.v1720_min_ttt_delta)
+            gVmeStatistics.run.v1720_min_ttt_delta = ttt_delta;
+        if (ttt_delta > gVmeStatistics.run.v1720_max_ttt_delta)
+            gVmeStatistics.run.v1720_max_ttt_delta = ttt_delta;
+        ++gVmeStatistics.run.v1720_ttt_count;
     }
-    gRunStatistics.v1720_last_counter = event.event_counter;
-    gRunStatistics.v1720_previous_counter = event.event_counter;
-    gRunStatistics.v1720_previous_ttt = event.trigger_time_tag;
+    gVmeStatistics.run.v1720_last_counter = event.event_counter;
+    gVmeStatistics.run.v1720_previous_counter = event.event_counter;
+    gVmeStatistics.run.v1720_previous_ttt = event.trigger_time_tag;
     return valid;
 }
 
@@ -4640,11 +4665,11 @@ static INT build_midas_event(char *pevent,
 {
     bk_init32(pevent);
     void *bank = NULL;
-    if(gV792RunSettings.enabled) { bk_create(pevent,"ADC0",TID_DWORD,&bank); memcpy(bank,v792_data,v792.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v792.words); }
+    if(gVmeConfig.v792.enabled) { bk_create(pevent,"ADC0",TID_DWORD,&bank); memcpy(bank,v792_data,v792.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v792.words); }
 
-    if(gV1190RunSettings.enabled) { bank=NULL; bk_create(pevent,"TDC0",TID_DWORD,&bank); memcpy(bank,v1190_data,v1190.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v1190.words); }
+    if(gVmeConfig.v1190.enabled) { bank=NULL; bk_create(pevent,"TDC0",TID_DWORD,&bank); memcpy(bank,v1190_data,v1190.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v1190.words); }
 
-    if(gV775RunSettings.enabled) { bank=NULL; bk_create(pevent,"TDC1",TID_DWORD,&bank); memcpy(bank,v775_data,v775.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v775.words); }
+    if(gVmeConfig.v775.enabled) { bank=NULL; bk_create(pevent,"TDC1",TID_DWORD,&bank); memcpy(bank,v775_data,v775.words*sizeof(DWORD)); bk_close(pevent,static_cast<DWORD*>(bank)+v775.words); }
 
     if (v1720) {
         bank = NULL;
@@ -4662,29 +4687,29 @@ static INT build_midas_event(char *pevent,
 INT read_vme_event(char *pevent, INT off)
 {
     Rpv130EventTiming timing;
-    if (gSingleEventBusyEnabledForRun &&
-        gRpv130TimingEventCount.load(std::memory_order_relaxed) <
+    if (gVmeState.single_event_busy_enabled_for_run &&
+        gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
             RPV130_TIMING_EVENT_LIMIT)
         timing.read_start_ns = monotonic_ns();
     if (!global_busy::readout_allowed())
         return 0;
-    if (!gVme || gReadoutFailed)
+    if (!gVme || gVmeState.readout_failed)
         return 0;
-    if (gSingleEventBusyEnabledForRun && timing.read_start_ns) {
-        const unsigned index = gRpv130TimingEventCount.fetch_add(
+    if (gVmeState.single_event_busy_enabled_for_run && timing.read_start_ns) {
+        const unsigned index = gVmeStatistics.rpv130_timing_events.fetch_add(
             1, std::memory_order_relaxed) + 1;
         timing.active = index <= RPV130_TIMING_EVENT_LIMIT;
         if (timing.active) {
             timing.index = index;
             timing.serial = SERIAL_NUMBER(pevent);
-            timing.poll_ready_ns = gRpv130PollReadyNs.exchange(
+            timing.poll_ready_ns = gVmeStatistics.rpv130_poll_ready_ns.exchange(
                 0, std::memory_order_relaxed);
-            timing.poll_previous_miss_ns = gRpv130PollPreviousMissNs.exchange(
+            timing.poll_previous_miss_ns = gVmeStatistics.rpv130_poll_previous_miss_ns.exchange(
                 0, std::memory_order_relaxed);
         }
     }
 
-    if (gSingleEventBusyEnabledForRun) {
+    if (gVmeState.single_event_busy_enabled_for_run) {
         bool busy1 = false;
         uint8_t csr1 = 0;
         const int busy_status = rpv130_read_busy1(
@@ -4706,12 +4731,12 @@ INT read_vme_event(char *pevent, INT off)
     // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
     if (timing.active) timing.peers_start_ns = monotonic_ns();
     bool peers_ready = true;
-    if (gV1190RunSettings.enabled) {
+    if (gVmeConfig.v1190.enabled) {
         if (timing.active) timing.v1190_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v1190_data_ready();
         if (timing.active) timing.v1190_ready_end_ns = monotonic_ns();
     }
-    if (peers_ready && gV775RunSettings.enabled) {
+    if (peers_ready && gVmeConfig.v775.enabled) {
         if (timing.active) timing.v775_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v775_data_ready();
         if (timing.active) timing.v775_ready_end_ns = monotonic_ns();
@@ -4723,7 +4748,7 @@ INT read_vme_event(char *pevent, INT off)
     }
     if (timing.active) timing.peers_end_ns = monotonic_ns();
     if (!peers_ready) {
-        gReadoutFailed = true;
+        gVmeState.readout_failed = true;
         cm_msg(MERROR, frontend_name,
                "Synchronized readout disabled after module-ready timeout; "
                "no FIFO was consumed. Check hardware and restart the run.");
@@ -4736,15 +4761,15 @@ INT read_vme_event(char *pevent, INT off)
     DWORD v775_data[V775_MAX_EVENT_WORDS];
     DWORD v1720_data[V1720E_MAX_EVENT_WORDS];
     V792EventInfo v792 = {};
-    if (gV792RunSettings.enabled) {
+    if (gVmeConfig.v792.enabled) {
         if (timing.active) timing.v792_start_ns = monotonic_ns();
         v792 = V792_READOUT_MODE_SELECT == V792_BLT32 ?
             read_v792_blt32_event(v792_data) :
             read_v792_single_event(v792_data);
         if (timing.active) timing.v792_end_ns = monotonic_ns();
     }
-    if (gV792RunSettings.enabled && (!v792.valid || v792.words == 0)) {
-        gReadoutFailed = true;
+    if (gVmeConfig.v792.enabled && (!v792.valid || v792.words == 0)) {
+        gVmeState.readout_failed = true;
         cm_msg(MERROR, frontend_name,
                "V792 readout disabled after error; no partial bank sent. Check hardware and restart the run to reset readout.");
         fail_single_event_busy("V792 event readout failed");
@@ -4754,7 +4779,7 @@ INT read_vme_event(char *pevent, INT off)
     V1190EventInfo v1190 = {};
     V1190_FIFO_BLT_TIMING v1190_phases = {};
     bool v1190_diagnostic = false;
-    if (gV1190RunSettings.enabled) {
+    if (gVmeConfig.v1190.enabled) {
         if (timing.active ||
             V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
             timing.v1190_start_ns = monotonic_ns();
@@ -4767,8 +4792,8 @@ INT read_vme_event(char *pevent, INT off)
             timing.v1190_end_ns = monotonic_ns();
 
     }
-    if (gV1190RunSettings.enabled && (!v1190.valid || v1190.words == 0)) {
-        gReadoutFailed = true;
+    if (gVmeConfig.v1190.enabled && (!v1190.valid || v1190.words == 0)) {
+        gVmeState.readout_failed = true;
         cm_msg(MERROR, frontend_name,
                "V1190 readout failed; V792 consumed. No MIDAS event sent; stop RUN.");
         fail_single_event_busy("V1190 event readout failed");
@@ -4776,13 +4801,13 @@ INT read_vme_event(char *pevent, INT off)
     }
 
     V775EventInfo v775 = {};
-    if (gV775RunSettings.enabled) {
+    if (gVmeConfig.v775.enabled) {
         if (timing.active) timing.v775_start_ns = monotonic_ns();
         v775 = read_v775_single_event(v775_data);
         if (timing.active) timing.v775_end_ns = monotonic_ns();
     }
-    if (gV775RunSettings.enabled && (!v775.valid || v775.words == 0)) {
-        gReadoutFailed = true;
+    if (gVmeConfig.v775.enabled && (!v775.valid || v775.words == 0)) {
+        gVmeState.readout_failed = true;
         cm_msg(MERROR, frontend_name,
                "V775 readout disabled after error; V792/V1190 events were consumed but no partial MIDAS event was sent. Check hardware and restart the run.");
         fail_single_event_busy("V775 event readout failed");
@@ -4810,14 +4835,14 @@ INT read_vme_event(char *pevent, INT off)
                        "V1720E BLT32 failed: CAEN status=%d requested=%d bytes actual=%d bytes",
                        v1720.blt_status, v1720.blt_requested_bytes,
                        v1720.blt_actual_bytes);
-                gBltStopRequested.store(true, std::memory_order_relaxed);
+                gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
             }
             if (v1720_status != MVME_SUCCESS)
                 gV1720Runtime.communication_ok = FALSE;
             gV1720Runtime.dirty = true;
-            ++gRunStatistics.v1720_malformed_count;
+            ++gVmeStatistics.run.v1720_malformed_count;
             mark_run_counters_dirty();
-            gReadoutFailed = true;
+            gVmeState.readout_failed = true;
             cm_msg(MERROR, frontend_name,
                    "V1720E readout disabled after malformed/partial event: "
                    "status %d words=%zu header-valid=%d. V792/V1190"
@@ -4832,7 +4857,7 @@ INT read_vme_event(char *pevent, INT off)
         const bool v1720_integrity =
             update_v1720e_integrity(v1720, SERIAL_NUMBER(pevent));
         if (!v1720_integrity) {
-            gReadoutFailed = true;
+            gVmeState.readout_failed = true;
             fail_single_event_busy("V1720E event consistency failure");
             return 0;
         }
@@ -4842,7 +4867,7 @@ INT read_vme_event(char *pevent, INT off)
     }
 
     if (!check_event_counter_match(v792, v1190, v775, v1720_event)) {
-        if (gSingleEventBusyEnabledForRun) {
+        if (gVmeState.single_event_busy_enabled_for_run) {
             fail_single_event_busy("participating module event counters differ");
             return 0;
         }
@@ -4860,7 +4885,7 @@ INT read_vme_event(char *pevent, INT off)
                              v775_data, v775,
                              v1720_data, v1720_event);
     if (timing.active) timing.build_end_ns = monotonic_ns();
-    if (gSingleEventBusyEnabledForRun) {
+    if (gVmeState.single_event_busy_enabled_for_run) {
         if (event_size <= 0) {
             fail_single_event_busy("MIDAS event construction failed");
             return 0;
@@ -4892,7 +4917,7 @@ INT read_vme_event(char *pevent, INT off)
 //************************************//
 INT read_vme_configuration_event(char *pevent, INT)
 {
-    if (gVmeRunSnapshot.frontend_bor_complete != TRUE)
+    if (gVmeModuleState.snapshot.frontend_bor_complete != TRUE)
         return 0;
 
     HNDLE hDB = 0;

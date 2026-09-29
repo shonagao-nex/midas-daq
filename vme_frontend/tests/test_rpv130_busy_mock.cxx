@@ -101,12 +101,12 @@ int main() {
     std::ifstream input("fevme.cxx");
     const std::string source{std::istreambuf_iterator<char>(input), {}};
     const auto arm = source.find("static bool arm_rpv130_single_event_busy()");
-    const auto gate = source.find("if (!gSingleEventBusyEnabledForRun) return true;", arm);
+    const auto gate = source.find("if (!gVmeState.single_event_busy_enabled_for_run) return true;", arm);
     const auto write = source.find("rpv130_clear_busy1_and_rearm(", arm);
     assert(arm != std::string::npos && gate != std::string::npos &&
            gate < write);
     const auto event = source.find("INT read_vme_event(");
-    const auto event_gate = source.find("if (gSingleEventBusyEnabledForRun)", event);
+    const auto event_gate = source.find("if (gVmeState.single_event_busy_enabled_for_run)", event);
     const auto event_write = source.find("rpv130_clear_busy1_and_rearm(", event);
     assert(event != std::string::npos && event_gate < event_write);
     std::puts("test_rpv130_busy_mock: passed");
