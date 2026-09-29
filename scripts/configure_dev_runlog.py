@@ -66,6 +66,15 @@ def ensure_link(name, target, phase):
         raise RuntimeError(f"Cannot link {path}: {result}")
 
 
+def remove_link(name, phase):
+    path = f"{JSON_ROOT}/Links {phase}/{name}"
+    if get(path)[0] != 1:
+        return
+    result = rpc("db_delete", {"paths": [path]})
+    if result["status"] != [1] or get(path)[0] == 1:
+        raise RuntimeError(f"Cannot remove {path}: {result}")
+
+
 def main():
     if get("/Experiment/Name") != (1, "daq-dev"):
         raise RuntimeError("Port 8181 is not daq-dev")
@@ -97,11 +106,11 @@ def main():
     for name, target in (
             ("Run number", "/Runinfo/Run number"),
             ("Start time", "/Runinfo/Start time"),
-            ("Type", f"{RUN_PARAMETERS}/Type"),
-            ("Comment", f"{RUN_PARAMETERS}/Comment")):
+            ("Type", f"{RUN_PARAMETERS}/Type")):
         ensure_link(name, target, "BOR")
     for name, target in (
             ("Stop time", "/Runinfo/Stop time"),
+            ("Comment", f"{RUN_PARAMETERS}/Comment"),
             ("Duration", f"{root}/DurationSec"),
             ("VME events", f"{root}/VMEEvents"),
             ("EASIROC events", f"{root}/EASIROCEvents"),
@@ -109,6 +118,7 @@ def main():
             ("DAQ Status", f"{root}/DAQStatus"),
             ("DAQ Summary", f"{root}/DAQSummary")):
         ensure_link(name, target, "EOR")
+    remove_link("Comment", "BOR")
     set_value(f"{JSON_ROOT}/Write data", True)
     print("Configured daq-dev JSON Runlog on port 8181")
 

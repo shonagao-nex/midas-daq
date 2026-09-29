@@ -48,9 +48,9 @@ class FakeOdb:
 class RunElogTest(unittest.TestCase):
     def setUp(self):
         self.record = {
-            "BOR": {"Run number": 53, "Start time": "start", "Type": "Test",
-                    "Comment": "   "},
-            "EOR": {"Stop time": "stop", "Duration": "0x0000000000000007",
+            "BOR": {"Run number": 53, "Start time": "start", "Type": "Test"},
+            "EOR": {"Stop time": "stop", "Comment": "   ",
+                    "Duration": "0x0000000000000007",
                     "VME events": "10", "EASIROC events": "-1",
                     "DAQ Status": "WARNING", "DAQ Summary": "VME disconnected",
                     "EventSlipCount": "0x0000000000000002"},
@@ -63,6 +63,13 @@ class RunElogTest(unittest.TestCase):
                          "VME      : 10", "EASIROC  : N/A (not participating)",
                          "DAQ Summary: VME disconnected", "Event Slip : 2"):
             self.assertIn(expected, body)
+
+    def test_format_uses_final_eor_comment(self):
+        self.record["BOR"]["Comment"] = "old BOR comment"
+        self.record["EOR"]["Comment"] = "During run: detector adjusted"
+        _, body = run_elog.format_entry(53, self.record)
+        self.assertIn("Comment    : During run: detector adjusted", body)
+        self.assertNotIn("old BOR comment", body)
 
     def test_disabled_and_duplicate_attempt(self):
         odb = FakeOdb(enabled=False)

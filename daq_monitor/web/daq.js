@@ -1,5 +1,5 @@
 "use strict";
-const REFRESH_INTERVAL_MS=1000,MESSAGE_INTERVAL_MS=5000,MIDAS_SUCCESS=1,HISTORY_MAX_MS=24*60*60*1000;
+const REFRESH_INTERVAL_MS=1000,MESSAGE_INTERVAL_MS=5000,MIDAS_SUCCESS=1,HISTORY_MAX_MS=24*60*60*1000,COMMENT_SAVE_DELAY_MS=400;
 const ODB=Object.freeze({
  globalSeverity:"/DAQ/Status/Global/Severity",globalSummary:"/DAQ/Status/Global/Summary",canStart:"/DAQ/Status/Global/CanStart",canStartReason:"/DAQ/Status/Global/CanStartReason",alarmSystemActive:"/Alarms/Alarm system active",acquisitionTime:"/Logger/Run duration",vmeEventLimit:"/Equipment/VME/Common/Event limit",easirocEventLimit:"/Equipment/NIM-EASIROC Physics/Common/Event limit",runNumber:"/DAQ/Status/Run/RunNumber",runState:"/DAQ/Status/Run/State",controlRunState:"/Runinfo/State",transitionInProgress:"/Runinfo/Transition in progress",runDuration:"/DAQ/Status/Run/DurationSec",startTime:"/Runinfo/Start time",stopTime:"/Runinfo/Stop time",runType:"/Experiment/Run Parameters/Type",runComment:"/Experiment/Run Parameters/Comment",
  vmeSeverity:"/DAQ/Status/Frontends/VME/Severity",vmeReason:"/DAQ/Status/Frontends/VME/Reason",vmeConnected:"/DAQ/Status/Frontends/VME/Connected",vmeParticipating:"/DAQ/Status/Frontends/VME/Participating",vmeEventSlip:"/DAQ/Status/Frontends/VME/EventSlipCount",easirocSeverity:"/DAQ/Status/Frontends/EASIROC/Severity",easirocReason:"/DAQ/Status/Frontends/EASIROC/Reason",easirocConnected:"/DAQ/Status/Frontends/EASIROC/Connected",easirocParticipating:"/DAQ/Status/Frontends/EASIROC/Participating",
@@ -11,7 +11,7 @@ const ODB=Object.freeze({
 const MODULES=Object.freeze([
  {id:"v792",setting:"v792Enabled",link:"/Equipment/VME/Settings/V792"},{id:"v1190",setting:"v1190Enabled",link:"/Equipment/VME/Settings/V1190"},{id:"v1720e",setting:"v1720eEnabled",link:"/Equipment/VME/Settings/V1720E"},{id:"v775",setting:"v775Enabled",link:"/Equipment/VME/Settings/V775"},{id:"rpv130",setting:"rpv130Enabled",link:"/Equipment/VME/Settings/RPV130"},{id:"easiroc",setting:"easirocEnabled",link:"/Equipment/EASIROC/Settings"}
 ]);
-const ODB_PATHS=Object.values(ODB);let mockMode=false,mockScenario="running_ok",mockValues=null,currentValues={},transitionPending=false,transitionTarget=null,lastCanStart=false,lastRunState="—",lastControlRunState="—",lastTransitionInProgress=null,lastAlarmSystemActive=null,alarmTogglePending=false,lastMessageRefresh=0,historyWindowMs=10*60*1000,historyUpdateMs=1000,lastHistorySample=0,metadataWrite=Promise.resolve(),metadataPending=0;const togglePending=new Set(),rateHistory=[];
+const ODB_PATHS=Object.values(ODB);let mockMode=false,mockScenario="running_ok",mockValues=null,currentValues={},transitionPending=false,transitionTarget=null,lastCanStart=false,lastRunState="—",lastControlRunState="—",lastTransitionInProgress=null,lastAlarmSystemActive=null,alarmTogglePending=false,lastMessageRefresh=0,historyWindowMs=10*60*1000,historyUpdateMs=1000,lastHistorySample=0,metadataWrite=Promise.resolve(),metadataPending=0,commentSaveTimer=null;const togglePending=new Set(),rateHistory=[];
 const element=id=>document.getElementById(id),valid=v=>v!==null&&v!==undefined&&v!=="",truth=v=>v===true||v===1;
 function setText(id,value,fallback="—"){element(id).textContent=valid(value)?String(value):fallback}function count(value){const n=Number(value);return valid(value)&&Number.isFinite(n)?Math.trunc(n).toLocaleString("en-US"):"—"}function rate(value){const n=Number(value);return valid(value)&&Number.isFinite(n)?n.toLocaleString("en-US",{maximumFractionDigits:n<10?2:1}):"—"}function dataRate(value){const n=Number(value);return !valid(value)||!Number.isFinite(n)?"—":Math.abs(n)>=1000?`${(n/1000).toFixed(2)} MB/s`:`${n.toFixed(1)} kB/s`}function duration(value){const n=Number(value);return !Number.isFinite(n)||n<0?"—":[Math.floor(n/3600),Math.floor(n%3600/60),Math.floor(n%60)].map(x=>String(x).padStart(2,"0")).join(":")}function runState(value){return Number(value)===1?"STOPPED":Number(value)===2?"PAUSED":Number(value)===3?"RUNNING":"—"}function hex(value){const n=Number(value);return valid(value)&&Number.isFinite(n)?`0x${Math.trunc(n).toString(16).toUpperCase().padStart(8,"0")}`:"—"}
 function formatRunTime(value){if(!valid(value))return "—";const source=String(value).trim(),numeric=source.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})/);if(numeric)return `${numeric[1]}/${numeric[2].padStart(2,"0")}/${numeric[3].padStart(2,"0")} ${numeric[4].padStart(2,"0")}:${numeric[5]}:${numeric[6]}`;const monthNames={Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12},midas=source.match(/^(?:[A-Za-z]{3}\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})$/);if(midas&&monthNames[midas[1]])return `${midas[6]}/${String(monthNames[midas[1]]).padStart(2,"0")}/${midas[2].padStart(2,"0")} ${midas[3].padStart(2,"0")}:${midas[4]}:${midas[5]}`;const parsed=new Date(source);if(Number.isNaN(parsed.getTime()))return source;const part=number=>String(number).padStart(2,"0");return `${parsed.getFullYear()}/${part(parsed.getMonth()+1)}/${part(parsed.getDate())} ${part(parsed.getHours())}:${part(parsed.getMinutes())}:${part(parsed.getSeconds())}`}
@@ -40,7 +40,8 @@ function updateButtons(){
  upper.className=`run-button ${state==="STOPPED"?"start-button":"stop-button"}`;
  lower.textContent=state==="STOPPED"?"CLEAR":state==="RUNNING"?"PAUSE":"RESUME";
  lower.className="run-button";
- upper.disabled=mockMode||!stateKnown||transitionLocked||metadataPending>0||(state==="STOPPED"&&!lastCanStart);
+ upper.disabled=mockMode||!stateKnown||transitionLocked||
+  (state==="STOPPED"&&(metadataPending>0||!lastCanStart));
  lower.disabled=state==="STOPPED"?false:mockMode||!stateKnown||transitionLocked;
 }
 function sampleRates(vme,easiroc){const now=Date.now();if(now-lastHistorySample<historyUpdateMs)return;lastHistorySample=now;const v=Number(vme),e=Number(easiroc);rateHistory.push({time:now,vme:Number.isFinite(v)?v:null,easiroc:Number.isFinite(e)?e:null});while(rateHistory.length&&rateHistory[0].time<now-HISTORY_MAX_MS)rateHistory.shift();drawRateHistory()}
@@ -143,23 +144,28 @@ async function toggleAlarmSystem(){
  }
 }
 function renderMetadata(){
- const editable=lastControlRunState==="STOPPED"&&!transitionPending&&
-  valid(lastTransitionInProgress)&&Number(lastTransitionInProgress)===0;
+ const ready=!transitionPending&&valid(lastTransitionInProgress)&&Number(lastTransitionInProgress)===0;
  for(const [id,key] of [["run-type","runType"],["run-comment","runComment"]]){
   const input=element(id),value=currentValues[ODB[key]];
   const exists=value!==null&&value!==undefined;
-  input.disabled=!editable||!exists||metadataPending>0;
+  const editable=id==="run-type"?lastControlRunState==="STOPPED":
+   ["STOPPED","RUNNING","PAUSED"].includes(lastControlRunState);
+  input.disabled=!ready||!editable||!exists||(id==="run-type"&&metadataPending>0);
   if(document.activeElement!==input&&metadataPending===0&&exists)input.value=String(value);
  }
 }
 function saveMetadata(id,requestedValue){
  const input=element(id),key=id==="run-type"?"runType":"runComment",path=ODB[key],value=requestedValue===undefined?input.value:requestedValue;
+ if(id==="run-comment"&&commentSaveTimer!==null){clearTimeout(commentSaveTimer);commentSaveTimer=null}
  if(mockMode){mockValues[path]=value;currentValues[path]=value;renderMetadata();return Promise.resolve(true)}
  metadataPending++;renderMetadata();updateButtons();
  const operation=metadataWrite.catch(()=>false).then(async()=>{
-  if(lastControlRunState!=="STOPPED"||transitionPending)return false;
+  const stateAllowed=id==="run-type"?lastControlRunState==="STOPPED":
+   ["STOPPED","RUNNING","PAUSED"].includes(lastControlRunState);
+  if(!stateAllowed||transitionPending)return false;
   const state=await mjsonrpc_db_get_values([ODB.controlRunState,ODB.transitionInProgress]);
-  if(Number(state.result.data[0])!==1||Number(state.result.data[1])!==0)
+  const stateCode=Number(state.result.data[0]);
+  if((id==="run-type"?stateCode!==1:![1,2,3].includes(stateCode))||Number(state.result.data[1])!==0)
    throw new Error("Run state changed before metadata could be saved");
   if(currentValues[path]===value)return true;
   const write=await mjsonrpc_db_set_value(path,value);
@@ -186,10 +192,24 @@ async function requestStart(){
  }
  requestTransition("TR_START");
 }
-async function requestTransition(transition){const state=lastControlRunState,allowed=transition==="TR_START"?state==="STOPPED"&&lastCanStart:transition==="TR_STOP"?state==="RUNNING"||state==="PAUSED":transition==="TR_PAUSE"?state==="RUNNING":transition==="TR_RESUME"&&state==="PAUSED";if(mockMode||transitionPending||!allowed||!valid(lastTransitionInProgress)||Number(lastTransitionInProgress)!==0)return;const target={TR_START:"RUNNING",TR_STOP:"STOPPED",TR_PAUSE:"PAUSED",TR_RESUME:"RUNNING"}[transition],action={TR_START:"Starting",TR_STOP:"Stopping",TR_PAUSE:"Pausing",TR_RESUME:"Resuming"}[transition];transitionPending=true;renderMetadata();updateButtons();setText("transition-status",`${action} run…`);try{const rpc=await mjsonrpc_call("cm_transition",{transition});if(rpc.result.status!==MIDAS_SUCCESS)throw new Error(rpc.result.error_string||`MIDAS transition status ${rpc.result.status}`);transitionTarget=target;setText("transition-status",`${action} run requested`)}catch(error){transitionPending=false;transitionTarget=null;showError(`Transition failed: ${decodeError(error)}`);setText("transition-status","Transition failed")}finally{renderMetadata();updateButtons()}}
+async function requestTransition(transition){
+ const state=lastControlRunState,allowed=transition==="TR_START"?state==="STOPPED"&&lastCanStart:
+  transition==="TR_STOP"?state==="RUNNING"||state==="PAUSED":
+  transition==="TR_PAUSE"?state==="RUNNING":transition==="TR_RESUME"&&state==="PAUSED";
+ if(mockMode||transitionPending||!allowed||!valid(lastTransitionInProgress)||Number(lastTransitionInProgress)!==0)return;
+ // Flush the current draft before STOP so Logger's EOR link sees the last edit.
+ // A metadata write failure must not prevent the DAQ from stopping.
+ if(transition==="TR_STOP")await saveMetadata("run-comment",element("run-comment").value);
+ if(transitionPending||lastControlRunState!==state||Number(lastTransitionInProgress)!==0)return;
+ const target={TR_START:"RUNNING",TR_STOP:"STOPPED",TR_PAUSE:"PAUSED",TR_RESUME:"RUNNING"}[transition],action={TR_START:"Starting",TR_STOP:"Stopping",TR_PAUSE:"Pausing",TR_RESUME:"Resuming"}[transition];
+ transitionPending=true;renderMetadata();updateButtons();setText("transition-status",`${action} run…`);
+ try{const rpc=await mjsonrpc_call("cm_transition",{transition});if(rpc.result.status!==MIDAS_SUCCESS)throw new Error(rpc.result.error_string||`MIDAS transition status ${rpc.result.status}`);transitionTarget=target;setText("transition-status",`${action} run requested`)}
+ catch(error){transitionPending=false;transitionTarget=null;showError(`Transition failed: ${decodeError(error)}`);setText("transition-status","Transition failed")}
+ finally{renderMetadata();updateButtons()}
+}
 function requestManualBufferClear(){window.location.assign(mockMode?"buffer-clear.html?mock=1":"/buffer-clear.html")}
 function seedMockHistory(){if(rateHistory.length>1)return;const now=Date.now(),vme=Number(mockValues[ODB.vmeEventRate])||0,easiroc=Number(mockValues[ODB.easirocEventRate])||0;rateHistory.length=0;for(let i=1440;i>0;i--)rateHistory.push({time:now-i*60000,vme:Math.max(0,vme+Math.sin(i/17)*55),easiroc:Math.max(0,easiroc+Math.cos(i/23)*42)})}
 function selectMockScenario(name){if(!window.DAQ_MOCK_SCENARIOS[name])return;mockScenario=name;mockValues={...window.DAQ_MOCK_SCENARIOS[name]};mockValues[ODB.controlRunState]=mockValues[ODB.runState];mockValues[ODB.transitionInProgress]=0;mockValues[ODB.alarmSystemActive]=true;mockValues[ODB.acquisitionTime]=currentValues[ODB.acquisitionTime]??0;mockValues[ODB.vmeEventLimit]=currentValues[ODB.vmeEventLimit]??0;mockValues[ODB.easirocEventLimit]=currentValues[ODB.easirocEventLimit]??0;document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.classList.toggle("active",button.dataset.mockScenario===name));seedMockHistory();render(mockValues);renderMessages(window.DAQ_MOCK_MESSAGES)}
 function mockRefresh(){if(!mockMode)return;const running=runState(mockValues[ODB.runState])==="RUNNING",phase=Date.now()/3500;if(running){mockValues[ODB.vmeEventRate]=1248+55*Math.sin(phase);mockValues[ODB.easirocEventRate]=1244+42*Math.cos(phase*.9);mockValues[ODB.runDuration]=Number(mockValues[ODB.runDuration])+1}render(mockValues);window.setTimeout(mockRefresh,REFRESH_INTERVAL_MS)}
-function setupLinksAndEvents(){MODULES.forEach(module=>{element(`${module.id}-link`).href=`?cmd=odb&odb_path=${encodeURIComponent(module.link)}`;element(`${module.id}-toggle`).addEventListener("click",()=>setModuleEnabled(module))});element("upper-run-button").addEventListener("click",()=>lastControlRunState==="STOPPED"?requestStart():requestTransition("TR_STOP"));element("lower-run-button").addEventListener("click",()=>{if(lastControlRunState==="STOPPED")requestManualBufferClear();else if(lastControlRunState==="RUNNING")requestTransition("TR_PAUSE");else if(lastControlRunState==="PAUSED")requestTransition("TR_RESUME")});element("alarm-toggle").addEventListener("click",toggleAlarmSystem);["run-type","run-comment"].forEach(id=>element(id).addEventListener("change",()=>saveMetadata(id)));element("cancel-empty-comment").addEventListener("click",()=>element("empty-comment-dialog").close());element("start-anyway").addEventListener("click",()=>{element("empty-comment-dialog").close();requestTransition("TR_START")});["acquisition-time","event-limit"].forEach(id=>{element(id).addEventListener("change",()=>saveLimit(id));element(id).addEventListener("input",event=>event.target.setCustomValidity(""))});document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.addEventListener("click",()=>selectMockScenario(button.dataset.mockScenario)));document.querySelectorAll("[data-history-minutes]").forEach(button=>button.addEventListener("click",()=>setHistoryWindow(Number(button.dataset.historyMinutes))));document.querySelectorAll("[data-history-seconds]").forEach(button=>button.addEventListener("click",()=>setHistoryUpdate(Number(button.dataset.historySeconds))));window.addEventListener("resize",drawRateHistory)}
+function setupLinksAndEvents(){MODULES.forEach(module=>{element(`${module.id}-link`).href=`?cmd=odb&odb_path=${encodeURIComponent(module.link)}`;element(`${module.id}-toggle`).addEventListener("click",()=>setModuleEnabled(module))});element("upper-run-button").addEventListener("click",()=>lastControlRunState==="STOPPED"?requestStart():requestTransition("TR_STOP"));element("lower-run-button").addEventListener("click",()=>{if(lastControlRunState==="STOPPED")requestManualBufferClear();else if(lastControlRunState==="RUNNING")requestTransition("TR_PAUSE");else if(lastControlRunState==="PAUSED")requestTransition("TR_RESUME")});element("alarm-toggle").addEventListener("click",toggleAlarmSystem);["run-type","run-comment"].forEach(id=>element(id).addEventListener("change",()=>saveMetadata(id)));element("run-comment").addEventListener("input",()=>{if(commentSaveTimer!==null)clearTimeout(commentSaveTimer);commentSaveTimer=setTimeout(()=>{commentSaveTimer=null;saveMetadata("run-comment")},COMMENT_SAVE_DELAY_MS)});element("cancel-empty-comment").addEventListener("click",()=>element("empty-comment-dialog").close());element("start-anyway").addEventListener("click",()=>{element("empty-comment-dialog").close();requestTransition("TR_START")});["acquisition-time","event-limit"].forEach(id=>{element(id).addEventListener("change",()=>saveLimit(id));element(id).addEventListener("input",event=>event.target.setCustomValidity(""))});document.querySelectorAll("[data-mock-scenario]").forEach(button=>button.addEventListener("click",()=>selectMockScenario(button.dataset.mockScenario)));document.querySelectorAll("[data-history-minutes]").forEach(button=>button.addEventListener("click",()=>setHistoryWindow(Number(button.dataset.historyMinutes))));document.querySelectorAll("[data-history-seconds]").forEach(button=>button.addEventListener("click",()=>setHistoryUpdate(Number(button.dataset.historySeconds))));window.addEventListener("resize",drawRateHistory)}
 function initializeDashboard(){mhttpdConfigSet("speakTalk",false);mhttpdConfigSet("alarmSound",true);updateAlarmButton();setupLinksAndEvents();setHistoryWindow(10);setHistoryUpdate(1);const query=new URLSearchParams(window.location.search);mockMode=query.has("mock");if(mockMode){document.body.classList.add("mock-mode");element("mock-notice").hidden=false;const requested=query.get("mock"),scenario=requested==="stopped"?"stopped_warning":requested==="error"?"running_error":"running_ok";selectMockScenario(scenario);window.setTimeout(mockRefresh,REFRESH_INTERVAL_MS);return}mhttpd_init("DAQ",REFRESH_INTERVAL_MS);refreshDashboard()}
