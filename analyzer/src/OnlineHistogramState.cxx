@@ -4,6 +4,7 @@
 #include "mvodb.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -57,8 +58,9 @@ void OnlineHistogramState::PollPdfRequest(MVOdb* odb) {
   request_directory->RS("OutputFile", &output_file, false, 0, &error);
   if (error.fError) output_file.clear();
 
-  const std::filesystem::path plot_directory(
-      "/home/daq/midas/midas/plots");
+  const char* home = std::getenv("HOME");
+  const std::filesystem::path plot_directory =
+      std::filesystem::path(home ? home : "") / "midas/midas/plots";
   if (output_file.empty()) {
     const std::time_t now = std::time(nullptr);
     std::tm local{};

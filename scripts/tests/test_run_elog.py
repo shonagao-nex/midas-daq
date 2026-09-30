@@ -23,6 +23,7 @@ class FakeOdb:
             f"{root}/Author": "DAQ",
             f"{root}/Type": "Routine",
             f"{root}/System": "DAQ",
+            f"{root}/Web Port": 8181,
         }
         self.errors = []
 
@@ -32,7 +33,7 @@ class FakeOdb:
     def boolean(self, path):
         return self.values[path]
 
-    def string(self, path):
+    def string(self, path, optional=False):
         return self.values[path]
 
     def set_integer(self, path, value):
@@ -67,6 +68,18 @@ class RunElogTest(unittest.TestCase):
                          "HUL      : N/A (not participating)", "Scaler     : N/A",
                          "DAQ Summary: VME disconnected", "Event Slip : 2"):
             self.assertIn(expected, body)
+
+    def test_storage_paths_follow_runtime_layout(self):
+        odb = FakeOdb()
+        odb.values["/Logger/Elog dir"] = str(run_elog.RUNTIME / "elog")
+        odb.values["/Logger/Message dir"] = str(run_elog.RUNTIME / "log")
+        odb.values["/Logger/Runlog/JSON/Subdir"] = "../runlogs"
+        self.assertEqual(run_elog.elog_file(odb).parent, run_elog.RUNTIME / "elog")
+        self.assertEqual(run_elog.runlog_path(odb, 53),
+                         run_elog.RUNTIME / "runlogs/runlog_000053.json")
+        odb.values["/Logger/Runlog/JSON/Subdir"] = "../../other"
+        with self.assertRaisesRegex(RuntimeError, "Runlog directory"):
+            run_elog.runlog_path(odb, 53)
 
     def test_scaler_displays_only_present_channels_in_order(self):
         self.record["EOR"]["HUL events"] = "12"

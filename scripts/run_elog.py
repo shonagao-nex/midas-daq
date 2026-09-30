@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post one completed daq-dev JSON Runlog to the MIDAS Built-in ELOG."""
+"""Post one completed JSON Runlog to the experiment's built-in ELOG."""
 
 import argparse
 import ctypes
@@ -14,10 +14,12 @@ import tempfile
 import time
 
 
-EXPTAB = "/home/nagao/midas/midas/exptab"
-LIBMIDAS = "/home/nagao/midas/midas_src/lib/libmidas-c-compat.so"
-MELOG = "/home/nagao/midas/midas_src/bin/melog"
-LOCK = "/tmp/midas-daq-dev-run-elog.lock"
+HOME = Path.home()
+RUNTIME = HOME / "midas/midas"
+EXPTAB = RUNTIME / "exptab"
+LIBMIDAS = HOME / "midas/midas_src/lib/libmidas-c-compat.so"
+MELOG = HOME / "midas/midas_src/bin/melog"
+LOCK = Path(tempfile.gettempdir()) / f"midas-run-elog-{os.getuid()}.lock"
 ROOT = "/Experiment/Run Elog"
 TIMEOUT_SECONDS = 10
 RUNLOG_RETRY_INTERVAL_SECONDS = 0.2
@@ -26,9 +28,14 @@ RUNLOG_MAX_WAIT_SECONDS = 5.0
 
 class Odb:
     def __init__(self):
-        if os.environ.get("MIDAS_EXPTAB") != EXPTAB:
-            raise RuntimeError("Refusing to connect outside daq-dev EXPTAB")
-        self.lib = ctypes.CDLL(LIBMIDAS)
+        if os.environ.get("MIDAS_EXPTAB") != str(EXPTAB):
+            raise RuntimeError("MIDAS_EXPTAB does not match the user runtime")
+        experiment = os.environ.get("MIDAS_EXPT_NAME", "")
+        if not experiment or not any(
+                line.split() and line.split()[0] == experiment
+                for line in EXPTAB.read_text(encoding="utf-8").splitlines()):
+            raise RuntimeError("Experiment is absent from the user EXPTAB")
+        self.lib = ctypes.CDLL(str(LIBMIDAS))
         self.lib.c_cm_connect_experiment.argtypes = [ctypes.c_char_p] * 3 + [ctypes.c_void_p]
         self.lib.c_cm_connect_experiment.restype = ctypes.c_int
         self.lib.c_cm_get_experiment_database.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_void_p]
@@ -45,15 +52,15 @@ class Odb:
         self.lib.c_cm_msg.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                                       ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         self.lib.c_cm_msg.restype = ctypes.c_int
-        if self.lib.c_cm_connect_experiment(b"", b"daq-dev", b"run_elog", None) != 1:
-            raise RuntimeError("Cannot connect to daq-dev ODB")
+        if self.lib.c_cm_connect_experiment(b"", experiment.encode(), b"run_elog", None) != 1:
+            raise RuntimeError("Cannot connect to configured ODB")
         self.handle = ctypes.c_int()
         if self.lib.c_cm_get_experiment_database(ctypes.byref(self.handle), None) != 1:
             self.close()
-            raise RuntimeError("Cannot get daq-dev ODB handle")
-        if self.string("/Experiment/Name") != "daq-dev":
+            raise RuntimeError("Cannot get experiment ODB handle")
+        if self.string("/Experiment/Name") != experiment:
             self.close()
-            raise RuntimeError("Connected experiment is not daq-dev")
+            raise RuntimeError("Connected experiment name mismatch")
 
     def close(self):
         self.lib.c_cm_disconnect_experiment()
@@ -171,10 +178,9 @@ def format_entry(run, record):
 
 
 def elog_file(odb):
-    directory = odb.string("/Logger/Elog dir", optional=True) or odb.string("/Logger/Data dir")
-    path = Path(directory).resolve()
-    if not str(path).startswith("/home/nagao/"):
-        raise RuntimeError("Refusing ELOG storage outside /home/nagao")
+    path = Path(odb.string("/Logger/Elog dir")).resolve()
+    if path != RUNTIME / "elog":
+        raise RuntimeError("ELOG directory does not match the user runtime")
     return path / datetime.datetime.now().strftime("%y%m%d.log")
 
 
@@ -190,8 +196,8 @@ def runlog_path(odb, run):
     directory = odb.string("/Logger/Message dir", optional=True) or odb.string("/Logger/Data dir")
     path = (Path(directory) / odb.string("/Logger/Runlog/JSON/Subdir") /
             f"runlog_{run:06d}.json").resolve()
-    if not str(path).startswith("/home/nagao/"):
-        raise RuntimeError("Refusing Runlog outside /home/nagao")
+    if path.parent != RUNTIME / "runlogs":
+        raise RuntimeError("Runlog directory does not match the user runtime")
     return path
 
 
@@ -223,7 +229,7 @@ def read_complete_runlog(odb, run, max_wait_seconds=RUNLOG_MAX_WAIT_SECONDS,
         time.sleep(min(retry_interval_seconds, remaining))
 
 
-def post_melog(run, subject, body, author, category, system):
+def post_melog(run, subject, body, author, category, system, port):
     attrs = (f"Author={author}", f"Type={category}", f"System={system}",
              f"Subject={subject}", f"Run={run}")
     if any(len(attr.encode("utf-8")) >= 100 for attr in attrs):
@@ -231,7 +237,7 @@ def post_melog(run, subject, body, author, category, system):
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=True) as message:
         message.write(body)
         message.flush()
-        command = [MELOG, "-h", "127.0.0.1", "-p", "8181"]
+        command = [str(MELOG), "-h", "127.0.0.1", "-p", str(port)]
         for attr in attrs:
             command.extend(("-a", attr))
         command.extend(("-m", message.name))
@@ -271,8 +277,11 @@ def process_run(odb, run, retry=False, *,
         subject, body = format_entry(run, record)
         target = elog_file(odb)
         if not entry_exists(target, run, subject):
+            port = odb.integer(f"{ROOT}/Web Port")
+            if not 1 <= port <= 65535:
+                raise ValueError("Invalid Run ELOG Web Port")
             post_melog(run, subject, body, odb.string(f"{ROOT}/Author"),
-                       odb.string(f"{ROOT}/Type"), odb.string(f"{ROOT}/System"))
+                       odb.string(f"{ROOT}/Type"), odb.string(f"{ROOT}/System"), port)
         if not entry_exists(target, run, subject):
             raise RuntimeError("melog reported success but Built-in ELOG entry was not found")
         odb.set_integer(f"{ROOT}/Last Run", run)

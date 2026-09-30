@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -12,8 +13,10 @@
 namespace ana {
 namespace {
 
-constexpr const char* kRootOutputDirectory =
-    "/home/daq/midas/midas/rootfiles";
+std::filesystem::path RootOutputDirectory() {
+  const char* home = std::getenv("HOME");
+  return std::filesystem::path(home ? home : "") / "midas/midas/rootfiles";
+}
 
 bool StartsWith(const std::string& text, const char* prefix) {
   return text.rfind(prefix, 0) == 0;
@@ -48,14 +51,14 @@ std::string DefaultOutputName(const std::string& input) {
     name.resize(name.size() - 8);
   else if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".mid") == 0)
     name.resize(name.size() - 4);
-  return (std::filesystem::path(kRootOutputDirectory) / (name + ".root"))
+  return (RootOutputDirectory() / (name + ".root"))
       .string();
 }
 
 std::string ResolveOutputName(const std::string& requested) {
   const std::filesystem::path path(requested);
   if (path.is_absolute() || !path.parent_path().empty()) return path.string();
-  return (std::filesystem::path(kRootOutputDirectory) / path).string();
+  return (RootOutputDirectory() / path).string();
 }
 
 }  // namespace
@@ -253,7 +256,8 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "Options:\n"
        << "  -f FILE    Input MIDAS file for offline analysis\n"
        << "  -w FILE    Offline ROOT output filename\n"
-       << "             Default: /home/daq/midas/midas/rootfiles/<input>.root\n"
+       << "             Default: " << RootOutputDirectory().string()
+       << "/<input>.root\n"
        << "  -n N       Process at most N decoded events (0 = unlimited)\n"
        << "  -h         Show this help\n\n"
        << "Management option:\n"

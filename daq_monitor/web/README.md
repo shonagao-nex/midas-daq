@@ -6,7 +6,8 @@
 ODB on port 8181. It reads `/runlogs/runlog_index.json`, applies
 `/runlogs/runlog_selection.json`, and requests ten listed JSON Runlog
 files per page through mhttpd, with four requests in flight. The `runlogs`
-symlink in this directory points to the development Runlog directory. It does
+symlink in this directory points to `$HOME/midas/midas/runlogs` relative to
+the common repository layout. It does
 not probe missing run numbers or modify Runlogs.
 The `experiment_label` field in each Runlog's BOR section records
 `/Experiment/Run Parameters/ExperimentLabel` when Logger starts that run.
@@ -21,10 +22,10 @@ refresh leaves the previous index intact and cannot fail STOP. The index is
 derived data; never edit the standard MIDAS JSON Runlogs to change the list.
 The monitor finds the index script relative to its own `bin/daq_monitor`
 executable, so deployments need both the binary and `scripts/` in the same
-repository layout. Restart the development monitor to activate a rebuilt
-binary; rebuilding alone does not replace the running process. A separate
-deployment must point its `web/runlogs` link at that environment's own Runlog
-directory and regenerate the index there.
+repository layout. Restart the monitor to activate a rebuilt binary;
+rebuilding alone does not replace the running process. Each environment keeps
+its own Runlog directory and index; the relative `web/runlogs` link works in
+both layouts.
 
 Keep `runlog_selection.json` in the same directory. Its default content is
 `{"runs":[]}`: an empty array selects every indexed run. To filter, edit it
@@ -33,6 +34,12 @@ this file. Unknown runs are ignored, duplicates are removed, and the result
 is sorted newest first. Invalid or unreadable selection falls back to the
 full index with a page warning. Deploy the default file before opening the
 page so normal operation never requests a missing selection resource.
+
+For the shared user layout, set `/Logger/Message dir` to
+`$HOME/midas/midas/log` and `/Logger/Runlog/JSON/Subdir` to `../runlogs`.
+MIDAS then writes JSON files in `$HOME/midas/midas/runlogs`; the Web symlink
+serves that same directory. Keep `/Logger/Data dir` and `/Logger/Elog dir`
+pointed at their separate `data` and `elog` directories.
 
 MIDAS BOR-only files can end with a comma until Logger appends EOR. The page
 displays these as `INCOMPLETE`. Scaler details show only channels present in

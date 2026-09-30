@@ -1,6 +1,8 @@
 #include "AnalyzerCli.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,9 @@ bool Contains(const std::vector<std::string>& values,
 
 int main() {
   bool okay = true;
+  const char* home = std::getenv("HOME");
+  const auto rootfiles = std::filesystem::path(home ? home : "") /
+                         "midas/midas/rootfiles";
 
   const auto online = ana::ParseAnalyzerCli({"midas_analyzer"});
   okay &= Check(online.okay &&
@@ -101,7 +106,7 @@ int main() {
                     !ana::ParseAnalyzerCli({"midas_analyzer", "-R65536"}).okay,
                 "invalid ROOT web ports should be rejected");
   okay &= Check(offline.output_file ==
-                    "/home/daq/midas/midas/rootfiles/run00062.root",
+                    (rootfiles / "run00062.root").string(),
                 "offline default filename should strip .mid.lz4");
   okay &= Check(offline.inspector_options.decoded_event_limit == 100,
                 "-n should set the decoded event limit");
@@ -121,7 +126,7 @@ int main() {
   const auto relative = ana::ParseAnalyzerCli(
       {"midas_analyzer", "-f", "run.mid", "-w", "test.root"});
   okay &= Check(relative.output_file ==
-                    "/home/daq/midas/midas/rootfiles/test.root",
+                    (rootfiles / "test.root").string(),
                 "relative basename output should use rootfiles");
 
   const auto absolute = ana::ParseAnalyzerCli(

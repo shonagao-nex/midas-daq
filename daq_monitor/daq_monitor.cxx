@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,10 +42,6 @@ constexpr std::size_t kTransitionErrorCapacity = 256;
 constexpr char kVmeClientName[] = "fevme";
 constexpr char kEasirocClientName[] = "feeasiroc";
 constexpr char kLoggerClientName[] = "Logger";
-constexpr char kRunElogScript[] =
-    "/home/nagao/midas/midas/online/scripts/run_elog.py";
-constexpr char kDevelopmentRunlogDirectory[] =
-    "/home/nagao/midas/midas/daq-dev/runlogs";
 
 volatile std::sig_atomic_t gStopRequested = 0;
 HNDLE gDatabase = 0;
@@ -1022,9 +1019,20 @@ void maybe_spawn_run_elog(INT* last_spawned_run) {
 
   char run_text[32] = {};
   std::snprintf(run_text, sizeof(run_text), "%d", eor_run);
+  std::error_code path_error;
+  const auto executable = std::filesystem::read_symlink("/proc/self/exe", path_error);
+  const auto script = executable.parent_path().parent_path().parent_path() /
+                      "scripts/run_elog.py";
+  if (path_error || !std::filesystem::is_regular_file(script)) {
+    cm_msg(MERROR, kClientName, "Run ELOG script is unavailable: %s",
+           script.c_str());
+    *last_spawned_run = eor_run;
+    return;
+  }
+  const std::string script_name = script.string();
   char* const arguments[] = {
       const_cast<char*>("/usr/bin/python3"),
-      const_cast<char*>(kRunElogScript),
+      const_cast<char*>(script_name.c_str()),
       const_cast<char*>("--run"), run_text, nullptr};
   pid_t child = 0;
   const int result = posix_spawn(&child, arguments[0], nullptr, nullptr,
@@ -1119,7 +1127,9 @@ std::optional<std::filesystem::path> edit_runlog_directory() {
   std::error_code error;
   const auto path = std::filesystem::weakly_canonical(
       std::filesystem::path(directory) / subdir, error);
-  if (error || path != std::filesystem::path(kDevelopmentRunlogDirectory))
+  const char* home = std::getenv("HOME");
+  if (error || !home || !*home ||
+      path != std::filesystem::path(home) / "midas/midas/runlogs")
     return std::nullopt;
   return path;
 }

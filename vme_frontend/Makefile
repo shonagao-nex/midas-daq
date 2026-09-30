@@ -1,6 +1,6 @@
 # Makefile for fevme with CAEN V3718 backend
 
-MIDASSYS ?= /home/daq/midas/midas_src
+MIDASSYS ?= $(HOME)/midas/midas_src
 
 CXX      = g++
 CC       = gcc

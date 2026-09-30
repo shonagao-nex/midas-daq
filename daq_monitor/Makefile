@@ -4,7 +4,7 @@ CPPFLAGS += -I$(MIDASSYS)/include -MMD -MP
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic
 
-MIDASSYS ?= /home/daq/midas/midas_src
+MIDASSYS ?= $(HOME)/midas/midas_src
 MIDASLIB := $(MIDASSYS)/lib/libmidas.a
 LIBS := -lsqlite3 -lm -lz -lutil -lpthread
 

@@ -46,6 +46,7 @@ def main():
     create(f"{ROOT}/Last Attempt Run", 7, current_run)
     create(f"{ROOT}/Last Status", 12, "DISABLED", 64)
     create(f"{ROOT}/Last Error", 12, "", 1024)
+    create(f"{ROOT}/Web Port", 7, 8181)
     create("/DAQ/Status/Runlog/EORCompleteRunNumber", 7, 0)
     print("Configured daq-dev Built-in ELOG settings")
 

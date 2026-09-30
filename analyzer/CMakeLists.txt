@@ -8,10 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(MIDASSYS "$ENV{MIDASSYS}" CACHE PATH "MIDAS installation prefix")
 if(NOT MIDASSYS)
-  set(MIDASSYS "/home/daq/midas/midas_src")
+  set(MIDASSYS "$ENV{HOME}/midas/midas_src")
 endif()
 
-set(ROOTANA_DIR "/home/daq/midas/rootana" CACHE PATH "ROOTANA installation prefix")
+set(ROOTANA_DIR "$ENV{HOME}/midas/rootana" CACHE PATH "ROOTANA installation prefix")
 
 find_package(ROOT REQUIRED COMPONENTS Core RIO Tree Hist Graf Gpad)
 
