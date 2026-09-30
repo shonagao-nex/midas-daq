@@ -20,7 +20,7 @@ std::string readFile(const char* path) {
 int main() {
   const std::string source = readFile("feeasiroc.cxx");
   const auto begin =
-      source.find("void process_manual_buffer_clear_request()");
+      source.find("std::optional<DWORD> accept_manual_buffer_clear_request()");
   const auto end = source.find("void reset_software_readout_state()", begin);
   expect(begin != std::string::npos && end != std::string::npos,
          "cannot isolate EASIROC manual clear function");

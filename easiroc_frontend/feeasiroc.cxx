@@ -439,27 +439,42 @@ void process_manual_apply_request() {
 }
 
 //************************************//
-// Handle an EASIROC buffer-clear request
+// Accept and publish a new manual buffer-clear request
 //************************************//
-void process_manual_buffer_clear_request() {
+std::optional<DWORD> accept_manual_buffer_clear_request() {
   const std::string request_path =
       odb_path(kCommandsPath, "BufferClearRequestId");
   DWORD request_id = 0;
   if (!read_odb_dword(request_path, &request_id) ||
       request_id <= g_state.buffer_clear.last_handled_request_id)
-    return;
+    return std::nullopt;
 
   const auto transition =
       daq::beginBufferClearRequest(g_state.buffer_clear, request_id);
-  if (!transition.handled) return;
+  if (!transition.handled) return std::nullopt;
   g_state.buffer_clear = transition.pending;
   g_state.buffer_clear_result = "Not attempted";
   g_state.buffer_clear_drained_bytes = 0;
   publish_runtime_variables();
+  return request_id;
+}
 
-  const std::time_t now = std::time(nullptr);
-  const std::uint64_t unix_time =
-      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+//************************************//
+// Reject a manual buffer-clear request and publish its status
+//************************************//
+void reject_manual_buffer_clear_request(const std::string& error,
+                                        std::uint64_t unix_time) {
+  g_state.buffer_clear = daq::rejectBufferClearRequest(
+      g_state.buffer_clear, error, unix_time);
+  g_state.buffer_clear_result = "Not attempted: " + error;
+  publish_runtime_variables();
+}
+
+//************************************//
+// Verify STOPPED state and snapshot TCP settings for buffer clear
+//************************************//
+std::optional<FrontendSettings> prepare_manual_buffer_clear(
+    DWORD request_id, std::uint64_t unix_time) {
   bool run_state_ok = false;
   const auto run_state = read_manual_apply_run_state(&run_state_ok);
   if (!run_state_ok || run_state != easiroc::ManualApplyRunState::kStopped) {
@@ -473,35 +488,78 @@ void process_manual_buffer_clear_request() {
                           : daq::BufferClearRunState::kUnknown));
     const std::string error = daq::bufferClearRunStateRejection(
         clear_run_state, "EASIROC receive");
-    g_state.buffer_clear = daq::rejectBufferClearRequest(
-        g_state.buffer_clear, error, unix_time);
-    g_state.buffer_clear_result = "Not attempted: " + error;
-    publish_runtime_variables();
+    reject_manual_buffer_clear_request(error, unix_time);
     cm_msg(MINFO, "manual_buffer_clear", "Request %u rejected: %s",
            static_cast<unsigned>(request_id), error.c_str());
-    return;
+    return std::nullopt;
   }
   if (g_state.run_active || g_state.runtime.acquisition_running ||
       g_state.tcp) {
     const std::string error =
         "Frontend acquisition state is active despite MIDAS STOPPED";
-    g_state.buffer_clear = daq::rejectBufferClearRequest(
-        g_state.buffer_clear, error, unix_time);
-    g_state.buffer_clear_result = "Not attempted: " + error;
-    publish_runtime_variables();
-    return;
+    reject_manual_buffer_clear_request(error, unix_time);
+    return std::nullopt;
   }
 
   FrontendSettings settings;
   if (read_settings(&settings) != SUCCESS) {
     const std::string error =
         "Cannot snapshot EASIROC network settings";
-    g_state.buffer_clear = daq::rejectBufferClearRequest(
-        g_state.buffer_clear, error, unix_time);
-    g_state.buffer_clear_result = "Not attempted: " + error;
-    publish_runtime_variables();
-    return;
+    reject_manual_buffer_clear_request(error, unix_time);
+    return std::nullopt;
   }
+  return settings;
+}
+
+//************************************//
+// Record a successful TCP drain and manual buffer-clear result
+//************************************//
+void complete_manual_buffer_clear_success(DWORD request_id,
+                                          std::size_t drained,
+                                          std::uint64_t unix_time) {
+  g_state.buffer_clear_drained_bytes = drained;
+  g_state.runtime.statistics.last_drain_bytes = drained;
+  g_state.runtime.statistics.total_drain_bytes += drained;
+  g_state.buffer_clear_result =
+      "Succeeded: host TCP receive drain; no device FIFO-clear command "
+      "issued; discarded " +
+      std::to_string(drained) + " byte(s)";
+  g_state.buffer_clear = daq::finishBufferClearRequest(
+      g_state.buffer_clear, true, "", unix_time);
+  cm_msg(MINFO, "manual_buffer_clear",
+         "Request %u EASIROC TCP drain succeeded: discarded %zu byte(s); "
+         "no device FIFO-clear, reset, or configuration command issued",
+         static_cast<unsigned>(request_id), drained);
+}
+
+//************************************//
+// Record a failed TCP drain and manual buffer-clear result
+//************************************//
+void complete_manual_buffer_clear_failure(DWORD request_id,
+                                          const std::exception& exception,
+                                          std::uint64_t unix_time) {
+  const std::string error =
+      std::string("EASIROC TCP receive drain failed: ") + exception.what();
+  g_state.buffer_clear_result = "Failed: " + error;
+  g_state.buffer_clear = daq::finishBufferClearRequest(
+      g_state.buffer_clear, false, error, unix_time);
+  cm_msg(MERROR, "manual_buffer_clear", "Request %u failed: %s",
+         static_cast<unsigned>(request_id), error.c_str());
+}
+
+//************************************//
+// Handle an EASIROC buffer-clear request
+//************************************//
+void process_manual_buffer_clear_request() {
+  const auto request_id = accept_manual_buffer_clear_request();
+  if (!request_id) return;
+
+  const std::time_t now = std::time(nullptr);
+  const std::uint64_t unix_time =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  const auto settings = prepare_manual_buffer_clear(*request_id, unix_time);
+  if (!settings) return;
+
   if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
   publish_completed_diagnostic();
 
@@ -509,33 +567,15 @@ void process_manual_buffer_clear_request() {
       daq::markBufferClearExecuting(g_state.buffer_clear);
   publish_runtime_variables();
   try {
-    TcpConnection connection(settings.ip_address, easiroc::kTcpDataPort,
+    TcpConnection connection(settings->ip_address, easiroc::kTcpDataPort,
                              kReceiveTimeoutMs);
     const std::size_t drained =
         connection.drain(kDrainQuietMs, kDrainMaximumMs);
     g_state.pending_events.clear();
     g_state.parser.reset();
-    g_state.buffer_clear_drained_bytes = drained;
-    g_state.runtime.statistics.last_drain_bytes = drained;
-    g_state.runtime.statistics.total_drain_bytes += drained;
-    g_state.buffer_clear_result =
-        "Succeeded: host TCP receive drain; no device FIFO-clear command "
-        "issued; discarded " +
-        std::to_string(drained) + " byte(s)";
-    g_state.buffer_clear = daq::finishBufferClearRequest(
-        g_state.buffer_clear, true, "", unix_time);
-    cm_msg(MINFO, "manual_buffer_clear",
-           "Request %u EASIROC TCP drain succeeded: discarded %zu byte(s); "
-           "no device FIFO-clear, reset, or configuration command issued",
-           static_cast<unsigned>(request_id), drained);
+    complete_manual_buffer_clear_success(*request_id, drained, unix_time);
   } catch (const std::exception& exception) {
-    const std::string error =
-        std::string("EASIROC TCP receive drain failed: ") + exception.what();
-    g_state.buffer_clear_result = "Failed: " + error;
-    g_state.buffer_clear = daq::finishBufferClearRequest(
-        g_state.buffer_clear, false, error, unix_time);
-    cm_msg(MERROR, "manual_buffer_clear", "Request %u failed: %s",
-           static_cast<unsigned>(request_id), error.c_str());
+    complete_manual_buffer_clear_failure(*request_id, exception, unix_time);
   }
   publish_runtime_variables();
 }
