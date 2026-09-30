@@ -3,6 +3,9 @@
 
 #include "midas.h"
 #include "v1720e.h"
+#include "rpv130.h"
+#include "../common/manual_buffer_clear.h"
+#include <string>
 #include <cstddef>
 #include <cstdint>
 
@@ -198,6 +201,13 @@ struct RunStatistics {
     bool v1720_have_previous;
 };
 
+struct VmeBufferClearResults {
+    std::string v792 = "Not requested";
+    std::string v1190 = "Not requested";
+    std::string v775 = "Not requested";
+    std::string v1720e = "Not requested";
+};
+
 namespace vme_odb {
 
 bool make_odb_path(char *path, size_t capacity, const char *base,
@@ -209,6 +219,9 @@ bool ensure_odb_value(const char *path, const void *default_value,
 bool get_absolute_odb_value(const char *path, void *value, INT size,
                             DWORD type);
 bool publish_configuration_status(bool configuration_ok, INT run_number);
+bool ensure_buffer_clear_schema();
+bool publish_buffer_clear_status(const daq::BufferClearStatus &status,
+                                 const VmeBufferClearResults &results);
 bool set_module_output(const char *base, const char *name,
                        const void *value, INT size, INT count, DWORD type);
 bool initialize_rpv130_odb(bool &rpv130_enabled_for_run,
@@ -226,6 +239,15 @@ bool read_v775_settings(V775Settings &settings);
 bool ensure_v1720e_settings_schema(const V1720ESettings &defaults);
 bool read_v1720e_settings(V1720ESettings &settings);
 bool publish_v1720e_info();
+void publish_rpv130_disabled_state();
+void publish_rpv130_status(const RPV130_STATUS &status, BOOL communication_ok,
+                           BOOL busy1, BOOL armed);
+bool publish_rpv130_busy_state(bool busy, bool armed);
+void publish_rpv130_armed(bool armed);
+void publish_rpv130_enabled_for_run(bool enabled);
+void set_v1720e_readback_valid(bool valid);
+void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
+                             bool valid);
 void set_module_readback_valid(const char *path, bool valid);
 void initialize_module_output_schema(
     V7xxRuntimeState &v792, V1190RuntimeState &v1190, V7xxRuntimeState &v775,

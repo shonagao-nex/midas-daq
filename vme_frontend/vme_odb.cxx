@@ -18,6 +18,7 @@ static const char *V1190_SETTINGS_PATH = "/Equipment/VME/Settings/V1190";
 static const char *V775_SETTINGS_PATH = "/Equipment/VME/Settings/V775";
 static const char *V1720E_SETTINGS_PATH = "/Equipment/VME/Settings/V1720E";
 static const char *V1720E_INFO_PATH = "/Equipment/VME/Info/V1720E";
+static const char *V1720E_READBACK_PATH = "/Equipment/VME/Readback/V1720E";
 
 static const char *V792_READBACK_PATH = "/Equipment/VME/Readback/V792";
 static const char *V1190_READBACK_PATH = "/Equipment/VME/Readback/V1190";
@@ -25,7 +26,13 @@ static const char *V775_READBACK_PATH = "/Equipment/VME/Readback/V775";
 static const char *FRONTEND_VARIABLES_PATH =
     "/Equipment/VME/Variables/Frontend";
 static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
+static const char *BUFFER_CLEAR_COMMAND_PATH = "/Equipment/VME/Commands/BufferClearRequestId";
+static const char *BUFFER_CLEAR_STATUS_PATH = "/Equipment/VME/Variables/BufferClear";
 static const DWORD RUN_SNAPSHOT_SCHEMA_VERSION = 1;
+static const DWORD V1720E_TRIGGER_SOFTWARE = 0x80000000u;
+static const DWORD V1720E_TRIGGER_EXTERNAL = 0x40000000u;
+static const DWORD V1720E_CHANNEL_CONFIG_ZS_MASK = 0x000F0000u;
+static const DWORD V1720E_CHANNEL_CONFIG_PACK25 = 0x00000800u;
 
 //************************************//
 // Build an absolute path for a VME ODB field
@@ -859,6 +866,258 @@ void initialize_module_output_schema(
     publish_v7xx_variables("/Equipment/VME/Variables/V792",v792,v792_last_publish);
     publish_v1190_variables(v1190, v1190_last_publish);
     publish_v7xx_variables("/Equipment/VME/Variables/V775",v775,v775_last_publish);
+}
+
+//************************************//
+// Write one V1720E readback field to ODB
+//************************************//
+static bool set_v1720e_output(const char *base, const char *name,
+                              const void *value, INT size, INT count,
+                              DWORD type)
+{
+    char path[256];
+    return make_odb_path(path, sizeof(path), base, name) &&
+           set_absolute_odb_value(path, value, size, count, type);
+}
+
+//************************************//
+// Publish V1720E readback validity without changing other fields
+//************************************//
+void set_v1720e_readback_valid(bool valid)
+{
+    const BOOL value = valid ? TRUE : FALSE;
+    set_v1720e_output(V1720E_READBACK_PATH, "Valid", &value, sizeof(value),
+                      1, TID_BOOL);
+}
+
+//************************************//
+// Publish the acquired V1720E register readback to ODB
+//************************************//
+void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
+                                    bool valid)
+{
+    const DWORD record_length =
+        readback.custom_size == V1720E_DEFAULT_CUSTOM_SIZE
+            ? V1720E_DEFAULT_RECORD_SAMPLES : 0u;
+    const BOOL software_trigger =
+        (readback.trigger_source & V1720E_TRIGGER_SOFTWARE) != 0;
+    const BOOL external_trigger =
+        (readback.trigger_source & V1720E_TRIGGER_EXTERNAL) != 0;
+    const BOOL zero_suppression =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK) != 0;
+    const BOOL pack25 =
+        (readback.channel_config & V1720E_CHANNEL_CONFIG_PACK25) != 0;
+    BOOL self_trigger[V1720E_CHANNEL_COUNT] = {};
+    BOOL channel_enabled[V1720E_CHANNEL_COUNT] = {};
+    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        self_trigger[channel] =
+            (readback.trigger_source & (1u << channel)) != 0;
+        channel_enabled[channel] =
+            (readback.channel_enable & (1u << channel)) != 0;
+    }
+
+#define SET_READBACK(name, value, count, type) \
+    set_v1720e_output(V1720E_READBACK_PATH, name, &(value), sizeof(value), \
+                      count, type)
+    SET_READBACK("BoardInfo", readback.board_info, 1, TID_DWORD);
+    SET_READBACK("RocFirmwareRevision", readback.roc_firmware, 1, TID_DWORD);
+    SET_READBACK("BufferOrganization", readback.buffer_organization, 1, TID_DWORD);
+    SET_READBACK("CustomSizeRaw", readback.custom_size, 1, TID_DWORD);
+    SET_READBACK("RecordLengthSamples", record_length, 1, TID_DWORD);
+    SET_READBACK("PostTrigger", readback.post_trigger, 1, TID_DWORD);
+    SET_READBACK("SoftwareTriggerEnabled", software_trigger, 1, TID_BOOL);
+    SET_READBACK("ExternalTriggerEnabled", external_trigger, 1, TID_BOOL);
+    SET_READBACK("ChannelSelfTriggerEnabled", self_trigger,
+                 V1720E_CHANNEL_COUNT, TID_BOOL);
+    SET_READBACK("ChannelEnabled", channel_enabled,
+                 V1720E_CHANNEL_COUNT, TID_BOOL);
+    SET_READBACK("DCOffset", readback.dc_offset,
+                 V1720E_CHANNEL_COUNT, TID_WORD);
+    SET_READBACK("ZeroSuppressionEnabled", zero_suppression, 1, TID_BOOL);
+    SET_READBACK("Pack25Enabled", pack25, 1, TID_BOOL);
+    SET_READBACK("TriggerSourceRaw", readback.trigger_source, 1, TID_DWORD);
+    SET_READBACK("ChannelEnableRaw", readback.channel_enable, 1, TID_DWORD);
+    SET_READBACK("ChannelConfigRaw", readback.channel_config, 1, TID_DWORD);
+#undef SET_READBACK
+    set_v1720e_readback_valid(valid);
+}
+
+//************************************//
+// Publish disabled RPV130 status fields
+//************************************//
+void publish_rpv130_disabled_state()
+{
+    const BOOL no = FALSE;
+    const BYTE zero = 0;
+    set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun", &no,
+                      sizeof(no), 1, TID_BOOL);
+    set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK", &no,
+                      sizeof(no), 1, TID_BOOL);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch1", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch2", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "RSFF", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Through", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR1", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR2", &zero,
+                      sizeof(zero), 1, TID_BYTE);
+}
+
+//************************************//
+// Publish acquired RPV130 status without reading hardware
+//************************************//
+void publish_rpv130_status(const RPV130_STATUS &status, BOOL communication_ok,
+                           BOOL busy1, BOOL armed)
+{
+    set_module_output(RPV130_VARIABLES_PATH, "Latch1", &status.latch1,
+                      sizeof(status.latch1), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Latch2", &status.latch2,
+                      sizeof(status.latch2), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "RSFF", &status.rsff,
+                      sizeof(status.rsff), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "Through", &status.through,
+                      sizeof(status.through), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR1", &status.csr1,
+                      sizeof(status.csr1), 1, TID_BYTE);
+    set_module_output(RPV130_VARIABLES_PATH, "CSR2", &status.csr2,
+                      sizeof(status.csr2), 1, TID_BYTE);
+    // Keep the last hardware-derived BUSY1 value when CSR1 cannot be read.
+    if (communication_ok)
+        set_module_output(RPV130_STATUS_PATH, "Busy1", &busy1,
+                          sizeof(busy1), 1, TID_BOOL);
+    set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &armed,
+                      sizeof(armed), 1, TID_BOOL);
+    set_module_output(RPV130_VARIABLES_PATH, "CommunicationOK",
+                      &communication_ok, sizeof(communication_ok), 1,
+                      TID_BOOL);
+    const BOOL enabled_for_run = TRUE;
+    set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun",
+                      &enabled_for_run, sizeof(enabled_for_run), 1,
+                      TID_BOOL);
+}
+
+//************************************//
+// Publish the RPV130 BUSY and armed state
+//************************************//
+bool publish_rpv130_busy_state(bool busy, bool armed)
+{
+    const BOOL b = busy ? TRUE : FALSE;
+    const BOOL a = armed ? TRUE : FALSE;
+    return set_module_output(RPV130_STATUS_PATH, "Busy1", &b,
+                             sizeof(b), 1, TID_BOOL) &&
+           set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &a,
+                             sizeof(a), 1, TID_BOOL);
+}
+
+//************************************//
+// Publish one RPV130 armed status update
+//************************************//
+void publish_rpv130_armed(bool armed)
+{
+    const BOOL value = armed ? TRUE : FALSE;
+    set_module_output(RPV130_STATUS_PATH, "SingleEventBusyArmed", &value,
+                      sizeof(value), 1, TID_BOOL);
+}
+
+//************************************//
+// Publish the RPV130 run enable flag
+//************************************//
+void publish_rpv130_enabled_for_run(bool enabled)
+{
+    const BOOL value = enabled ? TRUE : FALSE;
+    set_module_output(RPV130_VARIABLES_PATH, "EnabledForRun", &value,
+                      sizeof(value), 1, TID_BOOL);
+}
+
+//************************************//
+// Write one manual buffer clear status string to ODB
+//************************************//
+static bool set_buffer_clear_string(const char *name, const std::string &value)
+{
+    char path[256];
+    if (!make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name))
+        return false;
+    char buffer[256] = {};
+    snprintf(buffer, sizeof(buffer), "%s", value.c_str());
+    return set_absolute_odb_value(path, buffer, sizeof(buffer), 1, TID_STRING);
+}
+
+//************************************//
+// Publish manual buffer clear status and module results
+//************************************//
+bool publish_buffer_clear_status(const daq::BufferClearStatus &status,
+                                 const VmeBufferClearResults &results)
+{
+    char path[256];
+    bool ok = true;
+    const DWORD active = status.active_request_id;
+    const DWORD handled = status.last_handled_request_id;
+    const DWORD successful = status.last_successful_request_id;
+    const BOOL in_progress = status.in_progress ? TRUE : FALSE;
+    const BOOL last_succeeded =
+        status.last_attempt_succeeded ? TRUE : FALSE;
+#define PUBLISH_CLEAR_VALUE(name, value, type) \
+    do { \
+        ok = make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name) && \
+             set_absolute_odb_value(path, &(value), sizeof(value), 1, type) && ok; \
+    } while (0)
+    PUBLISH_CLEAR_VALUE("ActiveRequestId", active, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("LastHandledRequestId", handled, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("LastSuccessfulRequestId", successful, TID_DWORD);
+    PUBLISH_CLEAR_VALUE("InProgress", in_progress, TID_BOOL);
+    PUBLISH_CLEAR_VALUE("LastAttemptSucceeded", last_succeeded, TID_BOOL);
+    PUBLISH_CLEAR_VALUE("LastClearUnixTime",
+                        status.last_clear_unix_time, TID_QWORD);
+#undef PUBLISH_CLEAR_VALUE
+    ok = set_buffer_clear_string(
+             "State", daq::bufferClearStateName(status.state)) && ok;
+    ok = set_buffer_clear_string("LastError", status.last_error) && ok;
+    ok = set_buffer_clear_string("V792Result", results.v792) && ok;
+    ok = set_buffer_clear_string("V1190Result", results.v1190) && ok;
+    ok = set_buffer_clear_string("V775Result", results.v775) && ok;
+    ok = set_buffer_clear_string("V1720EResult", results.v1720e) && ok;
+    return ok;
+}
+
+//************************************//
+// Create manual buffer clear command and status fields
+//************************************//
+bool ensure_buffer_clear_schema()
+{
+    const DWORD zero = 0;
+    const BOOL no = FALSE;
+    const uint64_t zero_time = 0;
+    char path[256];
+    char idle[32] = "Idle";
+    char empty[256] = {};
+#define ENSURE_CLEAR_VALUE(name, value, count, type) \
+    do { \
+        if (!make_odb_path(path, sizeof(path), BUFFER_CLEAR_STATUS_PATH, name) || \
+            !ensure_odb_value(path, &(value), sizeof(value), count, type)) \
+            return false; \
+    } while (0)
+    if (!ensure_odb_value(BUFFER_CLEAR_COMMAND_PATH, &zero, sizeof(zero), 1,
+                          TID_DWORD))
+        return false;
+    ENSURE_CLEAR_VALUE("ActiveRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("LastHandledRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("LastSuccessfulRequestId", zero, 1, TID_DWORD);
+    ENSURE_CLEAR_VALUE("InProgress", no, 1, TID_BOOL);
+    ENSURE_CLEAR_VALUE("LastAttemptSucceeded", no, 1, TID_BOOL);
+    ENSURE_CLEAR_VALUE("LastClearUnixTime", zero_time, 1, TID_QWORD);
+    ENSURE_CLEAR_VALUE("State", idle, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("LastError", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V792Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V1190Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V775Result", empty, 1, TID_STRING);
+    ENSURE_CLEAR_VALUE("V1720EResult", empty, 1, TID_STRING);
+#undef ENSURE_CLEAR_VALUE
+
+    return true;
 }
 
 }  // namespace vme_odb

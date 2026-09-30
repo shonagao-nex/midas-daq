@@ -29,8 +29,18 @@ int main() {
   const std::string frontend = readFile("fevme.cxx");
   const std::string driver = readFile("v1720e.c");
   const std::string clear = functionBody(
+      frontend, "static bool validate_manual_buffer_clear_request(",
+      "static bool reset_module_event_counters()");
+  const std::string flow = functionBody(
       frontend, "static void process_manual_buffer_clear_request()",
       "static bool reset_module_event_counters()");
+  const auto validate = flow.find("validate_manual_buffer_clear_request(request)");
+  const auto execute = flow.find("execute_manual_buffer_clear(request, result)");
+  const auto finish = flow.find("finish_manual_buffer_clear_request(request, result)");
+  require(validate != std::string::npos && execute != std::string::npos &&
+              finish != std::string::npos && validate < execute &&
+              execute < finish,
+          "manual clear request flow changed order");
   const std::string v1720 = functionBody(
       driver, "int v1720e_software_clear(", "\n}");
   require(clear.find("STATE_STOPPED") != std::string::npos,
@@ -56,5 +66,5 @@ int main() {
               v1720.find("REG_SOFTWARE_RESET") == std::string::npos &&
               v1720.find("REG_CONFIG_RELOAD") == std::string::npos,
           "V1720E clear contains reset/reload command");
-  std::cout << "test_manual_buffer_clear_contract: 9 checks passed\n";
+  std::cout << "test_manual_buffer_clear_contract: 10 checks passed\n";
 }
