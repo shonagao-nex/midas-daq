@@ -55,9 +55,9 @@ COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
            $(BUILD_DIR)/v1720e.o \
            $(BUILD_DIR)/rpv130.o \
            $(BUILD_DIR)/manual_buffer_clear.o
-OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/global_busy.o \
+OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/global_busy.o \
        $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
-DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/global_busy.o \
+DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/global_busy.o \
             $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
 RPV130_TEST_OBJ = $(BUILD_DIR)/tests/test_rpv130_status.o
 IDLE_POLICY_TEST = $(BIN_TEST_DIR)/test_fevme_idle_policy
@@ -194,15 +194,19 @@ $(BIN_TEST_DIR)/%: $(BUILD_DIR)/tests/%.o
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $< -lCAENVME
 
-$(BUILD_DIR)/fevme.o: fevme.cxx vme_odb.h
+$(BUILD_DIR)/fevme.o: fevme.cxx vme_odb.h v1190_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(NORMAL_DEFINES) -c $< -o $@
 
-$(BUILD_DIR)/fevme_diag.o: fevme.cxx vme_odb.h
+$(BUILD_DIR)/fevme_diag.o: fevme.cxx vme_odb.h v1190_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(DIAGNOSTIC_DEFINES) -c $< -o $@
 
 $(BUILD_DIR)/vme_odb.o: vme_odb.cxx vme_odb.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/v1190_config.o: v1190_config.cxx v1190_config.h vme_odb.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
