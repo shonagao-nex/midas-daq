@@ -320,10 +320,58 @@ void update_disk_cache(const LoggerSource& source, DWORD now_ms) {
   gMonitorState.disk.initialized = true;
 }
 
+struct StatusInputs {
+  INT run_number;
+  INT run_state;
+  INT transition_in_progress;
+  DWORD start_time;
+  DWORD stop_time;
+  std::uint64_t previous_update_unix;
+  bool collection_ok;
+  std::uint64_t now_unix;
+  std::uint64_t duration_sec;
+  BOOL vme_connected;
+  BOOL vme_status_fresh;
+  BOOL easiroc_connected;
+  BOOL easiroc_status_fresh;
+  BOOL logger_connected;
+  BOOL vme_configuration_ok;
+  INT vme_configuration_run_number;
+  std::uint64_t vme_configuration_checked_unix;
+  BOOL easiroc_configuration_ok;
+  INT easiroc_configuration_run_number;
+  std::uint64_t easiroc_configuration_checked_unix;
+  std::uint64_t event_slip_count;
+  std::uint64_t malformed_event_count;
+  std::uint64_t vme_timeout_count;
+  std::uint64_t counter_discontinuity_count;
+  std::uint64_t size_error_count;
+  std::uint64_t channel_mask_error_count;
+  BOOL v1720_enabled;
+  BOOL v1720_running;
+  std::uint64_t vme_event_content_error_count;
+  BOOL easiroc_running;
+  BOOL easiroc_enabled;
+  BOOL easiroc_fault;
+  std::uint64_t easiroc_event_counter;
+  std::uint64_t decode_error_count;
+  std::uint64_t easiroc_timeout_count;
+  std::uint64_t overflow_count;
+  std::uint64_t easiroc_event_content_error_count;
+  LoggerSource logger;
+  daq_monitor::RunParticipation run_participation;
+};
+
+struct StatusDecision {
+  daq_monitor::RawStatus raw_status;
+  daq_monitor::ActiveParticipation participation;
+  daq_monitor::StatusEvaluation evaluation;
+};
+
 //************************************//
-// Evaluate and publish DAQ status in ODB
+// Read monitor status inputs from ODB and system services
 //************************************//
-bool publish_status(bool synchronous_start_check = false) {
+StatusInputs collect_status_inputs() {
   INT run_number = 0;
   INT run_state = 0;
   INT transition_in_progress = 0;
@@ -452,6 +500,88 @@ bool publish_status(bool synchronous_start_check = false) {
   const LoggerSource logger = read_logger_source();
   update_disk_cache(logger, ss_millitime());
 
+  const auto run_participation = read_run_participation();
+  return {
+      run_number,
+      run_state,
+      transition_in_progress,
+      start_time,
+      stop_time,
+      previous_update_unix,
+      collection_ok,
+      now_unix,
+      duration_sec,
+      vme_connected,
+      vme_status_fresh,
+      easiroc_connected,
+      easiroc_status_fresh,
+      logger_connected,
+      vme_configuration_ok,
+      vme_configuration_run_number,
+      vme_configuration_checked_unix,
+      easiroc_configuration_ok,
+      easiroc_configuration_run_number,
+      easiroc_configuration_checked_unix,
+      event_slip_count,
+      malformed_event_count,
+      vme_timeout_count,
+      counter_discontinuity_count,
+      size_error_count,
+      channel_mask_error_count,
+      v1720_enabled,
+      v1720_running,
+      vme_event_content_error_count,
+      easiroc_running,
+      easiroc_enabled,
+      easiroc_fault,
+      easiroc_event_counter,
+      decode_error_count,
+      easiroc_timeout_count,
+      overflow_count,
+      easiroc_event_content_error_count,
+      logger,
+      run_participation
+  };
+}
+
+//************************************//
+// Evaluate DAQ status and start policy from collected inputs
+//************************************//
+StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
+                                      bool synchronous_start_check) {
+  const auto& run_state = inputs.run_state;
+  const auto& transition_in_progress = inputs.transition_in_progress;
+  const auto& collection_ok = inputs.collection_ok;
+  const auto& now_unix = inputs.now_unix;
+  const auto& previous_update_unix = inputs.previous_update_unix;
+  const auto& run_number = inputs.run_number;
+  const auto& vme_connected = inputs.vme_connected;
+  const auto& vme_status_fresh = inputs.vme_status_fresh;
+  const auto& easiroc_connected = inputs.easiroc_connected;
+  const auto& easiroc_status_fresh = inputs.easiroc_status_fresh;
+  const auto& logger_connected = inputs.logger_connected;
+  const auto& vme_configuration_ok = inputs.vme_configuration_ok;
+  const auto& vme_configuration_run_number = inputs.vme_configuration_run_number;
+  const auto& vme_configuration_checked_unix = inputs.vme_configuration_checked_unix;
+  const auto& easiroc_configuration_ok = inputs.easiroc_configuration_ok;
+  const auto& easiroc_configuration_run_number = inputs.easiroc_configuration_run_number;
+  const auto& easiroc_configuration_checked_unix = inputs.easiroc_configuration_checked_unix;
+  const auto& event_slip_count = inputs.event_slip_count;
+  const auto& malformed_event_count = inputs.malformed_event_count;
+  const auto& vme_timeout_count = inputs.vme_timeout_count;
+  const auto& counter_discontinuity_count = inputs.counter_discontinuity_count;
+  const auto& size_error_count = inputs.size_error_count;
+  const auto& channel_mask_error_count = inputs.channel_mask_error_count;
+  const auto& v1720_enabled = inputs.v1720_enabled;
+  const auto& v1720_running = inputs.v1720_running;
+  const auto& vme_event_content_error_count = inputs.vme_event_content_error_count;
+  const auto& easiroc_running = inputs.easiroc_running;
+  const auto& easiroc_enabled = inputs.easiroc_enabled;
+  const auto& easiroc_fault = inputs.easiroc_fault;
+  const auto& decode_error_count = inputs.decode_error_count;
+  const auto& easiroc_timeout_count = inputs.easiroc_timeout_count;
+  const auto& overflow_count = inputs.overflow_count;
+  const auto& easiroc_event_content_error_count = inputs.easiroc_event_content_error_count;
   daq_monitor::RawStatus raw_status;
   raw_status.run_state = policy_run_state(run_state);
   raw_status.stop_transition_in_progress =
@@ -464,36 +594,7 @@ bool publish_status(bool synchronous_start_check = false) {
   raw_status.logger_connected = logger_connected != FALSE;
   const daq_monitor::ActiveParticipation participation =
       daq_monitor::resolve_run_participation(
-          raw_status.run_state, run_number, read_run_participation());
-  // Preserve the largest observed MIDAS event count if a participating
-  // frontend disconnects before EOR. The record is keyed by run number.
-  bool ok = true;
-  if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
-    INT count_run = 0;
-    double previous_vme = 0, previous_easiroc = 0;
-    read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
-    if (count_run == run_number) {
-      read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
-                 &previous_vme);
-      read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
-                 &previous_easiroc);
-    }
-    double current_vme = 0, current_easiroc = 0;
-    read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
-               &current_vme);
-    read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
-               TID_DOUBLE, &current_easiroc);
-    const double observed_vme = participation.vme
-        ? std::max(previous_vme, current_vme) : 0;
-    const double observed_easiroc = participation.easiroc
-        ? std::max(previous_easiroc, current_easiroc) : 0;
-    write_value("/DAQ/Status/Runlog/ObservedVMEEvents", &observed_vme,
-                sizeof(observed_vme), TID_DOUBLE);
-    write_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", &observed_easiroc,
-                sizeof(observed_easiroc), TID_DOUBLE);
-    write_value("/DAQ/Status/Runlog/CountRunNumber", &run_number,
-                sizeof(run_number), TID_INT32);
-  }
+          raw_status.run_state, run_number, inputs.run_participation);
   raw_status.vme.participating = participation.vme;
   raw_status.vme.connected = vme_connected != FALSE;
   raw_status.vme.status_fresh = vme_status_fresh != FALSE;
@@ -526,6 +627,86 @@ bool publish_status(bool synchronous_start_check = false) {
   const daq_monitor::StatusEvaluation evaluation =
       daq_monitor::evaluate_status(raw_status);
 
+  return {raw_status, participation, evaluation};
+}
+
+//************************************//
+// Preserve the largest observed event counts for the runlog
+//************************************//
+void publish_observed_event_counts(const StatusInputs& inputs,
+                                   const StatusDecision& decision) {
+  const auto& run_state = inputs.run_state;
+  const auto& run_number = inputs.run_number;
+  const auto& participation = decision.participation;
+  // Preserve the largest observed MIDAS event count if a participating
+  // frontend disconnects before EOR. The record is keyed by run number.
+  if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
+    INT count_run = 0;
+    double previous_vme = 0, previous_easiroc = 0;
+    read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
+    if (count_run == run_number) {
+      read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
+                 &previous_vme);
+      read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
+                 &previous_easiroc);
+    }
+    double current_vme = 0, current_easiroc = 0;
+    read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
+               &current_vme);
+    read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+               TID_DOUBLE, &current_easiroc);
+    const double observed_vme = participation.vme
+        ? std::max(previous_vme, current_vme) : 0;
+    const double observed_easiroc = participation.easiroc
+        ? std::max(previous_easiroc, current_easiroc) : 0;
+    write_value("/DAQ/Status/Runlog/ObservedVMEEvents", &observed_vme,
+                sizeof(observed_vme), TID_DOUBLE);
+    write_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", &observed_easiroc,
+                sizeof(observed_easiroc), TID_DOUBLE);
+    write_value("/DAQ/Status/Runlog/CountRunNumber", &run_number,
+                sizeof(run_number), TID_INT32);
+  }
+}
+
+//************************************//
+// Publish evaluated status and start permission to ODB
+//************************************//
+bool publish_status_outputs(const StatusInputs& inputs,
+                            const StatusDecision& decision) {
+  const auto& run_state = inputs.run_state;
+  const auto& run_number = inputs.run_number;
+  const auto& duration_sec = inputs.duration_sec;
+  const auto& logger = inputs.logger;
+  const auto& logger_connected = inputs.logger_connected;
+  const auto& vme_connected = inputs.vme_connected;
+  const auto& vme_status_fresh = inputs.vme_status_fresh;
+  const auto& vme_configuration_ok = inputs.vme_configuration_ok;
+  const auto& vme_configuration_run_number = inputs.vme_configuration_run_number;
+  const auto& vme_configuration_checked_unix = inputs.vme_configuration_checked_unix;
+  const auto& easiroc_connected = inputs.easiroc_connected;
+  const auto& easiroc_status_fresh = inputs.easiroc_status_fresh;
+  const auto& easiroc_configuration_ok = inputs.easiroc_configuration_ok;
+  const auto& easiroc_configuration_run_number = inputs.easiroc_configuration_run_number;
+  const auto& easiroc_configuration_checked_unix = inputs.easiroc_configuration_checked_unix;
+  const auto& event_slip_count = inputs.event_slip_count;
+  const auto& malformed_event_count = inputs.malformed_event_count;
+  const auto& vme_timeout_count = inputs.vme_timeout_count;
+  const auto& vme_event_content_error_count = inputs.vme_event_content_error_count;
+  const auto& size_error_count = inputs.size_error_count;
+  const auto& channel_mask_error_count = inputs.channel_mask_error_count;
+  const auto& counter_discontinuity_count = inputs.counter_discontinuity_count;
+  const auto& easiroc_running = inputs.easiroc_running;
+  const auto& easiroc_fault = inputs.easiroc_fault;
+  const auto& easiroc_event_counter = inputs.easiroc_event_counter;
+  const auto& decode_error_count = inputs.decode_error_count;
+  const auto& easiroc_timeout_count = inputs.easiroc_timeout_count;
+  const auto& overflow_count = inputs.overflow_count;
+  const auto& easiroc_event_content_error_count = inputs.easiroc_event_content_error_count;
+  const auto& now_unix = inputs.now_unix;
+  const auto& participation = decision.participation;
+  const auto& evaluation = decision.evaluation;
+  auto raw_status = decision.raw_status;
+  bool ok = true;
   // Keep the worst observed run status so a transient disconnect remains
   // visible in the EOR record even if the frontend reconnects before STOP.
   if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
@@ -645,7 +826,17 @@ bool publish_status(bool synchronous_start_check = false) {
     raw_status.monitor_status_fresh = false;
     can_start = daq_monitor::evaluate_can_start(raw_status);
   }
-  return publish_can_start(can_start) && ok;
+  return publish_can_start(can_start) && ok;}
+
+//************************************//
+// Collect, evaluate, and publish the current DAQ status
+//************************************//
+bool publish_status(bool synchronous_start_check = false) {
+  const StatusInputs inputs = collect_status_inputs();
+  const StatusDecision decision =
+      evaluate_status_inputs(inputs, synchronous_start_check);
+  publish_observed_event_counts(inputs, decision);
+  return publish_status_outputs(inputs, decision);
 }
 
 //************************************//
