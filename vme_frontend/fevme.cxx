@@ -1133,7 +1133,7 @@ static V1190EventInfo read_v1190_fifo_blt32_event(
     phases = result.timing;
     diagnostic = gVmeStatistics.v1190_blt_diagnostics.fetch_add(
         1, std::memory_order_relaxed) < 10;
-    if (diagnostic) {
+    if (diagnostic && status != V1190_FIFO_BLT_OK) {
         cm_msg(MINFO, frontend_name,
                "V1190 BLT FIFO=%u stored=%d->%d req=%d got=%d CAEN=%d",
                static_cast<unsigned>(result.fifo_word_count),
