@@ -2,6 +2,7 @@
 #include "mrpc.h"
 #include "alarm_policy.h"
 #include "monitor_alarms.h"
+#include "monitor_odb_utils.h"
 #include "runlog_edit_rpc.h"
 #include "status_policy.h"
 
@@ -25,6 +26,9 @@
 extern char** environ;
 
 namespace {
+
+using daq_monitor::read_string;
+using daq_monitor::read_value;
 
 constexpr char kClientName[] = "daq_monitor";
 constexpr char kStatusRoot[] = "/DAQ/Status";
@@ -70,8 +74,6 @@ MonitorState gMonitorState;
 
 void handle_signal(int) { gStopRequested = 1; }
 
-daq_monitor::RunState policy_run_state(INT state);
-
 bool is_owned_status_path(const char* path) {
   const std::size_t root_length = std::strlen(kStatusRoot);
   return std::strncmp(path, kStatusRoot, root_length) == 0 &&
@@ -105,40 +107,16 @@ bool write_string(const char* path, const std::string& value) {
                      TID_STRING);
 }
 
-template <typename T>
-bool read_value(const char* path, DWORD type, T* value) {
-  T candidate{};
-  INT size = sizeof(candidate);
-  const INT status =
-      db_get_value(gDatabase, 0, path, &candidate, &size, type, FALSE);
-  if (status != DB_SUCCESS || size != static_cast<INT>(sizeof(candidate)))
-    return false;
-  *value = candidate;
-  return true;
-}
-
-bool read_string(const std::string& path, std::string* value) {
-  char buffer[kStringCapacity] = {};
-  INT size = sizeof(buffer);
-  const INT status = db_get_value(gDatabase, 0, path.c_str(), buffer, &size,
-                                  TID_STRING, FALSE);
-  if (status != DB_SUCCESS || size <= 0)
-    return false;
-  buffer[sizeof(buffer) - 1] = '\0';
-  *value = buffer;
-  return true;
-}
-
 daq_monitor::RunParticipation read_run_participation() {
   BOOL valid = FALSE;
   INT run_number = 0;
   BOOL vme = FALSE;
   BOOL easiroc = FALSE;
-  if (!read_value("/DAQ/Status/Run/ParticipationValid", TID_BOOL, &valid) ||
-      !read_value("/DAQ/Status/Run/ParticipationRunNumber", TID_INT32,
+  if (!read_value(gDatabase, "/DAQ/Status/Run/ParticipationValid", TID_BOOL, &valid) ||
+      !read_value(gDatabase, "/DAQ/Status/Run/ParticipationRunNumber", TID_INT32,
                   &run_number) ||
-      !read_value("/DAQ/Status/Run/VMEParticipating", TID_BOOL, &vme) ||
-      !read_value("/DAQ/Status/Run/EASIROCParticipating", TID_BOOL,
+      !read_value(gDatabase, "/DAQ/Status/Run/VMEParticipating", TID_BOOL, &vme) ||
+      !read_value(gDatabase, "/DAQ/Status/Run/EASIROCParticipating", TID_BOOL,
                   &easiroc))
     return {};
   return {valid != FALSE, run_number, vme != FALSE, easiroc != FALSE};
@@ -206,18 +184,6 @@ bool publish_can_start(const daq_monitor::CanStartEvaluation& evaluation) {
   return ok;
 }
 
-daq_monitor::RunState policy_run_state(INT state) {
-  switch (state) {
-    case STATE_RUNNING:
-      return daq_monitor::RunState::kRunning;
-    case STATE_STOPPED:
-      return daq_monitor::RunState::kStopped;
-    case STATE_PAUSED:
-    default:
-      return daq_monitor::RunState::kPausedOrTransition;
-  }
-}
-
 std::uint64_t add_saturating(std::uint64_t left, std::uint64_t right) {
   if (right > std::numeric_limits<std::uint64_t>::max() - left)
     return std::numeric_limits<std::uint64_t>::max();
@@ -251,8 +217,8 @@ std::string logger_channel_path() {
 
     BOOL active = FALSE;
     std::string type;
-    read_value((base + "/Settings/Active").c_str(), TID_BOOL, &active);
-    read_string(base + "/Settings/Type", &type);
+    read_value(gDatabase, (base + "/Settings/Active").c_str(), TID_BOOL, &active);
+    read_string(gDatabase, base + "/Settings/Type", &type);
     if (active != FALSE && (type.empty() || equal_ustring(type.c_str(), "Disk")))
       return base;
   }
@@ -263,9 +229,9 @@ LoggerSource read_logger_source() {
   LoggerSource source;
   source.channel = logger_channel_path();
   if (!source.channel.empty())
-    read_string(source.channel + "/Settings/Current filename",
+    read_string(gDatabase, source.channel + "/Settings/Current filename",
                 &source.current_filename);
-  read_string("/Logger/Data dir", &source.data_directory);
+  read_string(gDatabase, "/Logger/Data dir", &source.data_directory);
   return source;
 }
 
@@ -382,19 +348,19 @@ void collect_runinfo_inputs(StatusInputs* inputs) {
   auto& now_unix = inputs->now_unix;
   auto& duration_sec = inputs->duration_sec;
   collection_ok =
-      read_value("/Runinfo/Run number", TID_INT32, &run_number) &&
+      read_value(gDatabase, "/Runinfo/Run number", TID_INT32, &run_number) &&
       collection_ok;
-  collection_ok = read_value("/Runinfo/State", TID_INT32, &run_state) &&
+  collection_ok = read_value(gDatabase, "/Runinfo/State", TID_INT32, &run_state) &&
                   collection_ok;
   // MIDAS writes the transition number before invoking callbacks and clears
   // it only after updating Runinfo/State. If this read fails, remain fail-safe
   // and do not suppress any acquisition-state error.
-  read_value("/Runinfo/Transition in progress", TID_INT32,
+  read_value(gDatabase, "/Runinfo/Transition in progress", TID_INT32,
              &transition_in_progress);
-  collection_ok = read_value("/Runinfo/Start time binary", TID_DWORD,
+  collection_ok = read_value(gDatabase, "/Runinfo/Start time binary", TID_DWORD,
                              &start_time) && collection_ok;
-  read_value("/Runinfo/Stop time binary", TID_DWORD, &stop_time);
-  read_value("/DAQ/Status/Global/LastUpdateUnix", TID_QWORD,
+  read_value(gDatabase, "/Runinfo/Stop time binary", TID_DWORD, &stop_time);
+  read_value(gDatabase, "/DAQ/Status/Global/LastUpdateUnix", TID_QWORD,
              &previous_update_unix);
 
   const std::time_t now = std::time(nullptr);
@@ -443,18 +409,18 @@ void collect_configuration_inputs(StatusInputs* inputs) {
   // pre-start policy. Missing or old values remain false/zero for monitoring;
   // each participating frontend reports BOR failure through its own
   // sequence-500 transition callback.
-  read_value("/Equipment/VME/Variables/Frontend/ConfigurationOK", TID_BOOL,
+  read_value(gDatabase, "/Equipment/VME/Variables/Frontend/ConfigurationOK", TID_BOOL,
              &vme_configuration_ok);
-  read_value("/Equipment/VME/Variables/Frontend/ConfigurationRunNumber",
+  read_value(gDatabase, "/Equipment/VME/Variables/Frontend/ConfigurationRunNumber",
              TID_INT, &vme_configuration_run_number);
-  read_value("/Equipment/VME/Variables/Frontend/ConfigurationCheckedUnix",
+  read_value(gDatabase, "/Equipment/VME/Variables/Frontend/ConfigurationCheckedUnix",
              TID_QWORD, &vme_configuration_checked_unix);
-  read_value("/Equipment/EASIROC/Variables/Frontend/ConfigurationOK",
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/Frontend/ConfigurationOK",
              TID_BOOL, &easiroc_configuration_ok);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/EASIROC/Variables/Frontend/ConfigurationRunNumber",
       TID_INT, &easiroc_configuration_run_number);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/EASIROC/Variables/Frontend/ConfigurationCheckedUnix",
       TID_QWORD, &easiroc_configuration_checked_unix);
 }
@@ -473,23 +439,23 @@ void collect_vme_inputs(StatusInputs* inputs) {
   auto& v1720_running = inputs->v1720_running;
   auto& vme_event_content_error_count = inputs->vme_event_content_error_count;
   v1720_enabled = TRUE;
-  read_value("/Equipment/VME/Variables/V1720E/EnabledForRun", TID_BOOL,
+  read_value(gDatabase, "/Equipment/VME/Variables/V1720E/EnabledForRun", TID_BOOL,
              &v1720_enabled);
-  read_value("/Equipment/VME/Variables/V1720E/Running", TID_BOOL,
+  read_value(gDatabase, "/Equipment/VME/Variables/V1720E/Running", TID_BOOL,
              &v1720_running);
-  read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
+  read_value(gDatabase, "/Equipment/VME/Variables/RunCounters/EventSlipCount",
              TID_QWORD, &event_slip_count);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/VME/Variables/RunCounters/V1720EMalformedEventCount",
       TID_QWORD, &malformed_event_count);
-  read_value("/Equipment/VME/Variables/RunCounters/V1720EReadTimeoutCount",
+  read_value(gDatabase, "/Equipment/VME/Variables/RunCounters/V1720EReadTimeoutCount",
              TID_QWORD, &vme_timeout_count);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/VME/Variables/RunCounters/V1720ECounterDiscontinuityCount",
       TID_QWORD, &counter_discontinuity_count);
-  read_value("/Equipment/VME/Variables/RunCounters/V1720ESizeErrorCount",
+  read_value(gDatabase, "/Equipment/VME/Variables/RunCounters/V1720ESizeErrorCount",
              TID_QWORD, &size_error_count);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/VME/Variables/RunCounters/V1720EChannelMaskErrorCount",
       TID_QWORD, &channel_mask_error_count);
   vme_event_content_error_count =
@@ -510,21 +476,21 @@ void collect_easiroc_inputs(StatusInputs* inputs) {
   auto& easiroc_event_content_error_count =
       inputs->easiroc_event_content_error_count;
   easiroc_enabled = TRUE;
-  read_value("/Equipment/EASIROC/Variables/EnabledForRun", TID_BOOL,
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/EnabledForRun", TID_BOOL,
              &easiroc_enabled);
-  read_value("/Equipment/EASIROC/Variables/AcquisitionRunning", TID_BOOL,
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/AcquisitionRunning", TID_BOOL,
              &easiroc_running);
-  read_value("/Equipment/EASIROC/Variables/AcquisitionFault", TID_BOOL,
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/AcquisitionFault", TID_BOOL,
              &easiroc_fault);
-  read_value("/Equipment/EASIROC/Variables/EventCounter", TID_QWORD,
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/EventCounter", TID_QWORD,
              &easiroc_event_counter);
-  read_value("/Equipment/EASIROC/Variables/Statistics/DecodeErrorCount",
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/Statistics/DecodeErrorCount",
              TID_QWORD, &decode_error_count);
-  read_value("/Equipment/EASIROC/Variables/Statistics/ReceiveTimeoutCount",
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/Statistics/ReceiveTimeoutCount",
              TID_QWORD, &easiroc_timeout_count);
-  read_value("/Equipment/EASIROC/Variables/Statistics/ADCOverflowCount",
+  read_value(gDatabase, "/Equipment/EASIROC/Variables/Statistics/ADCOverflowCount",
              TID_QWORD, &overflow_count);
-  read_value(
+  read_value(gDatabase,
       "/Equipment/EASIROC/Variables/Statistics/EventContentErrorCount",
       TID_QWORD, &easiroc_event_content_error_count);
 }
@@ -592,7 +558,7 @@ StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
   const auto& overflow_count = inputs.overflow_count;
   const auto& easiroc_event_content_error_count = inputs.easiroc_event_content_error_count;
   daq_monitor::RawStatus raw_status;
-  raw_status.run_state = policy_run_state(run_state);
+  raw_status.run_state = daq_monitor::policy_run_state(run_state);
   raw_status.stop_transition_in_progress =
       transition_in_progress == TR_STOP;
   raw_status.monitor_status_fresh =
@@ -652,17 +618,17 @@ void publish_observed_event_counts(const StatusInputs& inputs,
   if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
     INT count_run = 0;
     double previous_vme = 0, previous_easiroc = 0;
-    read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
+    read_value(gDatabase, "/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
     if (count_run == run_number) {
-      read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
+      read_value(gDatabase, "/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
                  &previous_vme);
-      read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
+      read_value(gDatabase, "/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
                  &previous_easiroc);
     }
     double current_vme = 0, current_easiroc = 0;
-    read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
+    read_value(gDatabase, "/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
                &current_vme);
-    read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+    read_value(gDatabase, "/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
                TID_DOUBLE, &current_easiroc);
     const double observed_vme = participation.vme
         ? std::max(previous_vme, current_vme) : 0;
@@ -691,10 +657,10 @@ bool publish_runlog_worst_status(const StatusInputs& inputs,
   if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
     INT status_run = 0;
     std::string previous;
-    read_value("/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
+    read_value(gDatabase, "/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
                &status_run);
     if (status_run == run_number) {
-      read_string("/DAQ/Status/Runlog/DAQStatus", &previous);
+      read_string(gDatabase, "/DAQ/Status/Runlog/DAQStatus", &previous);
     }
     const std::string current =
         daq_monitor::severity_name(evaluation.global_severity);
@@ -938,11 +904,11 @@ INT validate_start_transition(INT run_number, char* error) {
   // A successful synchronous collection makes freshness explicit without
   // sleeping or polling while this transition callback is running.
   if (!publish_status(true) ||
-      !read_value("/DAQ/Status/Global/CanStart", TID_BOOL, &can_start) ||
-      !read_string("/DAQ/Status/Global/CanStartReason", &evaluation.reason) ||
-      !read_value("/DAQ/Status/Frontends/VME/Connected", TID_BOOL,
+      !read_value(gDatabase, "/DAQ/Status/Global/CanStart", TID_BOOL, &can_start) ||
+      !read_string(gDatabase, "/DAQ/Status/Global/CanStartReason", &evaluation.reason) ||
+      !read_value(gDatabase, "/DAQ/Status/Frontends/VME/Connected", TID_BOOL,
                   &vme_connected) ||
-      !read_value("/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
+      !read_value(gDatabase, "/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
                   &easiroc_connected)) {
     evaluation = {false, "Monitor status unavailable"};
   } else {
@@ -983,21 +949,21 @@ INT capture_runlog_eor(INT run_number, char*) {
     return CM_SUCCESS;  // Never prevent STOP from completing.
   }
   DWORD start = 0, stop = 0;
-  bool times_ok = read_value("/Runinfo/Start time binary", TID_DWORD, &start);
-  times_ok = read_value("/Runinfo/Stop time binary", TID_DWORD, &stop) &&
+  bool times_ok = read_value(gDatabase, "/Runinfo/Start time binary", TID_DWORD, &start);
+  times_ok = read_value(gDatabase, "/Runinfo/Stop time binary", TID_DWORD, &stop) &&
              times_ok;
   const std::uint64_t elapsed = stop >= start ? stop - start : 0;
   double vme_sent = 0, easiroc_sent = 0;
-  read_value("/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent);
-  read_value("/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+  read_value(gDatabase, "/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent);
+  read_value(gDatabase, "/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
              TID_DOUBLE, &easiroc_sent);
   INT count_run = 0;
-  read_value("/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
+  read_value(gDatabase, "/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
   if (count_run == run_number) {
     double observed = 0;
-    if (read_value("/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
+    if (read_value(gDatabase, "/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
                    &observed)) vme_sent = std::max(vme_sent, observed);
-    if (read_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
+    if (read_value(gDatabase, "/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
                    &observed)) easiroc_sent = std::max(easiroc_sent, observed);
   }
   const std::int64_t vme_events =
@@ -1009,15 +975,15 @@ INT capture_runlog_eor(INT run_number, char*) {
   const std::int64_t hul_events = -1;
   std::uint64_t slips = 0;
   if (participation.vme)
-    read_value("/Equipment/VME/Variables/RunCounters/EventSlipCount",
+    read_value(gDatabase, "/Equipment/VME/Variables/RunCounters/EventSlipCount",
                TID_QWORD, &slips);
   bool ok = publish_status() && times_ok;
   INT status_run = 0;
   std::string daq_status, daq_summary;
-  ok = read_value("/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
+  ok = read_value(gDatabase, "/DAQ/Status/Runlog/StatusRunNumber", TID_INT32,
                   &status_run) && status_run == run_number &&
-       read_string("/DAQ/Status/Runlog/DAQStatus", &daq_status) &&
-       read_string("/DAQ/Status/Runlog/DAQSummary", &daq_summary) && ok;
+       read_string(gDatabase, "/DAQ/Status/Runlog/DAQStatus", &daq_status) &&
+       read_string(gDatabase, "/DAQ/Status/Runlog/DAQSummary", &daq_summary) && ok;
   ok = write_value("/DAQ/Status/Runlog/DurationSec", &elapsed,
                    sizeof(elapsed), TID_QWORD) && ok;
   ok = write_value("/DAQ/Status/Runlog/VMEEvents", &vme_events,
@@ -1043,13 +1009,13 @@ INT capture_runlog_eor(INT run_number, char*) {
 //************************************//
 void maybe_spawn_run_elog(INT* last_spawned_run) {
   INT state = 0, transition = 0, eor_run = 0, last_attempt = 0, last_run = 0;
-  if (!read_value("/Runinfo/State", TID_INT32, &state) ||
-      !read_value("/Runinfo/Transition in progress", TID_INT32, &transition) ||
-      !read_value("/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
+  if (!read_value(gDatabase, "/Runinfo/State", TID_INT32, &state) ||
+      !read_value(gDatabase, "/Runinfo/Transition in progress", TID_INT32, &transition) ||
+      !read_value(gDatabase, "/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
                   &eor_run) ||
-      !read_value("/Experiment/Run Elog/Last Attempt Run", TID_INT32,
+      !read_value(gDatabase, "/Experiment/Run Elog/Last Attempt Run", TID_INT32,
                   &last_attempt) ||
-      !read_value("/Experiment/Run Elog/Last Run", TID_INT32, &last_run) ||
+      !read_value(gDatabase, "/Experiment/Run Elog/Last Run", TID_INT32, &last_run) ||
       state != STATE_STOPPED || transition != 0 || eor_run <= 0 ||
       eor_run <= std::max({*last_spawned_run, last_attempt, last_run}))
     return;
@@ -1083,23 +1049,23 @@ void maybe_spawn_run_elog(INT* last_spawned_run) {
 void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
                              INT* active_run) {
   INT state = 0, transition = 0, eor_run = 0;
-  if (!read_value("/Runinfo/State", TID_INT32, &state) ||
-      !read_value("/Runinfo/Transition in progress", TID_INT32, &transition) ||
-      !read_value("/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
+  if (!read_value(gDatabase, "/Runinfo/State", TID_INT32, &state) ||
+      !read_value(gDatabase, "/Runinfo/Transition in progress", TID_INT32, &transition) ||
+      !read_value(gDatabase, "/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
                   &eor_run) ||
       state != STATE_STOPPED || transition != 0 || eor_run <= 0 ||
       eor_run <= *last_spawned_run || *active_child > 0)
     return;
 
   std::string directory, subdir;
-  if (!read_string("/Logger/Message dir", &directory) || directory.empty()) {
-    if (!read_string("/Logger/Data dir", &directory) || directory.empty()) {
+  if (!read_string(gDatabase, "/Logger/Message dir", &directory) || directory.empty()) {
+    if (!read_string(gDatabase, "/Logger/Data dir", &directory) || directory.empty()) {
       cm_msg(MERROR, kClientName, "Cannot locate JSON Runlog directory for index");
       *last_spawned_run = eor_run;
       return;
     }
   }
-  if (!read_string("/Logger/Runlog/JSON/Subdir", &subdir)) {
+  if (!read_string(gDatabase, "/Logger/Runlog/JSON/Subdir", &subdir)) {
     cm_msg(MERROR, kClientName, "Cannot read JSON Runlog subdirectory for index");
     *last_spawned_run = eor_run;
     return;
@@ -1143,11 +1109,11 @@ void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
 
 std::optional<std::filesystem::path> edit_runlog_directory() {
   std::string directory, subdir;
-  if (!read_string("/Logger/Message dir", &directory) || directory.empty()) {
-    if (!read_string("/Logger/Data dir", &directory) || directory.empty())
+  if (!read_string(gDatabase, "/Logger/Message dir", &directory) || directory.empty()) {
+    if (!read_string(gDatabase, "/Logger/Data dir", &directory) || directory.empty())
       return std::nullopt;
   }
-  if (!read_string("/Logger/Runlog/JSON/Subdir", &subdir) || subdir.empty() ||
+  if (!read_string(gDatabase, "/Logger/Runlog/JSON/Subdir", &subdir) || subdir.empty() ||
       std::filesystem::path(subdir).is_absolute())
     return std::nullopt;
   std::error_code error;
@@ -1164,9 +1130,9 @@ std::optional<std::filesystem::path> edit_runlog_directory() {
 bool runlog_edit_is_active(std::int64_t target_run) {
   INT current_run = 0, state = 0, transition = 0;
   const bool valid =
-      read_value("/Runinfo/Run number", TID_INT32, &current_run) &&
-      read_value("/Runinfo/State", TID_INT32, &state) &&
-      read_value("/Runinfo/Transition in progress", TID_INT32, &transition);
+      read_value(gDatabase, "/Runinfo/Run number", TID_INT32, &current_run) &&
+      read_value(gDatabase, "/Runinfo/State", TID_INT32, &state) &&
+      read_value(gDatabase, "/Runinfo/Transition in progress", TID_INT32, &transition);
   return daq_monitor::runlog_edit_target_active(
       target_run, current_run, state, transition, valid);
 }

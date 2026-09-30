@@ -1,4 +1,5 @@
 #include "monitor_alarms.h"
+#include "monitor_odb_utils.h"
 #include "status_policy.h"
 
 #include <algorithm>
@@ -10,8 +11,10 @@
 
 namespace {
 
+using daq_monitor::read_string;
+using daq_monitor::read_value;
+
 constexpr char kClientName[] = "daq_monitor";
-constexpr std::size_t kStringCapacity = 512;
 HNDLE gDatabase = 0;
 
 bool ensure_alarm_value(const std::string& path, const void* value, INT size,
@@ -89,37 +92,13 @@ bool initialize_alarm_classes() {
          initialize_alarm_class("DAQ Error", "red");
 }
 
-template <typename T>
-bool read_value(const char* path, DWORD type, T* value) {
-  T candidate{};
-  INT size = sizeof(candidate);
-  const INT status =
-      db_get_value(gDatabase, 0, path, &candidate, &size, type, FALSE);
-  if (status != DB_SUCCESS || size != static_cast<INT>(sizeof(candidate)))
-    return false;
-  *value = candidate;
-  return true;
-}
-
-bool read_string(const std::string& path, std::string* value) {
-  char buffer[kStringCapacity] = {};
-  INT size = sizeof(buffer);
-  const INT status = db_get_value(gDatabase, 0, path.c_str(), buffer, &size,
-                                  TID_STRING, FALSE);
-  if (status != DB_SUCCESS || size <= 0)
-    return false;
-  buffer[sizeof(buffer) - 1] = '\0';
-  *value = buffer;
-  return true;
-}
-
 bool validate_global_alarm_class() {
   HNDLE key = 0;
   if (db_find_key(gDatabase, 0, "/Alarms/Classes/All", &key) != DB_SUCCESS)
     return true;
 
   BOOL stop_run = FALSE;
-  if (!read_value("/Alarms/Classes/All/Stop run", TID_BOOL, &stop_run)) {
+  if (!read_value(gDatabase, "/Alarms/Classes/All/Stop run", TID_BOOL, &stop_run)) {
     cm_msg(MERROR, kClientName,
            "Cannot verify /Alarms/Classes/All/Stop run");
     return false;
@@ -133,25 +112,13 @@ bool validate_global_alarm_class() {
   return true;
 }
 
-daq_monitor::RunState policy_run_state(INT state) {
-  switch (state) {
-    case STATE_RUNNING:
-      return daq_monitor::RunState::kRunning;
-    case STATE_STOPPED:
-      return daq_monitor::RunState::kStopped;
-    case STATE_PAUSED:
-    default:
-      return daq_monitor::RunState::kPausedOrTransition;
-  }
-}
-
 std::string count_detail(const std::string& reason,
                          const char* counter_path,
                          const char* reason_fragment) {
   if (reason.find(reason_fragment) == std::string::npos)
     return {};
   std::uint64_t count = 0;
-  if (!read_value(counter_path, TID_QWORD, &count))
+  if (!read_value(gDatabase, counter_path, TID_QWORD, &count))
     return {};
   return "count=" + std::to_string(count);
 }
@@ -276,27 +243,27 @@ bool update_alarms(daq_monitor::MonitorAlarmState* state) {
   BOOL easiroc_connected = FALSE;
   BOOL alarm_system_active = FALSE;
 
-  if (!read_value("/Alarms/Alarm system active", TID_BOOL,
+  if (!read_value(gDatabase, "/Alarms/Alarm system active", TID_BOOL,
                   &alarm_system_active))
     return false;
 
   const bool vme_ok =
-      read_string("/DAQ/Status/Frontends/VME/Severity", &vme_severity) &&
-      read_string("/DAQ/Status/Frontends/VME/Reason", &vme_reason);
+      read_string(gDatabase, "/DAQ/Status/Frontends/VME/Severity", &vme_severity) &&
+      read_string(gDatabase, "/DAQ/Status/Frontends/VME/Reason", &vme_reason);
   const bool easiroc_ok =
-      read_string("/DAQ/Status/Frontends/EASIROC/Severity",
+      read_string(gDatabase, "/DAQ/Status/Frontends/EASIROC/Severity",
                   &easiroc_severity) &&
-      read_string("/DAQ/Status/Frontends/EASIROC/Reason", &easiroc_reason);
+      read_string(gDatabase, "/DAQ/Status/Frontends/EASIROC/Reason", &easiroc_reason);
   const bool logger_ok =
-      read_string("/DAQ/Status/Logger/Severity", &logger_severity);
+      read_string(gDatabase, "/DAQ/Status/Logger/Severity", &logger_severity);
   const bool disk_ok =
-      read_string("/DAQ/Status/Disk/Severity", &disk_severity) &&
-      read_value("/DAQ/Status/Disk/FreeGB", TID_DOUBLE, &disk_free_gb);
+      read_string(gDatabase, "/DAQ/Status/Disk/Severity", &disk_severity) &&
+      read_value(gDatabase, "/DAQ/Status/Disk/FreeGB", TID_DOUBLE, &disk_free_gb);
   const bool run_state_ok =
-      read_value("/DAQ/Status/Run/State", TID_INT32, &run_state);
-  const bool vme_connection_ok = read_value(
+      read_value(gDatabase, "/DAQ/Status/Run/State", TID_INT32, &run_state);
+  const bool vme_connection_ok = read_value(gDatabase,
       "/DAQ/Status/Frontends/VME/Connected", TID_BOOL, &vme_connected);
-  const bool easiroc_connection_ok = read_value(
+  const bool easiroc_connection_ok = read_value(gDatabase,
       "/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
       &easiroc_connected);
 
@@ -308,7 +275,7 @@ bool update_alarms(daq_monitor::MonitorAlarmState* state) {
   vme.alarm_suppressed =
       run_state_ok && vme_connection_ok &&
       daq_monitor::suppress_frontend_disconnect_alarm(
-          policy_run_state(run_state), vme_connected != FALSE, vme.severity,
+          daq_monitor::policy_run_state(run_state), vme_connected != FALSE, vme.severity,
           vme.reason);
 
   daq_monitor::AlarmObservation easiroc{
@@ -319,7 +286,7 @@ bool update_alarms(daq_monitor::MonitorAlarmState* state) {
   easiroc.alarm_suppressed =
       run_state_ok && easiroc_connection_ok &&
       daq_monitor::suppress_frontend_disconnect_alarm(
-          policy_run_state(run_state), easiroc_connected != FALSE,
+          daq_monitor::policy_run_state(run_state), easiroc_connected != FALSE,
           easiroc.severity, easiroc.reason);
 
   const daq_monitor::AlarmObservation logger{
