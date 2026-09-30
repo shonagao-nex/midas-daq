@@ -21,7 +21,7 @@ int main() {
   const std::string source = readFile("feeasiroc.cxx");
   const auto begin =
       source.find("void process_manual_buffer_clear_request()");
-  const auto end = source.find("void set_firmware_readback_valid", begin);
+  const auto end = source.find("void reset_software_readout_state()", begin);
   expect(begin != std::string::npos && end != std::string::npos,
          "cannot isolate EASIROC manual clear function");
   const std::string clear = source.substr(begin, end - begin);

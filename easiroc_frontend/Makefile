@@ -45,7 +45,7 @@ LAST_APPLIED_TEST_OBJECTS := $(call obj,tests/easiroc_last_applied_test.cxx \
 READOUT_TEST_OBJECTS := $(call obj,tests/easiroc_readout_test.cxx easiroc_readout.cxx)
 # The encoder/apply executor is linked for the manual command backend only;
 # the production BOR path does not call it.
-FEEASIROC_OBJECTS := $(call obj,feeasiroc.cxx easiroc_daq_control.cxx easiroc_run_settings.cxx \
+FEEASIROC_OBJECTS := $(call obj,feeasiroc.cxx easiroc_odb.cxx easiroc_daq_control.cxx easiroc_run_settings.cxx \
 	easiroc_manual_apply.cxx easiroc_asic_apply.cxx easiroc_slow_control.cxx \
 	easiroc_status.cxx easiroc_stream.cxx easiroc_event.cxx \
 	easiroc_last_applied.cxx \
@@ -177,6 +177,7 @@ $(PRODUCTION_TARGET): $(FEEASIROC_OBJECTS)
 		$(MIDAS_LIBS) $(LDLIBS)
 
 $(BUILD_DIR)/feeasiroc.o: CPPFLAGS += $(MIDAS_CPPFLAGS)
+$(BUILD_DIR)/easiroc_odb.o: CPPFLAGS += $(MIDAS_CPPFLAGS)
 $(BUILD_DIR)/feeasiroc.o: feeasiroc.cxx easiroc_daq_control.h easiroc_run_settings.h \
 	easiroc_manual_apply.h easiroc_asic_apply.h easiroc_slow_control.h \
 	easiroc_last_applied.h easiroc_status.h easiroc_stream.h easiroc_readout.h \
