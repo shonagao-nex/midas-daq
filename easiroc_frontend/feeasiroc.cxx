@@ -281,31 +281,46 @@ easiroc::ManualApplyRunState read_manual_apply_run_state(bool* ok) {
 void publish_completed_diagnostic();
 
 //************************************//
-// Apply requested EASIROC settings while stopped
+// Carry the claimed request and prior apply state
 //************************************//
-void process_manual_apply_request() {
+struct PendingManualApplyRequest {
+  DWORD request_id = 0;
+  bool another_apply_in_progress = false;
+  DWORD previous_successful_request_id = 0;
+};
+
+//************************************//
+// Accept the next manual ASIC apply request
+//************************************//
+std::optional<PendingManualApplyRequest> accept_manual_apply_request() {
   const std::string request_path =
       odb_path(kCommandsPath, "ASICSlowControl/ApplyRequestId");
   DWORD request_id = 0;
   if (!read_odb_dword(request_path, &request_id) ||
       request_id <= g_state.asic_apply.last_handled_request_id)
-    return;
+    return std::nullopt;
 
   const bool another_apply_in_progress = g_state.asic_apply.apply_in_progress;
   const auto transition =
       easiroc::beginManualApplyRequest(g_state.asic_apply, request_id);
-  if (!transition.handled) return;
+  if (!transition.handled) return std::nullopt;
   g_state.asic_apply = transition.pending;
   publish_runtime_variables();
+  return PendingManualApplyRequest{
+      request_id, another_apply_in_progress,
+      transition.pending.last_successful_request_id};
+}
 
-  // Serialize manual writes with the read-only startup/status diagnostic so
-  // two RBCP clients in this frontend never access the device concurrently.
-  if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
-  publish_completed_diagnostic();
+struct ManualApplyPreparation {
+  FrontendSettings settings;
+  easiroc::ManualApplyRequestContext context;
+};
 
-  const std::time_t now = std::time(nullptr);
-  const std::uint64_t unix_time =
-      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+//************************************//
+// Snapshot run state and settings for one manual apply
+//************************************//
+std::optional<ManualApplyPreparation> prepare_manual_apply(
+    bool another_apply_in_progress, std::uint64_t unix_time) {
   bool run_state_ok = false;
   const auto run_state = read_manual_apply_run_state(&run_state_ok);
   if (!run_state_ok) {
@@ -314,7 +329,7 @@ void process_manual_apply_request() {
         "Cannot verify Run state for manual ASIC slow-control apply",
         unix_time);
     publish_runtime_variables();
-    return;
+    return std::nullopt;
   }
 
   FrontendSettings apply_settings;
@@ -324,7 +339,7 @@ void process_manual_apply_request() {
         "Cannot snapshot EASIROC Settings for manual slow-control apply",
         unix_time);
     publish_runtime_variables();
-    return;
+    return std::nullopt;
   }
   // This local copy is the complete immutable request snapshot. Neither the
   // image nor LastApplied is populated from live ODB after this point.
@@ -332,27 +347,14 @@ void process_manual_apply_request() {
 
   const easiroc::ManualApplyRequestContext context{
       run_state, apply_settings.enabled, another_apply_in_progress};
-  std::unique_ptr<RbcpClient> manual_rbcp;
-  const auto result = easiroc::executeManualApplyBackend(
-      g_state.asic_apply, context, apply_settings.asic_slow_control,
-      g_state.last_applied, g_state.hardware_state_indeterminate, unix_time,
-      [](const easiroc::ManualApplyStatus& status) {
-        g_state.asic_apply = status;
-        publish_runtime_variables();
-      },
-      [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
-        if (!manual_rbcp)
-          manual_rbcp = std::make_unique<RbcpClient>(apply_settings.ip_address,
-                                                     kRbcpPort);
-        cm_msg(MINFO, "manual_apply",
-               "ASIC slow-control RBCP write: address 0x%08x, %zu byte(s)",
-               static_cast<unsigned>(address), data.size());
-        manual_rbcp->write(address, data);
-      },
-      [](unsigned milliseconds) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-      });
+  return ManualApplyPreparation{std::move(apply_settings), context};
+}
 
+//************************************//
+// Save the backend result and last transmitted ASIC settings
+//************************************//
+void record_manual_apply_result(const easiroc::ManualApplyBackendResult& result,
+                                DWORD previous_successful_request_id) {
   g_state.hardware_state_indeterminate =
       result.hardware_state_indeterminate;
   g_state.asic_apply = result.terminal;
@@ -361,7 +363,7 @@ void process_manual_apply_request() {
       g_state.last_applied = result.last_applied;
     } else {
       g_state.asic_apply.last_successful_request_id =
-          transition.pending.last_successful_request_id;
+          previous_successful_request_id;
       g_state.asic_apply.state = easiroc::ManualApplyState::kFailed;
       g_state.asic_apply.last_attempt_succeeded = false;
       g_state.asic_apply.last_apply_error =
@@ -370,6 +372,12 @@ void process_manual_apply_request() {
       load_last_applied_settings();
     }
   }
+}
+
+//************************************//
+// Publish and log the terminal manual apply status
+//************************************//
+void publish_manual_apply_result(DWORD request_id) {
   publish_runtime_variables();
   if (g_state.asic_apply.state == easiroc::ManualApplyState::kSucceeded) {
     cm_msg(MINFO, "manual_apply",
@@ -383,6 +391,51 @@ void process_manual_apply_request() {
            easiroc::manualApplyStateName(g_state.asic_apply.state),
            g_state.asic_apply.last_apply_error.c_str());
   }
+}
+
+//************************************//
+// Apply requested EASIROC settings while stopped
+//************************************//
+void process_manual_apply_request() {
+  const auto request = accept_manual_apply_request();
+  if (!request) return;
+
+  // Serialize manual writes with the read-only startup/status diagnostic so
+  // two RBCP clients in this frontend never access the device concurrently.
+  if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
+  publish_completed_diagnostic();
+
+  const std::time_t now = std::time(nullptr);
+  const std::uint64_t unix_time =
+      now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  const auto preparation =
+      prepare_manual_apply(request->another_apply_in_progress, unix_time);
+  if (!preparation) return;
+
+  std::unique_ptr<RbcpClient> manual_rbcp;
+  const auto result = easiroc::executeManualApplyBackend(
+      g_state.asic_apply, preparation->context,
+      preparation->settings.asic_slow_control,
+      g_state.last_applied, g_state.hardware_state_indeterminate, unix_time,
+      [](const easiroc::ManualApplyStatus& status) {
+        g_state.asic_apply = status;
+        publish_runtime_variables();
+      },
+      [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
+        if (!manual_rbcp)
+          manual_rbcp = std::make_unique<RbcpClient>(
+              preparation->settings.ip_address, kRbcpPort);
+        cm_msg(MINFO, "manual_apply",
+               "ASIC slow-control RBCP write: address 0x%08x, %zu byte(s)",
+               static_cast<unsigned>(address), data.size());
+        manual_rbcp->write(address, data);
+      },
+      [](unsigned milliseconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+      });
+
+  record_manual_apply_result(result, request->previous_successful_request_id);
+  publish_manual_apply_result(request->request_id);
 }
 
 //************************************//
