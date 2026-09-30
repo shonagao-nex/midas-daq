@@ -249,6 +249,11 @@ void set_v1720e_readback_valid(bool valid);
 void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
                              bool valid);
 void set_module_readback_valid(const char *path, bool valid);
+void publish_v792_readback(WORD firmware, WORD iped, BOOL zero_suppression,
+                           BOOL all_trigger, WORD bits,
+                           const WORD (&thresholds)[32], bool valid);
+void publish_v775_readback(WORD firmware, WORD full_scale, WORD fast_clear,
+                           WORD bits, const WORD (&thresholds)[32], bool valid);
 void initialize_module_output_schema(
     V7xxRuntimeState &v792, V1190RuntimeState &v1190, V7xxRuntimeState &v775,
     DWORD &v792_last_publish, DWORD &v1190_last_publish,

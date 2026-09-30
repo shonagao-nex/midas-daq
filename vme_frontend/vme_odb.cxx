@@ -1,5 +1,6 @@
 #include "vme_odb.h"
 #include "rpv130.h"
+#include "v775.h"
 
 #include <cstdio>
 #include <cstring>
@@ -805,6 +806,39 @@ void set_module_readback_valid(const char *path, bool valid)
 {
     const BOOL v=valid?TRUE:FALSE;
     set_module_output(path,"Valid",&v,sizeof(v),1,TID_BOOL);
+}
+
+//************************************//
+// Publish verified V792 register values to ODB
+//************************************//
+void publish_v792_readback(WORD firmware, WORD iped, BOOL zero_suppression,
+                           BOOL all_trigger, WORD bits,
+                           const WORD (&thresholds)[32], bool valid)
+{
+    set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zero_suppression,sizeof(zero_suppression),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"AllTriggerEnabled",&all_trigger,sizeof(all_trigger),1,TID_BOOL);
+    set_module_output(V792_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD);
+    set_module_output(V792_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
+    set_module_readback_valid(V792_READBACK_PATH,valid);
+}
+
+//************************************//
+// Publish verified V775 register values to ODB
+//************************************//
+void publish_v775_readback(WORD firmware, WORD full_scale, WORD fast_clear,
+                           WORD bits, const WORD (&thresholds)[32], bool valid)
+{
+    set_module_output(V775_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"FullScaleRange",&full_scale,sizeof(full_scale),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"FastClearWindow",&fast_clear,sizeof(fast_clear),1,TID_WORD);
+#define RB775(k,m,b) { const BOOL v=!!(bits&b); set_module_output(V775_READBACK_PATH,k,&v,sizeof(v),1,TID_BOOL); }
+    RB775("OverRangeEnabled",over_range_enabled,V775_BIT2_OVER_RANGE); RB775("LowThresholdEnabled",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); RB775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); RB775("EmptyProgramEnabled",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); RB775("ValidControlEnabled",valid_control_enabled,V775_BIT2_VALID_CONTROL); RB775("SlidingScaleEnabled",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); RB775("AllTriggerEnabled",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
+#undef RB775
+    set_module_output(V775_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD);
+    set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
+    set_module_readback_valid(V775_READBACK_PATH,valid);
 }
 
 //************************************//

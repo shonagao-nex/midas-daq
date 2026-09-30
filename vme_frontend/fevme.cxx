@@ -1843,6 +1843,9 @@ static bool verify_value(const char *module, const char *item,
     return false;
 }
 
+//************************************//
+// Verify V792 registers and publish their readback
+//************************************//
 static bool verify_v792_configuration()
 {
     if(!gVmeConfig.v792.enabled) { set_module_readback_valid(V792_READBACK_PATH,false); return true; }
@@ -1858,13 +1861,8 @@ static bool verify_v792_configuration()
     v7xx_config::capture_v792_readback(
         gVmeModuleState.snapshot.v792_readback, firmware, iped, bits,
         zs, all, thresholds, ok);
-    set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
-    set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
-    set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zs,sizeof(zs),1,TID_BOOL);
-    set_module_output(V792_READBACK_PATH,"AllTriggerEnabled",&all,sizeof(all),1,TID_BOOL);
-    set_module_output(V792_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD);
-    set_module_output(V792_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD);
-    set_module_readback_valid(V792_READBACK_PATH,ok); return ok;
+    vme_odb::publish_v792_readback(firmware, iped, zs, all, bits, thresholds, ok);
+    return ok;
 }
 
 
@@ -1881,6 +1879,9 @@ static bool verify_v1190_configuration()
         gVmeModuleState.snapshot.v1190_readback);
 }
 
+//************************************//
+// Verify V775 registers and publish their readback
+//************************************//
 static bool verify_v775_configuration()
 {
     if(!gVmeConfig.v775.enabled) { set_module_readback_valid(V775_READBACK_PATH,false); return true; }
@@ -1894,11 +1895,8 @@ static bool verify_v775_configuration()
     v7xx_config::capture_v775_readback(
         gVmeModuleState.snapshot.v775_readback, firmware, fsr, fclr,
         bits, thresholds, ok);
-    set_module_output(V775_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FullScaleRange",&fsr,sizeof(fsr),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FastClearWindow",&fclr,sizeof(fclr),1,TID_WORD);
-#define RB775(k,m,b) { const BOOL v=!!(bits&b); set_module_output(V775_READBACK_PATH,k,&v,sizeof(v),1,TID_BOOL); }
-    RB775("OverRangeEnabled",over_range_enabled,V775_BIT2_OVER_RANGE); RB775("LowThresholdEnabled",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); RB775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); RB775("EmptyProgramEnabled",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); RB775("ValidControlEnabled",valid_control_enabled,V775_BIT2_VALID_CONTROL); RB775("SlidingScaleEnabled",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); RB775("AllTriggerEnabled",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
-#undef RB775
-    set_module_output(V775_READBACK_PATH,"BitSet2Raw",&bits,sizeof(bits),1,TID_WORD); set_module_output(V775_READBACK_PATH,"Threshold",thresholds,sizeof(thresholds),32,TID_WORD); set_module_readback_valid(V775_READBACK_PATH,ok); return ok;
+    vme_odb::publish_v775_readback(firmware, fsr, fclr, bits, thresholds, ok);
+    return ok;
 }
 //************************************//
 // Clear participating module event buffers
