@@ -21,6 +21,7 @@
 #include "out0_diagnostic.h"
 #include "vme_odb.h"
 #include "v1190_config.h"
+#include "v1720e_config.h"
 
 using vme_odb::make_odb_path;
 using vme_odb::set_absolute_odb_value;
@@ -186,37 +187,12 @@ static const DWORD V1720E_STATUS_EXTERNAL_CLOCK = 0x00000020u;
 static const DWORD V1720E_STATUS_PLL_OK = 0x00000080u;
 static const DWORD V1720E_STATUS_BOARD_READY = 0x00000100u;
 
-static V1720ESettings default_v1720e_settings()
-{
-    V1720ESettings settings = {};
-    settings.enabled = TRUE;
-    settings.buffer_organization = 0x0Au;
-    settings.record_length_samples = V1720E_DEFAULT_RECORD_SAMPLES;
-    settings.post_trigger = 0x30u;
-    settings.software_trigger_enabled = TRUE;
-    settings.external_trigger_enabled = TRUE;
-    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
-        settings.channel_self_trigger_enabled[channel] = FALSE;
-        settings.channel_enabled[channel] = TRUE;
-        settings.dc_offset[channel] = 0x8000u;
-    }
-    return settings;
-}
-
-static V1720ESettings gV1720RunSettings = default_v1720e_settings();
-static V1720E_CONFIG gV1720RunConfig = {};
-static bool gV1720StartupEnabled = true;
-static INT gV1720StartupRunState = -1;
-static bool gV1720VariablesEnabled = true;
-static DWORD gV1720ExpectedEventWords = V1720E_DEFAULT_EVENT_WORDS;
-static DWORD gV1720ExpectedChannelMask = V1720E_DEFAULT_CHANNEL_MASK;
+static v1720e_config::State gV1720State;
 /* Change this source constant to BLT32 for the hardware comparison run. */
 static const V1720E_READOUT_MODE V1720E_READOUT_MODE_SELECT = BLT32;
 static const DWORD V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
 static const DWORD V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
 
-static V1720ERuntimeState gV1720Runtime = {};
-static DWORD gV1720LastVariablesPublish = 0;
 
 static void mark_configuration_failed(INT run_number)
 {
@@ -660,7 +636,7 @@ static bool initialize_other_module_odb()
 
 static bool ensure_v1720e_settings_schema()
 {
-    return vme_odb::ensure_v1720e_settings_schema(default_v1720e_settings());
+    return vme_odb::ensure_v1720e_settings_schema(v1720e_config::default_settings());
 }
 
 using vme_odb::read_v1720e_settings;
@@ -684,35 +660,35 @@ static void set_v1720e_readback_valid(bool valid)
 
 static void update_v1720e_acquisition_status(DWORD status)
 {
-    gV1720Runtime.acquisition_status = status;
-    gV1720Runtime.running = (status & V1720E_ACQ_RUN) != 0;
-    gV1720Runtime.event_ready =
+    gV1720State.runtime.value.acquisition_status = status;
+    gV1720State.runtime.value.running = (status & V1720E_ACQ_RUN) != 0;
+    gV1720State.runtime.value.event_ready =
         (status & V1720E_STATUS_EVENT_READY) != 0;
-    gV1720Runtime.external_clock =
+    gV1720State.runtime.value.external_clock =
         (status & V1720E_STATUS_EXTERNAL_CLOCK) != 0;
-    gV1720Runtime.pll_locked = (status & V1720E_STATUS_PLL_OK) != 0;
-    gV1720Runtime.board_ready = (status & V1720E_STATUS_BOARD_READY) != 0;
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value.pll_locked = (status & V1720E_STATUS_PLL_OK) != 0;
+    gV1720State.runtime.value.board_ready = (status & V1720E_STATUS_BOARD_READY) != 0;
+    gV1720State.runtime.value.dirty = true;
 }
 
 static void update_v1720e_board_state(const V1720E_BOARD_INFO &info)
 {
-    gV1720Runtime.acquisition_control = info.acquisition_control;
+    gV1720State.runtime.value.acquisition_control = info.acquisition_control;
     update_v1720e_acquisition_status(info.acquisition_status);
-    gV1720Runtime.event_stored = info.event_stored;
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value.event_stored = info.event_stored;
+    gV1720State.runtime.value.dirty = true;
 }
 
 static bool publish_v1720e_variables()
 {
     return vme_odb::publish_v1720e_variables(
-        gV1720Runtime, gV1720LastVariablesPublish);
+        gV1720State.runtime.value, gV1720State.runtime.last_variables_publish);
 }
 
 static void set_v1720e_communication_ok(bool ok)
 {
-    gV1720Runtime.communication_ok = ok ? TRUE : FALSE;
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value.communication_ok = ok ? TRUE : FALSE;
+    gV1720State.runtime.value.dirty = true;
     publish_v1720e_variables();
 }
 
@@ -732,8 +708,8 @@ static void initialize_v1720e_output_schema()
 {
     const V1720E_CONFIG_READBACK empty_readback = {};
     publish_v1720e_readback(empty_readback, false);
-    gV1720Runtime = {};
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value = {};
+    gV1720State.runtime.value.dirty = true;
     publish_v1720e_variables();
 }
 
@@ -748,8 +724,8 @@ static bool initialize_v1720e_odb()
     V1720ESettings startup_settings = {};
     if (!read_v1720e_settings(startup_settings))
         return false;
-    gV1720StartupEnabled = startup_settings.enabled != FALSE;
-    gV1720VariablesEnabled = gV1720StartupEnabled;
+    gV1720State.lifecycle.startup_enabled = startup_settings.enabled != FALSE;
+    gV1720State.run.variables_enabled = gV1720State.lifecycle.startup_enabled;
     return true;
 }
 
@@ -823,14 +799,6 @@ struct V775EventInfo {
     bool valid;
 };
 
-static bool gV1720Started = false;
-/*
- * Set before issuing the V1720E RUN request. A failed start can mean that the
- * write reached the module but a subsequent verification read failed, so an
- * attempted start must be rolled back even when gV1720Started is still false.
- */
-static bool gV1720StartAttempted = false;
-
 enum class V1720StopOutcome { Disabled, AlreadyStopped, StopVerified };
 
 static const char *v1720_stop_outcome_name(V1720StopOutcome outcome)
@@ -845,22 +813,22 @@ static const char *v1720_stop_outcome_name(V1720StopOutcome outcome)
 
 static void invalidate_v1720e_current_state()
 {
-    gV1720Runtime.communication_ok = FALSE;
-    gV1720Runtime.acquisition_control = 0;
-    gV1720Runtime.acquisition_status = 0;
-    gV1720Runtime.running = FALSE;
-    gV1720Runtime.event_ready = FALSE;
-    gV1720Runtime.external_clock = FALSE;
-    gV1720Runtime.pll_locked = FALSE;
-    gV1720Runtime.board_ready = FALSE;
-    gV1720Runtime.event_stored = 0;
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value.communication_ok = FALSE;
+    gV1720State.runtime.value.acquisition_control = 0;
+    gV1720State.runtime.value.acquisition_status = 0;
+    gV1720State.runtime.value.running = FALSE;
+    gV1720State.runtime.value.event_ready = FALSE;
+    gV1720State.runtime.value.external_clock = FALSE;
+    gV1720State.runtime.value.pll_locked = FALSE;
+    gV1720State.runtime.value.board_ready = FALSE;
+    gV1720State.runtime.value.event_stored = 0;
+    gV1720State.runtime.value.dirty = true;
 }
 
 static bool stop_v1720e_and_publish_state(
     const char *context, V1720StopOutcome *outcome = nullptr)
 {
-    if (!gV1720StartupEnabled && !gV1720StartAttempted && !gV1720Started) {
+    if (!gV1720State.lifecycle.startup_enabled && !gV1720State.lifecycle.start_attempted && !gV1720State.lifecycle.started) {
         if (outcome) *outcome = V1720StopOutcome::Disabled;
         return true;
     }
@@ -909,11 +877,11 @@ static bool stop_v1720e_and_publish_state(
         return false;
     }
 
-    gV1720StartAttempted = false;
-    gV1720Started = false;
+    gV1720State.lifecycle.start_attempted = false;
+    gV1720State.lifecycle.started = false;
     if (outcome) *outcome = stop_attempted
         ? V1720StopOutcome::StopVerified : V1720StopOutcome::AlreadyStopped;
-    gV1720Runtime.communication_ok = TRUE;
+    gV1720State.runtime.value.communication_ok = TRUE;
     update_v1720e_board_state(state);
     publish_v1720e_variables();
     cm_msg(MINFO, frontend_name,
@@ -1536,8 +1504,8 @@ static bool wait_for_v1720e_data_ready()
                                             &event_stored,
                                             &acquisition_status);
         if (status != MVME_SUCCESS) {
-            gV1720Runtime.communication_ok = FALSE;
-            gV1720Runtime.dirty = true;
+            gV1720State.runtime.value.communication_ok = FALSE;
+            gV1720State.runtime.value.dirty = true;
             ++gVmeStatistics.run.v1720_read_timeout_count;
             mark_run_counters_dirty();
             cm_msg(MERROR, frontend_name,
@@ -1545,7 +1513,7 @@ static bool wait_for_v1720e_data_ready()
             return false;
         }
         update_v1720e_acquisition_status(acquisition_status);
-        gV1720Runtime.event_stored = event_stored;
+        gV1720State.runtime.value.event_stored = event_stored;
         if (ready)
             return true;
         if (poll + 1 < V1720E_READY_MAX_POLLS)
@@ -1713,96 +1681,6 @@ static bool setup_v775_sw_trigger_test()
 }
 #endif
 
-static bool make_v1720e_run_configuration(const V1720ESettings &settings,
-                                          V1720E_CONFIG &config,
-                                          DWORD &expected_event_words,
-                                          DWORD &expected_channel_mask)
-{
-    if (settings.buffer_organization > 0x0Au) {
-        cm_msg(MERROR, frontend_name,
-               "V1720E BufferOrganization %u is outside supported range 0..10",
-               settings.buffer_organization);
-        return false;
-    }
-    if (settings.post_trigger > 0xFFu) {
-        cm_msg(MERROR, frontend_name,
-               "V1720E PostTrigger %u is outside the 8-bit register range",
-               settings.post_trigger);
-        return false;
-    }
-    /*
-     * The installed waveform-recording firmware 4.5 was verified with
-     * Custom Size 0x40 producing 256 samples/channel.  The older CAEN
-     * register description warns that its generic NLOC conversion may not
-     * apply above ROC firmware 3.8, so the first ODB version deliberately
-     * accepts only this verified pair.
-     */
-    if (settings.record_length_samples != V1720E_DEFAULT_RECORD_SAMPLES) {
-        cm_msg(MERROR, frontend_name,
-               "V1720E RecordLengthSamples %u is unsupported; first ODB version accepts only %u",
-               settings.record_length_samples,
-               V1720E_DEFAULT_RECORD_SAMPLES);
-        return false;
-    }
-
-    config = {};
-    config.buffer_organization = settings.buffer_organization;
-    config.custom_size = V1720E_DEFAULT_CUSTOM_SIZE;
-    config.post_trigger = settings.post_trigger;
-    if (settings.software_trigger_enabled)
-        config.trigger_source |= V1720E_TRIGGER_SOFTWARE;
-    if (settings.external_trigger_enabled)
-        config.trigger_source |= V1720E_TRIGGER_EXTERNAL;
-
-    unsigned enabled_channels = 0;
-    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
-        if (settings.channel_self_trigger_enabled[channel])
-            config.trigger_source |= (1u << channel);
-        if (settings.channel_enabled[channel]) {
-            config.channel_enable |= (1u << channel);
-            ++enabled_channels;
-        }
-        config.dc_offset[channel] = settings.dc_offset[channel];
-    }
-    if (enabled_channels == 0) {
-        cm_msg(MERROR, frontend_name,
-               "V1720E configuration has no enabled channels");
-        return false;
-    }
-
-    expected_channel_mask = config.channel_enable & 0xFFu;
-    expected_event_words = 4u + enabled_channels *
-        (settings.record_length_samples / 2u);
-    if (expected_event_words > V1720E_MAX_EVENT_WORDS) {
-        cm_msg(MERROR, frontend_name,
-               "V1720E expected event size %u exceeds safety limit %u",
-               expected_event_words, V1720E_MAX_EVENT_WORDS);
-        return false;
-    }
-    return true;
-}
-
-static bool snapshot_v1720e_settings_for_run()
-{
-    V1720ESettings settings = {};
-    V1720E_CONFIG config = {};
-    DWORD expected_event_words = 0;
-    DWORD expected_channel_mask = 0;
-    if (!read_v1720e_settings(settings))
-        return false;
-    if (settings.enabled &&
-        !make_v1720e_run_configuration(settings, config,
-                                       expected_event_words,
-                                       expected_channel_mask))
-        return false;
-    gV1720RunSettings = settings;
-    gV1720VariablesEnabled = settings.enabled != FALSE;
-    gV1720RunConfig = config;
-    gV1720ExpectedEventWords = expected_event_words;
-    gV1720ExpectedChannelMask = expected_channel_mask;
-    return true;
-}
-
 static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
                                     bool valid)
 {
@@ -1850,79 +1728,6 @@ static void publish_v1720e_readback(const V1720E_CONFIG_READBACK &readback,
     SET_READBACK("ChannelConfigRaw", readback.channel_config, 1, TID_DWORD);
 #undef SET_READBACK
     set_v1720e_readback_valid(valid);
-}
-
-static void capture_v1720e_run_readback(
-    const V1720E_CONFIG_READBACK &readback, bool valid)
-{
-    V1720EReadbackSnapshot &snapshot = gVmeModuleState.snapshot.v1720e_readback;
-    snapshot = {};
-    snapshot.valid = valid ? TRUE : FALSE;
-    snapshot.board_info = readback.board_info;
-    snapshot.roc_firmware_revision = readback.roc_firmware;
-    snapshot.buffer_organization = readback.buffer_organization;
-    snapshot.custom_size_raw = readback.custom_size;
-    snapshot.record_length_samples =
-        readback.custom_size == V1720E_DEFAULT_CUSTOM_SIZE
-            ? V1720E_DEFAULT_RECORD_SAMPLES : 0u;
-    snapshot.post_trigger = readback.post_trigger;
-    snapshot.software_trigger_enabled =
-        (readback.trigger_source & V1720E_TRIGGER_SOFTWARE) != 0;
-    snapshot.external_trigger_enabled =
-        (readback.trigger_source & V1720E_TRIGGER_EXTERNAL) != 0;
-    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
-        snapshot.channel_self_trigger_enabled[channel] =
-            (readback.trigger_source & (1u << channel)) != 0;
-        snapshot.channel_enabled[channel] =
-            (readback.channel_enable & (1u << channel)) != 0;
-        snapshot.dc_offset[channel] = readback.dc_offset[channel];
-    }
-    snapshot.zero_suppression_enabled =
-        (readback.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK) != 0;
-    snapshot.pack25_enabled =
-        (readback.channel_config & V1720E_CHANNEL_CONFIG_PACK25) != 0;
-    snapshot.trigger_source_raw = readback.trigger_source;
-    snapshot.channel_enable_raw = readback.channel_enable;
-    snapshot.channel_config_raw = readback.channel_config;
-}
-
-static bool verify_v1720e_readback(const V1720E_CONFIG &expected,
-                                   const V1720E_CONFIG_READBACK &actual)
-{
-    bool ok = true;
-#define VERIFY_V1720(name, expected_value, actual_value) \
-    do { \
-        if ((expected_value) != (actual_value)) { \
-            cm_msg(MERROR, frontend_name, \
-                   "V1720E readback mismatch: %s expected 0x%X, got 0x%X", \
-                   name, static_cast<unsigned>(expected_value), \
-                   static_cast<unsigned>(actual_value)); \
-            ok = false; \
-        } \
-    } while (0)
-    VERIFY_V1720("BufferOrganization", expected.buffer_organization,
-                 actual.buffer_organization);
-    VERIFY_V1720("CustomSizeRaw", expected.custom_size, actual.custom_size);
-    VERIFY_V1720("PostTrigger", expected.post_trigger, actual.post_trigger);
-    VERIFY_V1720("TriggerSourceRaw", expected.trigger_source,
-                 actual.trigger_source);
-    VERIFY_V1720("ChannelEnableRaw", expected.channel_enable,
-                 actual.channel_enable);
-    VERIFY_V1720("ZeroSuppression", 0u,
-                 actual.channel_config & V1720E_CHANNEL_CONFIG_ZS_MASK);
-    VERIFY_V1720("Pack25", 0u,
-                 actual.channel_config & V1720E_CHANNEL_CONFIG_PACK25);
-    for (unsigned channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
-        if (expected.dc_offset[channel] != actual.dc_offset[channel]) {
-            cm_msg(MERROR, frontend_name,
-                   "V1720E readback mismatch: DCOffset[%u] expected 0x%04X, got 0x%04X",
-                   channel, expected.dc_offset[channel],
-                   actual.dc_offset[channel]);
-            ok = false;
-        }
-    }
-#undef VERIFY_V1720
-    return ok;
 }
 
 /* Frontend initialization checks. Keep the established read-only access order. */
@@ -2060,14 +1865,14 @@ static void capture_vme_requested_snapshot()
     gVmeModuleState.snapshot.v792_requested = gVmeConfig.v792;
     gVmeModuleState.snapshot.v1190_requested = gV1190Config.run_settings;
     gVmeModuleState.snapshot.v775_requested = gVmeConfig.v775;
-    gVmeModuleState.snapshot.v1720e_requested = gV1720RunSettings;
+    gVmeModuleState.snapshot.v1720e_requested = gV1720State.run.settings;
     gVmeModuleState.snapshot.rpv130_enabled =
         gVmeState.rpv130_enabled_for_run ? TRUE : FALSE;
     gVmeModuleState.snapshot.rpv130_single_event_busy_enabled =
         gVmeState.single_event_busy_enabled_for_run ? TRUE : FALSE;
     gVmeModuleState.snapshot.enabled_for_run =
         (gVmeConfig.v792.enabled || gV1190Config.run_settings.enabled ||
-         gVmeConfig.v775.enabled || gV1720RunSettings.enabled ||
+         gVmeConfig.v775.enabled || gV1720State.run.settings.enabled ||
          gVmeState.rpv130_enabled_for_run) ? TRUE : FALSE;
 }
 
@@ -2076,11 +1881,11 @@ static void publish_vme_enabled_for_run()
     gVmeModuleState.v792.enabled_for_run = gVmeConfig.v792.enabled;
     gVmeModuleState.v1190.enabled_for_run = gV1190Config.run_settings.enabled;
     gVmeModuleState.v775.enabled_for_run = gVmeConfig.v775.enabled;
-    gV1720Runtime.enabled_for_run = gV1720RunSettings.enabled;
+    gV1720State.runtime.value.enabled_for_run = gV1720State.run.settings.enabled;
     gVmeModuleState.v792.dirty = true;
     gVmeModuleState.v1190.dirty = true;
     gVmeModuleState.v775.dirty = true;
-    gV1720Runtime.dirty = true;
+    gV1720State.runtime.value.dirty = true;
     publish_v7xx_variables(V792_VARIABLES_PATH, gVmeModuleState.v792,
                            gVmeModuleState.v792_last_publish);
     publish_v1190_variables();
@@ -2100,7 +1905,7 @@ static bool validate_v792_event_source_dependency()
 {
     if (!gVmeConfig.v792.enabled &&
         (gV1190Config.run_settings.enabled || gVmeConfig.v775.enabled ||
-         gV1720RunSettings.enabled)) {
+         gV1720State.run.settings.enabled)) {
         cm_msg(MERROR, frontend_name,
                "V792 must be enabled when any VME physics readout module "
                "is enabled");
@@ -2203,7 +2008,7 @@ static bool configure_v775_for_run()
 }
 static bool configure_v1720e_for_run()
 {
-    if (!gV1720RunSettings.enabled) {
+    if (!gV1720State.run.settings.enabled) {
         set_v1720e_communication_ok(false);
         set_v1720e_readback_valid(false);
         printf("  V1720E: DISABLED by BOR Settings snapshot; configuration skipped.\n");
@@ -2222,7 +2027,7 @@ static bool configure_v1720e_for_run()
     printf("  V1720E Event Stored before BOR configuration: %u\n",
            before.event_stored);
     const int status = v1720e_configure(gVme, V1720E_BASE,
-                                        &gV1720RunConfig);
+                                        &gV1720State.run.hardware);
     if (status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
                "V1720E configuration/readback failed: status %d", status);
@@ -2241,8 +2046,8 @@ static bool configure_v1720e_for_run()
         set_v1720e_readback_valid(false);
         return false;
     }
-    const bool verified = verify_v1720e_readback(gV1720RunConfig, readback);
-    capture_v1720e_run_readback(readback, verified);
+    const bool verified = v1720e_config::verify_readback(gV1720State.run.hardware, readback);
+    v1720e_config::capture_readback(gVmeModuleState.snapshot.v1720e_readback, readback, verified);
     publish_v1720e_readback(readback, verified);
     if (!verified) {
         set_v1720e_communication_ok(false);
@@ -2250,9 +2055,9 @@ static bool configure_v1720e_for_run()
     }
     printf("  V1720E: BufferOrg=0x%X CustomSize=0x%X PostTrigger=0x%X "
            "TriggerSource=0x%08X ChannelMask=0x%02X\n",
-           gV1720RunConfig.buffer_organization,
-           gV1720RunConfig.custom_size, gV1720RunConfig.post_trigger,
-           gV1720RunConfig.trigger_source, gV1720RunConfig.channel_enable);
+           gV1720State.run.hardware.buffer_organization,
+           gV1720State.run.hardware.custom_size, gV1720State.run.hardware.post_trigger,
+           gV1720State.run.hardware.trigger_source, gV1720State.run.hardware.channel_enable);
     return true;
 }
 
@@ -2587,13 +2392,13 @@ static bool verify_run_start_state()
            "  Event counters reset\n  Run may start\n",
            gVmeConfig.v792.enabled?"READY":"DISABLED",gV1190Config.run_settings.enabled?"READY":"DISABLED",
            gVmeConfig.v775.enabled?"READY":"DISABLED",
-           gV1720RunSettings.enabled ? "READY" : "DISABLED");
+           gV1720State.run.settings.enabled ? "READY" : "DISABLED");
     return true;
 }
 
 static bool prepare_modules_for_run()
 {
-    if (!check_module_communication(gV1720RunSettings.enabled != FALSE)) return false;
+    if (!check_module_communication(gV1720State.run.settings.enabled != FALSE)) return false;
     if (!configure_v792_for_run() || !configure_v1190_for_run()
         || !configure_v775_for_run()
         || !configure_v1720e_for_run()) return false;
@@ -2603,19 +2408,19 @@ static bool prepare_modules_for_run()
     if (!clear_module_buffers() || !reset_module_event_counters() ||
         !verify_run_start_state())
         return false;
-    if (!gV1720RunSettings.enabled) {
-        gV1720StartAttempted = false;
-        gV1720Started = false;
+    if (!gV1720State.run.settings.enabled) {
+        gV1720State.lifecycle.start_attempted = false;
+        gV1720State.lifecycle.started = false;
         return true;
     }
-    gV1720StartAttempted = true;
+    gV1720State.lifecycle.start_attempted = true;
     const int start_status = v1720e_start(gVme, V1720E_BASE);
     if (start_status != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name,
                "V1720E Acquisition Start failed: status %d", start_status);
         return false;
     }
-    gV1720Started = true;
+    gV1720State.lifecycle.started = true;
     DWORD v1720_events = 0;
     int v1720_ready = 0;
     DWORD v1720_acquisition_status = 0;
@@ -2649,9 +2454,9 @@ static bool vme_configuration_ready()
             gVmeModuleState.snapshot.v1190_readback.valid == TRUE) &&
            (!gVmeConfig.v775.enabled ||
             gVmeModuleState.snapshot.v775_readback.valid == TRUE) &&
-           (!gV1720RunSettings.enabled ||
+           (!gV1720State.run.settings.enabled ||
             (gVmeModuleState.snapshot.v1720e_readback.valid == TRUE &&
-             gV1720Started));
+             gV1720State.lifecycle.started));
 }
 
 #if ENABLE_V792_SW_TRIGGER_TEST
@@ -2754,7 +2559,7 @@ static INT verify_startup_run_state(INT *current_run_state)
                *current_run_state);
         return FE_ERR_ODB;
     }
-    gV1720StartupRunState = *current_run_state;
+    gV1720State.lifecycle.startup_run_state = *current_run_state;
     return SUCCESS;
 }
 
@@ -2850,7 +2655,7 @@ INT frontend_init()
 
     printf("VME interface opened.\n");
     publish_rpv130_status(true);
-    if (!check_module_communication(gV1720StartupEnabled)) {
+    if (!check_module_communication(gV1720State.lifecycle.startup_enabled)) {
         mvme_close(gVme);
         gVme = NULL;
         global_busy::attach(NULL);
@@ -2867,7 +2672,7 @@ INT frontend_init()
         global_busy::attach(NULL);
         return FE_ERR_ODB;
     }
-    gV1720StartupRunState = current_run_state;
+    gV1720State.lifecycle.startup_run_state = current_run_state;
     if (current_run_state != STATE_STOPPED &&
         current_run_state != STATE_RUNNING &&
         current_run_state != STATE_PAUSED) {
@@ -2886,7 +2691,7 @@ INT frontend_init()
         global_busy::attach(NULL);
         return FE_ERR_HW;
     }
-    if (gV1720StartupEnabled && current_run_state == STATE_STOPPED) {
+    if (gV1720State.lifecycle.startup_enabled && current_run_state == STATE_STOPPED) {
         DWORD control = 0, acquisition_status = 0;
         const int read_status = v1720e_read_run_state(
             gVme, V1720E_BASE, &control, &acquisition_status);
@@ -2967,15 +2772,15 @@ INT frontend_exit()
     const bool rpv130_stopped =
         quiesce_rpv130_single_event_busy("frontend exit");
     if (gVme) {
-        const bool owns_v1720_run = gV1720StartAttempted || gV1720Started;
+        const bool owns_v1720_run = gV1720State.lifecycle.start_attempted || gV1720State.lifecycle.started;
         const bool midas_active = run_state == STATE_RUNNING ||
                                   run_state == STATE_PAUSED;
         if (!owns_v1720_run &&
-            (gV1720StartupRunState != STATE_STOPPED || midas_active)) {
+            (gV1720State.lifecycle.startup_run_state != STATE_STOPPED || midas_active)) {
             cm_msg(MINFO, frontend_name,
                    "V1720E auto-stop skipped on frontend exit: "
                    "startup MIDAS state %d, current state %d, no frontend start",
-                   gV1720StartupRunState, run_state);
+                   gV1720State.lifecycle.startup_run_state, run_state);
         } else if (!stop_v1720e_and_publish_state("frontend exit")) {
             cm_msg(MERROR, frontend_name,
                    "V1720E hardware stop failed during frontend exit");
@@ -3036,7 +2841,7 @@ INT begin_of_run(INT run_number, char *error)
     vme_odb::reset_run_snapshot(gVmeModuleState.snapshot, run_number, frontend_name);
 
     if (!validate_and_snapshot_module_settings() ||
-        !snapshot_v1720e_settings_for_run() ||
+        !v1720e_config::snapshot_run_settings(gV1720State) ||
         !snapshot_rpv130_enabled_for_run()) {
         cm_msg(MERROR, frontend_name,
                "Cannot snapshot/validate VME module Settings at BOR");
@@ -3288,9 +3093,9 @@ INT frontend_loop()
         publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
     }
     const DWORD elapsed =
-        static_cast<DWORD>(now - gV1720LastVariablesPublish);
-    if (gV1720VariablesEnabled &&
-        ((gV1720Runtime.dirty &&
+        static_cast<DWORD>(now - gV1720State.runtime.last_variables_publish);
+    if (gV1720State.run.variables_enabled &&
+        ((gV1720State.runtime.value.dirty &&
           elapsed >= V1720E_VARIABLES_MIN_PUBLISH_INTERVAL_MS) ||
          elapsed >= V1720E_VARIABLES_HEARTBEAT_INTERVAL_MS))
         publish_v1720e_variables();
@@ -3313,7 +3118,7 @@ INT poll_event(INT source, INT count, BOOL test)
         return 0;
     if (!gVme || gVmeState.readout_failed ||
         !gVmeConfig.v792.enabled ||
-        (gV1720RunSettings.enabled && !gV1720Started))
+        (gV1720State.run.settings.enabled && !gV1720State.lifecycle.started))
         return 0;
     for (INT i = 0; i < count; ++i) {
         if (v792_DataReady(gVme, V792_BASE) && !test) {
@@ -3417,7 +3222,7 @@ static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
-               midas_serial, event.event_size, gV1720ExpectedEventWords);
+               midas_serial, event.event_size, gV1720State.run.expected_event_words);
     }
     if (!event.channel_mask_valid) {
         valid = false;
@@ -3425,7 +3230,7 @@ static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0x%02X",
-               midas_serial, event.channel_mask, gV1720ExpectedChannelMask);
+               midas_serial, event.channel_mask, gV1720State.run.expected_channel_mask);
     }
     if (!gVmeStatistics.run.v1720_have_previous) {
         gVmeStatistics.run.v1720_first_counter = event.event_counter;
@@ -3548,7 +3353,7 @@ INT read_vme_event(char *pevent, INT off)
         peers_ready = wait_for_v775_data_ready();
         if (timing.active) timing.v775_ready_end_ns = monotonic_ns();
     }
-    if (peers_ready && gV1720RunSettings.enabled) {
+    if (peers_ready && gV1720State.run.settings.enabled) {
         if (timing.active) timing.v1720_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v1720e_data_ready();
         if (timing.active) timing.v1720_ready_end_ns = monotonic_ns();
@@ -3623,14 +3428,14 @@ INT read_vme_event(char *pevent, INT off)
 
     V1720E_EVENT_INFO v1720 = {};
     V1720E_EVENT_INFO *v1720_event = NULL;
-    if (gV1720RunSettings.enabled) {
+    if (gV1720State.run.settings.enabled) {
         if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
             timing.v1720_start_ns = monotonic_ns();
         const int v1720_status =
             v1720e_read_event_mode(gVme, V1720E_BASE, v1720_data,
                                    V1720E_MAX_EVENT_WORDS,
-                                   gV1720ExpectedEventWords,
-                                   gV1720ExpectedChannelMask,
+                                   gV1720State.run.expected_event_words,
+                                   gV1720State.run.expected_channel_mask,
                                    V1720E_READOUT_MODE_SELECT, &v1720);
         if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
             timing.v1720_end_ns = monotonic_ns();
@@ -3645,8 +3450,8 @@ INT read_vme_event(char *pevent, INT off)
                 gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
             }
             if (v1720_status != MVME_SUCCESS)
-                gV1720Runtime.communication_ok = FALSE;
-            gV1720Runtime.dirty = true;
+                gV1720State.runtime.value.communication_ok = FALSE;
+            gV1720State.runtime.value.dirty = true;
             ++gVmeStatistics.run.v1720_malformed_count;
             mark_run_counters_dirty();
             gVmeState.readout_failed = true;
@@ -3668,9 +3473,9 @@ INT read_vme_event(char *pevent, INT off)
             fail_single_event_busy("V1720E event consistency failure");
             return 0;
         }
-        gV1720Runtime.event_counter = v1720.event_counter;
-        gV1720Runtime.trigger_time_tag = v1720.trigger_time_tag;
-        gV1720Runtime.dirty = true;
+        gV1720State.runtime.value.event_counter = v1720.event_counter;
+        gV1720State.runtime.value.trigger_time_tag = v1720.trigger_time_tag;
+        gV1720State.runtime.value.dirty = true;
     }
 
     if (!check_event_counter_match(v792, v1190, v775, v1720_event)) {

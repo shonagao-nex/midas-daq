@@ -37,7 +37,7 @@ int main() {
               std::string::npos,
           "TR_STARTABORT is not registered at sequence 500");
 
-  const auto start_attempt = source.find("gV1720StartAttempted = true;");
+  const auto start_attempt = source.find("gV1720State.lifecycle.start_attempted = true;");
   const auto hardware_start = source.find("v1720e_start(gVme, V1720E_BASE)");
   require(start_attempt != std::string::npos &&
               hardware_start != std::string::npos &&
@@ -47,13 +47,13 @@ int main() {
   const std::string stop = functionBody(
       source, "static bool stop_v1720e_and_publish_state(",
       "/* Low-level VME access helpers. */");
-  require(stop.find("if (!gV1720StartAttempted && !gV1720Started)") ==
+  require(stop.find("if (!gV1720State.lifecycle.start_attempted && !gV1720State.lifecycle.started)") ==
               std::string::npos,
           "rollback still skips untracked hardware RUN");
   require(stop.find("v1720e_stop_if_running(") != std::string::npos,
           "rollback does not check hardware RUN before stopping");
-  require(stop.find("gV1720StartAttempted = false") != std::string::npos &&
-              stop.find("gV1720Started = false") != std::string::npos,
+  require(stop.find("gV1720State.lifecycle.start_attempted = false") != std::string::npos &&
+              stop.find("gV1720State.lifecycle.started = false") != std::string::npos,
           "successful rollback does not become idempotent");
 
   const std::string abort = functionBody(
@@ -87,7 +87,7 @@ int main() {
           "startup recovery is not limited to MIDAS STOPPED");
   const std::string exit = functionBody(
       source, "INT frontend_exit()\n{", "INT begin_of_run(INT run_number, char *error)");
-  require(exit.find("gV1720StartupRunState != STATE_STOPPED || midas_active") !=
+  require(exit.find("gV1720State.lifecycle.startup_run_state != STATE_STOPPED || midas_active") !=
               std::string::npos &&
               exit.find("V1720E hardware stop failed during frontend exit") !=
               std::string::npos,
