@@ -276,18 +276,61 @@ void reset_run_snapshot(INT run_number) {
       std::to_string(snapshot.bor_unix_time) + "_feeasiroc";
 }
 
-bool publish_run_snapshot() {
-  const auto& snapshot = g_state.run_snapshot;
+//************************************//
+// Publish run identity and participation snapshot fields
+//************************************//
+void publish_snapshot_metadata(const EasirocRunSnapshot& snapshot, bool& ok) {
   const std::string metadata = odb_path(kRunSnapshotPath, "Metadata");
-  const std::string requested = odb_path(kRunSnapshotPath, "Requested");
-  const std::string apply = odb_path(kRunSnapshotPath, "Apply");
-  const std::string consistency = odb_path(kRunSnapshotPath, "Consistency");
-  const std::string firmware = odb_path(kRunSnapshotPath, "Readback/Firmware");
   const BOOL enabled_for_run = snapshot.enabled_for_run ? TRUE : FALSE;
+  ok = set_odb_value(odb_path(metadata.c_str(), "SchemaVersion"),
+                     &snapshot.schema_version, sizeof(snapshot.schema_version),
+                     1, TID_DWORD) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "SnapshotId"),
+                      snapshot.snapshot_id, 128) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "RunNumber"),
+                     &snapshot.run_number, sizeof(snapshot.run_number), 1,
+                     TID_INT) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "BORUnixTime"),
+                     &snapshot.bor_unix_time,
+                     sizeof(snapshot.bor_unix_time), 1, TID_QWORD) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "BORTimeISO8601"),
+                      snapshot.bor_time_iso8601, 32) && ok;
+  ok = set_odb_string(odb_path(metadata.c_str(), "FrontendName"),
+                      snapshot.frontend_name, 32) && ok;
+  ok = set_odb_value(odb_path(metadata.c_str(), "EnabledForRun"),
+                     &enabled_for_run, sizeof(enabled_for_run), 1, TID_BOOL) &&
+       ok;
+}
+
+//************************************//
+// Publish requested acquisition and network settings
+//************************************//
+void publish_snapshot_requested_acquisition(const EasirocRunSnapshot& snapshot,
+    bool& ok) {
+  const std::string requested = odb_path(kRunSnapshotPath, "Requested");
   const BOOL requested_enabled = snapshot.requested.enabled ? TRUE : FALSE;
   const BOOL adc = snapshot.requested.enables.adc ? TRUE : FALSE;
   const BOOL tdc = snapshot.requested.enables.tdc ? TRUE : FALSE;
   const BOOL scaler = snapshot.requested.enables.scaler ? TRUE : FALSE;
+  ok = set_odb_value(odb_path(requested.c_str(), "Enabled"),
+                     &requested_enabled, sizeof(requested_enabled), 1,
+                     TID_BOOL) && ok;
+  ok = set_odb_string(odb_path(requested.c_str(), "IPAddress"),
+                      snapshot.requested.ip_address, 64) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "ADCEnabled"), &adc,
+                     sizeof(adc), 1, TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "TDCEnabled"), &tdc,
+                     sizeof(tdc), 1, TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(requested.c_str(), "ScalerEnabled"), &scaler,
+                     sizeof(scaler), 1, TID_BOOL) && ok;
+}
+
+//************************************//
+// Publish requested ASIC slow control settings
+//************************************//
+void publish_snapshot_requested_asic(const EasirocRunSnapshot& snapshot,
+    bool& ok) {
+  const std::string requested = odb_path(kRunSnapshotPath, "Requested");
   const BOOL apply_at_bor =
       snapshot.requested.asic_slow_control.apply_at_bor ? TRUE : FALSE;
   const INT asic1_dac_code =
@@ -331,49 +374,6 @@ bool publish_run_snapshot() {
             ? TRUE
             : FALSE;
   }
-  const BOOL apply_attempted = snapshot.apply.attempted ? TRUE : FALSE;
-  const BOOL apply_succeeded =
-      snapshot.apply.sequence_succeeded ? TRUE : FALSE;
-  const BOOL last_applied_valid =
-      snapshot.consistency.last_applied_valid ? TRUE : FALSE;
-  const BOOL configuration_match =
-      snapshot.consistency.configuration_match ? TRUE : FALSE;
-  const BOOL hardware_state_indeterminate =
-      snapshot.consistency.hardware_state_indeterminate ? TRUE : FALSE;
-  const DWORD last_applied_request_id =
-      snapshot.consistency.last_applied_request_id;
-  const BOOL firmware_valid = snapshot.firmware.valid ? TRUE : FALSE;
-  bool ok = true;
-  ok = set_odb_value(odb_path(metadata.c_str(), "SchemaVersion"),
-                     &snapshot.schema_version, sizeof(snapshot.schema_version),
-                     1, TID_DWORD) && ok;
-  ok = set_odb_string(odb_path(metadata.c_str(), "SnapshotId"),
-                      snapshot.snapshot_id, 128) && ok;
-  ok = set_odb_value(odb_path(metadata.c_str(), "RunNumber"),
-                     &snapshot.run_number, sizeof(snapshot.run_number), 1,
-                     TID_INT) && ok;
-  ok = set_odb_value(odb_path(metadata.c_str(), "BORUnixTime"),
-                     &snapshot.bor_unix_time,
-                     sizeof(snapshot.bor_unix_time), 1, TID_QWORD) && ok;
-  ok = set_odb_string(odb_path(metadata.c_str(), "BORTimeISO8601"),
-                      snapshot.bor_time_iso8601, 32) && ok;
-  ok = set_odb_string(odb_path(metadata.c_str(), "FrontendName"),
-                      snapshot.frontend_name, 32) && ok;
-  ok = set_odb_value(odb_path(metadata.c_str(), "EnabledForRun"),
-                     &enabled_for_run, sizeof(enabled_for_run), 1, TID_BOOL) &&
-       ok;
-
-  ok = set_odb_value(odb_path(requested.c_str(), "Enabled"),
-                     &requested_enabled, sizeof(requested_enabled), 1,
-                     TID_BOOL) && ok;
-  ok = set_odb_string(odb_path(requested.c_str(), "IPAddress"),
-                      snapshot.requested.ip_address, 64) && ok;
-  ok = set_odb_value(odb_path(requested.c_str(), "ADCEnabled"), &adc,
-                     sizeof(adc), 1, TID_BOOL) && ok;
-  ok = set_odb_value(odb_path(requested.c_str(), "TDCEnabled"), &tdc,
-                     sizeof(tdc), 1, TID_BOOL) && ok;
-  ok = set_odb_value(odb_path(requested.c_str(), "ScalerEnabled"), &scaler,
-                     sizeof(scaler), 1, TID_BOOL) && ok;
   ok = set_odb_value(
            odb_path(requested.c_str(),
                     easiroc::kAsicSlowControlRequestedSnapshotPaths[0]),
@@ -447,6 +447,16 @@ bool publish_run_snapshot() {
            asic2_channel_enabled.data(), sizeof(asic2_channel_enabled),
            asic2_channel_enabled.size(), TID_BOOL) && ok;
 
+}
+
+//************************************//
+// Publish BOR apply result
+//************************************//
+void publish_snapshot_apply(const EasirocRunSnapshot& snapshot, bool& ok) {
+  const std::string apply = odb_path(kRunSnapshotPath, "Apply");
+  const BOOL apply_attempted = snapshot.apply.attempted ? TRUE : FALSE;
+  const BOOL apply_succeeded =
+      snapshot.apply.sequence_succeeded ? TRUE : FALSE;
   ok = set_odb_value(odb_path(apply.c_str(), "Attempted"),
                      &apply_attempted, sizeof(apply_attempted), 1,
                      TID_BOOL) && ok;
@@ -455,7 +465,22 @@ bool publish_run_snapshot() {
                      TID_BOOL) && ok;
   ok = set_odb_string(odb_path(apply.c_str(), "Error"),
                       snapshot.apply.error, 256) && ok;
+}
 
+//************************************//
+// Publish configuration consistency result
+//************************************//
+void publish_snapshot_consistency(const EasirocRunSnapshot& snapshot,
+    bool& ok) {
+  const std::string consistency = odb_path(kRunSnapshotPath, "Consistency");
+  const BOOL last_applied_valid =
+      snapshot.consistency.last_applied_valid ? TRUE : FALSE;
+  const BOOL configuration_match =
+      snapshot.consistency.configuration_match ? TRUE : FALSE;
+  const BOOL hardware_state_indeterminate =
+      snapshot.consistency.hardware_state_indeterminate ? TRUE : FALSE;
+  const DWORD last_applied_request_id =
+      snapshot.consistency.last_applied_request_id;
   ok = set_odb_value(odb_path(consistency.c_str(), "LastAppliedValid"),
                      &last_applied_valid, sizeof(last_applied_valid), 1,
                      TID_BOOL) && ok;
@@ -481,7 +506,14 @@ bool publish_run_snapshot() {
            32) && ok;
   ok = set_odb_string(odb_path(consistency.c_str(), "Detail"),
                       snapshot.consistency.detail, 256) && ok;
+}
 
+//************************************//
+// Publish firmware readback observation
+//************************************//
+void publish_snapshot_firmware(const EasirocRunSnapshot& snapshot, bool& ok) {
+  const std::string firmware = odb_path(kRunSnapshotPath, "Readback/Firmware");
+  const BOOL firmware_valid = snapshot.firmware.valid ? TRUE : FALSE;
   ok = set_odb_value(odb_path(firmware.c_str(), "Valid"), &firmware_valid,
                      sizeof(firmware_valid), 1, TID_BOOL) && ok;
   const std::string version = snapshot.firmware.valid
@@ -506,6 +538,21 @@ bool publish_run_snapshot() {
                       snapshot.firmware.observed_at_iso8601, 32) && ok;
   ok = set_odb_string(odb_path(firmware.c_str(), "Source"),
                       snapshot.firmware.source, 32) && ok;
+}
+
+//************************************//
+// Publish the EASIROC run snapshot and completion marker
+//************************************//
+bool publish_run_snapshot() {
+  const auto& snapshot = g_state.run_snapshot;
+  bool ok = true;
+  publish_snapshot_metadata(snapshot, ok);
+  publish_snapshot_requested_acquisition(snapshot, ok);
+  publish_snapshot_requested_asic(snapshot, ok);
+  publish_snapshot_apply(snapshot, ok);
+  publish_snapshot_consistency(snapshot, ok);
+  publish_snapshot_firmware(snapshot, ok);
+  const std::string metadata = odb_path(kRunSnapshotPath, "Metadata");
   /* Publish the completion marker last. If any preceding write failed,
    * leave the fixed subtree explicitly incomplete. */
   const BOOL published_complete =
@@ -514,8 +561,7 @@ bool publish_run_snapshot() {
       odb_path(metadata.c_str(), "FrontendBORComplete"), &published_complete,
       sizeof(published_complete), 1, TID_BOOL);
   ok = complete_ok && ok;
-  return ok;
-}
+  return ok;}
 
 //************************************//
 // Publish EASIROC runtime status in ODB
@@ -874,24 +920,13 @@ bool initialize_last_applied_odb() {
 }
 
 //************************************//
-// Initialize EASIROC settings and status in ODB
+// Initialize enabled, network, and acquisition ODB settings
 //************************************//
-bool initialize_odb() {
+bool initialize_acquisition_settings_odb() {
   char default_ip[64] = {};
   std::snprintf(default_ip, sizeof(default_ip), "%s", kDefaultIpAddress);
   const BOOL yes = TRUE;
   const BOOL no = FALSE;
-  const INT default_dac_code = easiroc::kDefaultDiscriminatorDacCode;
-  const INT default_dac_slope = easiroc::kDefaultDiscriminatorDacSlope;
-  const INT default_feedback =
-      easiroc::kDefaultFeedbackCapacitanceFemtofarads;
-  const INT default_hg_shaping =
-      easiroc::kDefaultHighGainShapingTimeNanoseconds;
-  const INT default_lg_shaping =
-      easiroc::kDefaultLowGainShapingTimeNanoseconds;
-  const auto default_input_dac = easiroc::defaultInputDacValues();
-  std::array<BOOL, easiroc::kInputDacChannelCount> default_channel_enabled{};
-  default_channel_enabled.fill(TRUE);
   if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
@@ -901,8 +936,25 @@ bool initialize_odb() {
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/TDCEnabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ScalerEnabled"),
-                        &no, sizeof(no), 1, TID_BOOL) ||
-      !ensure_odb_value(
+                        &no, sizeof(no), 1, TID_BOOL))
+    return false;
+  return true;
+}
+
+//************************************//
+// Initialize requested ASIC slow control ODB settings
+//************************************//
+bool initialize_asic_settings_odb() {
+  const BOOL no = FALSE;
+  const INT default_dac_code = easiroc::kDefaultDiscriminatorDacCode;
+  const INT default_dac_slope = easiroc::kDefaultDiscriminatorDacSlope;
+  const INT default_feedback = easiroc::kDefaultFeedbackCapacitanceFemtofarads;
+  const INT default_hg_shaping = easiroc::kDefaultHighGainShapingTimeNanoseconds;
+  const INT default_lg_shaping = easiroc::kDefaultLowGainShapingTimeNanoseconds;
+  const auto default_input_dac = easiroc::defaultInputDacValues();
+  std::array<BOOL, easiroc::kInputDacChannelCount> default_channel_enabled{};
+  default_channel_enabled.fill(TRUE);
+  if (!ensure_odb_value(
           odb_path(kSettingsPath,
                    easiroc::kAsicSlowControlRequestedSnapshotPaths[0]),
           &no, sizeof(no), 1, TID_BOOL) ||
@@ -976,6 +1028,15 @@ bool initialize_odb() {
           default_channel_enabled.size(), TID_BOOL))
     return false;
 
+  return true;
+}
+
+//************************************//
+// Publish fixed hardware and network information in ODB
+//************************************//
+bool initialize_hardware_info_odb() {
+  const BOOL yes = TRUE;
+  const BOOL no = FALSE;
   const DWORD channel_count = easiroc::kAdcChannelCount;
   const DWORD tcp_port = easiroc::kTcpDataPort;
   const DWORD rbcp_port = kRbcpPort;
@@ -1002,6 +1063,14 @@ bool initialize_odb() {
                      &yes, sizeof(yes), 1, TID_BOOL))
     return false;
 
+  return true;
+}
+
+//************************************//
+// Initialize empty firmware readback fields in ODB
+//************************************//
+bool initialize_firmware_readback_odb() {
+  const BOOL no = FALSE;
   const std::array<std::uint8_t, easiroc::kFirmwareVersionLength> empty_raw{};
   if (!set_odb_value(odb_path(kReadbackPath, "Firmware/Valid"), &no,
                      sizeof(no), 1, TID_BOOL) ||
@@ -1010,6 +1079,18 @@ bool initialize_odb() {
                       64) ||
       !set_odb_value(odb_path(kReadbackPath, "Firmware/Raw"), empty_raw.data(),
                      empty_raw.size(), empty_raw.size(), TID_BYTE))
+    return false;
+  return true;
+}
+
+//************************************//
+// Initialize EASIROC settings and status in ODB
+//************************************//
+bool initialize_odb() {
+  if (!initialize_acquisition_settings_odb() ||
+      !initialize_asic_settings_odb() ||
+      !initialize_hardware_info_odb() ||
+      !initialize_firmware_readback_odb())
     return false;
   if (!initialize_manual_apply_mailbox() ||
       !initialize_buffer_clear_mailbox() || !initialize_last_applied_odb())
