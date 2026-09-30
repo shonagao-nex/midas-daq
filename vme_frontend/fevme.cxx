@@ -22,6 +22,7 @@
 #include "vme_odb.h"
 #include "v1190_config.h"
 #include "v1720e_config.h"
+#include "v7xx_config.h"
 
 using vme_odb::make_odb_path;
 using vme_odb::set_absolute_odb_value;
@@ -59,21 +60,6 @@ static const bool V1190_FIFO_STRICT_SYNC_CHECK = false;
 static const size_t V775_MAX_EVENT_WORDS = 64;
 static const DWORD V7XX_EVENT_COUNTER_MASK = 0x00FFFFFF;
 static const DWORD V1190_EVENT_COUNTER_MASK = 0x003FFFFF;
-
-/* Normal-run V792 configuration. Bit Set/Clear 2 uses command semantics. */
-static const WORD V792_RUN_IPED = 0x00FF;
-static const WORD V792_BIT2_LOW_THRESHOLD = 0x0010;
-static const WORD V792_BIT2_ALL_TRIGGER = 0x4000;
-
-/* Normal-run V775 configuration. Bit Set/Clear 2 uses command semantics. */
-static const WORD V775_RUN_FULL_SCALE = 0x00FF; // nominal 140 ns / 35 ps LSB
-static const WORD V775_RUN_SET_BITS = V775_BIT2_OVER_RANGE |
-                                       V775_BIT2_LOW_THRESHOLD |
-                                       V775_BIT2_COMMON_STOP |
-                                       V775_BIT2_EMPTY_PROGRAM;
-static const WORD V775_RUN_CLEAR_BITS = V775_BIT2_VALID_CONTROL |
-                                         V775_BIT2_SLIDE_ENABLE |
-                                         V775_BIT2_ALL_TRIGGER;
 
 /* Finite ready/handshake polling limits. */
 static const unsigned V1190_READY_MAX_POLLS = 100;
@@ -213,39 +199,12 @@ static const char *V775_VARIABLES_PATH = "/Equipment/VME/Variables/V775";
 static const DWORD MODULE_VARIABLES_MIN_PUBLISH_INTERVAL_MS = 200;
 static const DWORD MODULE_VARIABLES_HEARTBEAT_INTERVAL_MS = 1000;
 
-static V792Settings default_v792_settings()
-{
-    V792Settings s = {};
-    s.enabled = TRUE;
-    s.iped = V792_RUN_IPED;
-    s.zero_suppression_enabled = FALSE;
-    s.all_trigger_enabled = FALSE;
-    return s;
-}
-
-
-
-static V775Settings default_v775_settings()
-{
-    V775Settings s = {};
-    s.enabled = FALSE;
-    s.full_scale_range = V775_RUN_FULL_SCALE;
-    s.over_range_enabled = TRUE;
-    s.low_threshold_enabled = TRUE;
-    s.common_stop = TRUE;
-    s.empty_program_enabled = TRUE;
-    s.valid_control_enabled = FALSE;
-    s.sliding_scale_enabled = FALSE;
-    s.all_trigger_enabled = FALSE;
-    return s;
-}
-
 //************************************//
 // Hold requested VME module settings for the run
 //************************************//
 struct VmeConfig {
-    V792Settings v792 = default_v792_settings();
-    V775Settings v775 = default_v775_settings();
+    V792Settings v792 = v7xx_config::default_v792_settings();
+    V775Settings v775 = v7xx_config::default_v775_settings();
 };
 static VmeConfig gVmeConfig;
 static v1190_config::State gV1190Config = {
@@ -550,7 +509,7 @@ static bool quiesce_rpv130_single_event_busy(const char *context)
 
 static bool ensure_v792_settings_schema()
 {
-    return vme_odb::ensure_v792_settings_schema(default_v792_settings());
+    return vme_odb::ensure_v792_settings_schema(v7xx_config::default_v792_settings());
 }
 
 static bool ensure_v1190_settings_schema()
@@ -560,7 +519,7 @@ static bool ensure_v1190_settings_schema()
 
 static bool ensure_v775_settings_schema()
 {
-    return vme_odb::ensure_v775_settings_schema(default_v775_settings());
+    return vme_odb::ensure_v775_settings_schema(v7xx_config::default_v775_settings());
 }
 
 using vme_odb::publish_module_info;
@@ -769,9 +728,7 @@ static bool initialize_run_counters_odb()
 #endif
 
 #if ENABLE_V775_SW_TRIGGER_TEST
-static WORD gV775SavedBitSet2 = 0;
-static bool gV775DiagnosticSaved = false;
-static bool gV775EmptyProgramMayHaveChanged = false;
+static v7xx_config::V775DiagnosticState gV775Diagnostic;
 #endif
 
 struct V792EventInfo {
@@ -1557,11 +1514,11 @@ static bool setup_v1190_soft_trigger_test()
 #if ENABLE_V775_SW_TRIGGER_TEST
 static bool restore_v775_diagnostic_settings()
 {
-    if (!gV775DiagnosticSaved)
+    if (!gV775Diagnostic.saved)
         return true;
 
-    if ((gV775SavedBitSet2 & V775_BIT2_EMPTY_PROGRAM) == 0 &&
-        gV775EmptyProgramMayHaveChanged) {
+    if ((gV775Diagnostic.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) == 0 &&
+        gV775Diagnostic.empty_program_may_have_changed) {
         WORD readback = 0;
         if (!vme_write16(V775_BASE + V775_BIT_CLEAR2,
                          V775_BIT2_EMPTY_PROGRAM,
@@ -1579,14 +1536,14 @@ static bool restore_v775_diagnostic_settings()
         cm_msg(MINFO, frontend_name,
                "V775 Empty Program restored to disabled (Bit Set 2=0x%04X)",
                readback);
-        gV775EmptyProgramMayHaveChanged = false;
+        gV775Diagnostic.empty_program_may_have_changed = false;
     } else {
         cm_msg(MINFO, frontend_name,
                "V775 Empty Program restoration needs no clear; original state was %s",
-               (gV775SavedBitSet2 & V775_BIT2_EMPTY_PROGRAM) ? "enabled" : "disabled");
+               (gV775Diagnostic.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) ? "enabled" : "disabled");
     }
 
-    gV775DiagnosticSaved = false;
+    gV775Diagnostic.saved = false;
     return true;
 }
 
@@ -1601,9 +1558,9 @@ static bool setup_v775_sw_trigger_test()
     if (!vme_read16(V775_BASE + V775_BIT_SET2, bitset2,
                     "V775 Bit Set 2 save"))
         return false;
-    gV775SavedBitSet2 = bitset2;
-    gV775DiagnosticSaved = true;
-    gV775EmptyProgramMayHaveChanged = false;
+    gV775Diagnostic.saved_bit_set2 = bitset2;
+    gV775Diagnostic.saved = true;
+    gV775Diagnostic.empty_program_may_have_changed = false;
     cm_msg(MINFO, frontend_name,
            "V775 diagnostic saved Bit Set 2=0x%04X; Empty Program=%s",
            bitset2,
@@ -1611,7 +1568,7 @@ static bool setup_v775_sw_trigger_test()
 
     if ((bitset2 & V775_BIT2_EMPTY_PROGRAM) == 0) {
         // From this write attempt onward, cleanup assumes the bit may be set.
-        gV775EmptyProgramMayHaveChanged = true;
+        gV775Diagnostic.empty_program_may_have_changed = true;
         if (!vme_write16(V775_BASE + V775_BIT_SET2,
                          V775_BIT2_EMPTY_PROGRAM,
                          "V775 Empty Program enable") ||
@@ -1970,8 +1927,8 @@ static bool configure_v792_for_run()
     const DWORD zsreg=gVmeConfig.v792.zero_suppression_enabled?V792_BIT_CLEAR2_WO:V792_BIT_SET2_RW;
     const DWORD atreg=gVmeConfig.v792.all_trigger_enabled?V792_BIT_SET2_RW:V792_BIT_CLEAR2_WO;
     return vme_write16(V792_BASE + V792_IPED_RW, gVmeConfig.v792.iped, "V792 Iped") &&
-           vme_write16(V792_BASE + zsreg,V792_BIT2_LOW_THRESHOLD,"V792 zero suppression") &&
-           vme_write16(V792_BASE + atreg,V792_BIT2_ALL_TRIGGER,"V792 ALL TRG");
+           vme_write16(V792_BASE + zsreg,v7xx_config::kV792LowThreshold,"V792 zero suppression") &&
+           vme_write16(V792_BASE + atreg,v7xx_config::kV792AllTrigger,"V792 ALL TRG");
 }
 
 
@@ -1992,13 +1949,8 @@ static bool configure_v1190_for_run()
 static bool configure_v775_for_run()
 {
     if (!gVmeConfig.v775.enabled) return true;
-    WORD set=0,clear=0;
-#define V775BIT(flag,bit) do { if(flag) set|=bit; else clear|=bit; } while(0)
-    V775BIT(gVmeConfig.v775.over_range_enabled,V775_BIT2_OVER_RANGE); V775BIT(gVmeConfig.v775.low_threshold_enabled,V775_BIT2_LOW_THRESHOLD);
-    V775BIT(gVmeConfig.v775.common_stop,V775_BIT2_COMMON_STOP); V775BIT(gVmeConfig.v775.empty_program_enabled,V775_BIT2_EMPTY_PROGRAM);
-    V775BIT(gVmeConfig.v775.valid_control_enabled,V775_BIT2_VALID_CONTROL); V775BIT(gVmeConfig.v775.sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE);
-    V775BIT(gVmeConfig.v775.all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
-#undef V775BIT
+    WORD set = 0, clear = 0;
+    v7xx_config::v775_run_bits(gVmeConfig.v775, set, clear);
     return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, gVmeConfig.v775.full_scale_range,
                        "V775 Full Scale Range") &&
            vme_write16(V775_BASE + V775_BIT_SET2, set,
@@ -2079,18 +2031,13 @@ static bool verify_v792_configuration()
         !vme_read16(V792_BASE + V792_BIT_SET2_RW,bits,"V792 Bit Set 2 verify") ||
         !vme_read16(V792_BASE + V792_FIRM_REV,firmware,"V792 Firmware verify") ||
         v792_ThresholdRead(gVme,V792_BASE,thresholds)!=V792_MAX_CHANNELS) return false;
-    const BOOL zs=!(bits&V792_BIT2_LOW_THRESHOLD), all=!!(bits&V792_BIT2_ALL_TRIGGER);
+    const BOOL zs=!(bits&v7xx_config::kV792LowThreshold), all=!!(bits&v7xx_config::kV792AllTrigger);
     bool ok=verify_value("V792","Iped",gVmeConfig.v792.iped,iped&0xFF);
     ok=verify_value("V792","ZeroSuppression",gVmeConfig.v792.zero_suppression_enabled,zs)&&ok;
     ok=verify_value("V792","AllTrigger",gVmeConfig.v792.all_trigger_enabled,all)&&ok;
-    gVmeModuleState.snapshot.v792_readback.valid = ok ? TRUE : FALSE;
-    gVmeModuleState.snapshot.v792_readback.firmware_revision = firmware;
-    gVmeModuleState.snapshot.v792_readback.iped = iped;
-    gVmeModuleState.snapshot.v792_readback.zero_suppression_enabled = zs;
-    gVmeModuleState.snapshot.v792_readback.all_trigger_enabled = all;
-    gVmeModuleState.snapshot.v792_readback.bit_set2_raw = bits;
-    memcpy(gVmeModuleState.snapshot.v792_readback.threshold, thresholds,
-           sizeof(thresholds));
+    v7xx_config::capture_v792_readback(
+        gVmeModuleState.snapshot.v792_readback, firmware, iped, bits,
+        zs, all, thresholds, ok);
     set_module_output(V792_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD);
     set_module_output(V792_READBACK_PATH,"Iped",&iped,sizeof(iped),1,TID_WORD);
     set_module_output(V792_READBACK_PATH,"ZeroSuppressionEnabled",&zs,sizeof(zs),1,TID_BOOL);
@@ -2124,20 +2071,9 @@ static bool verify_v775_configuration()
 #define VV775(name,member,bit) ok=verify_value("V775",name,gVmeConfig.v775.member,!!(bits&bit))&&ok
     VV775("OverRange",over_range_enabled,V775_BIT2_OVER_RANGE); VV775("LowThreshold",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); VV775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); VV775("EmptyProgram",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); VV775("ValidControl",valid_control_enabled,V775_BIT2_VALID_CONTROL); VV775("SlidingScale",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); VV775("AllTrigger",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
 #undef VV775
-    V775ReadbackSnapshot &snapshot = gVmeModuleState.snapshot.v775_readback;
-    snapshot.valid = ok ? TRUE : FALSE;
-    snapshot.firmware_revision = firmware;
-    snapshot.full_scale_range = fsr;
-    snapshot.fast_clear_window = fclr;
-    snapshot.over_range_enabled = !!(bits & V775_BIT2_OVER_RANGE);
-    snapshot.low_threshold_enabled = !!(bits & V775_BIT2_LOW_THRESHOLD);
-    snapshot.common_stop = !!(bits & V775_BIT2_COMMON_STOP);
-    snapshot.empty_program_enabled = !!(bits & V775_BIT2_EMPTY_PROGRAM);
-    snapshot.valid_control_enabled = !!(bits & V775_BIT2_VALID_CONTROL);
-    snapshot.sliding_scale_enabled = !!(bits & V775_BIT2_SLIDE_ENABLE);
-    snapshot.all_trigger_enabled = !!(bits & V775_BIT2_ALL_TRIGGER);
-    snapshot.bit_set2_raw = bits;
-    memcpy(snapshot.threshold, thresholds, sizeof(thresholds));
+    v7xx_config::capture_v775_readback(
+        gVmeModuleState.snapshot.v775_readback, firmware, fsr, fclr,
+        bits, thresholds, ok);
     set_module_output(V775_READBACK_PATH,"FirmwareRevision",&firmware,sizeof(firmware),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FullScaleRange",&fsr,sizeof(fsr),1,TID_WORD); set_module_output(V775_READBACK_PATH,"FastClearWindow",&fclr,sizeof(fclr),1,TID_WORD);
 #define RB775(k,m,b) { const BOOL v=!!(bits&b); set_module_output(V775_READBACK_PATH,k,&v,sizeof(v),1,TID_BOOL); }
     RB775("OverRangeEnabled",over_range_enabled,V775_BIT2_OVER_RANGE); RB775("LowThresholdEnabled",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); RB775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); RB775("EmptyProgramEnabled",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); RB775("ValidControlEnabled",valid_control_enabled,V775_BIT2_VALID_CONTROL); RB775("SlidingScaleEnabled",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); RB775("AllTriggerEnabled",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);

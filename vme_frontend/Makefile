@@ -55,9 +55,9 @@ COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
            $(BUILD_DIR)/v1720e.o \
            $(BUILD_DIR)/rpv130.o \
            $(BUILD_DIR)/manual_buffer_clear.o
-OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/global_busy.o \
+OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/global_busy.o \
        $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
-DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/global_busy.o \
+DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/global_busy.o \
             $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
 RPV130_TEST_OBJ = $(BUILD_DIR)/tests/test_rpv130_status.o
 IDLE_POLICY_TEST = $(BIN_TEST_DIR)/test_fevme_idle_policy
@@ -69,6 +69,7 @@ GLOBAL_BUSY_READINESS_TEST = $(BIN_TEST_DIR)/test_global_busy_readiness
 V1720E_CLEAR_TEST = $(BIN_TEST_DIR)/test_v1720e_software_clear
 V1720E_STOP_TEST = $(BIN_TEST_DIR)/test_v1720e_stop_recovery
 V1720E_BLT_TEST = $(BIN_TEST_DIR)/test_v1720e_blt32
+V7XX_CONFIG_TEST = $(BIN_TEST_DIR)/test_v7xx_config
 CAENVME_BLT_TEST = $(BIN_TEST_DIR)/test_caenvme_blt_wrapper
 V792_BLT_TEST = $(BIN_TEST_DIR)/test_v792_blt32
 V1190_FIFO_BLT_TEST = $(BIN_TEST_DIR)/test_v1190_fifo_blt32
@@ -90,6 +91,7 @@ check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	$(START_ABORT_CONTRACT_TEST) $(READOUT_GATE_CONTRACT_TEST) \
 	$(GLOBAL_BUSY_READINESS_TEST) \
 	$(V1720E_CLEAR_TEST) $(V1720E_STOP_TEST) $(V1720E_BLT_TEST) \
+	$(V7XX_CONFIG_TEST) \
 	$(CAENVME_BLT_TEST) $(V792_BLT_TEST) $(V1190_FIFO_BLT_TEST) $(RPV130_BUSY_MOCK_TEST)
 	./$(IDLE_POLICY_TEST)
 	./$(RPV130_BUSY_MOCK_TEST)
@@ -101,6 +103,7 @@ check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	./$(V1720E_CLEAR_TEST)
 	./$(V1720E_STOP_TEST)
 	./$(V1720E_BLT_TEST)
+	./$(V7XX_CONFIG_TEST)
 	./$(CAENVME_BLT_TEST)
 	./$(V792_BLT_TEST)
 	./$(V1190_FIFO_BLT_TEST)
@@ -176,6 +179,10 @@ $(V1720E_BLT_TEST): $(BUILD_DIR)/tests/test_v1720e_blt32.o \
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $^
 
+$(V7XX_CONFIG_TEST): tests/test_v7xx_config.cxx $(BUILD_DIR)/v7xx_config.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 $(CAENVME_BLT_TEST): $(BUILD_DIR)/tests/test_caenvme_blt_wrapper.o \
 	$(BUILD_DIR)/caenvme.o
 	@mkdir -p $(dir $@)
@@ -194,11 +201,11 @@ $(BIN_TEST_DIR)/%: $(BUILD_DIR)/tests/%.o
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $< -lCAENVME
 
-$(BUILD_DIR)/fevme.o: fevme.cxx vme_odb.h v1190_config.h v1720e_config.h
+$(BUILD_DIR)/fevme.o: fevme.cxx vme_odb.h v1190_config.h v1720e_config.h v7xx_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(NORMAL_DEFINES) -c $< -o $@
 
-$(BUILD_DIR)/fevme_diag.o: fevme.cxx vme_odb.h v1190_config.h v1720e_config.h
+$(BUILD_DIR)/fevme_diag.o: fevme.cxx vme_odb.h v1190_config.h v1720e_config.h v7xx_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(DIAGNOSTIC_DEFINES) -c $< -o $@
 
@@ -211,6 +218,10 @@ $(BUILD_DIR)/v1190_config.o: v1190_config.cxx v1190_config.h vme_odb.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/v1720e_config.o: v1720e_config.cxx v1720e_config.h vme_odb.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/v7xx_config.o: v7xx_config.cxx v7xx_config.h vme_odb.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
