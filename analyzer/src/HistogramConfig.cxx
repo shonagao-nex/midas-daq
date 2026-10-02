@@ -25,7 +25,7 @@ bool operator!=(const HistogramConfig& left, const HistogramConfig& right) {
 
 std::vector<HistogramConfig> DefaultHistogramConfigs() {
   std::vector<HistogramConfig> configs;
-  configs.reserve(521);
+  configs.reserve(513);
 
   const auto add = [&configs](std::string group, int channel_count,
                               const char* expression_format,
@@ -51,28 +51,26 @@ std::vector<HistogramConfig> DefaultHistogramConfigs() {
         std::snprintf(title, sizeof(title), "%s Ch.%d", title_prefix,
                       channel);
       configs.push_back({hist_name, "TH1D", expression, bins, min, max, "",
-                         event_group, title, x_title, "Counts", group, slot});
+                         true, title, x_title, "Counts", group, slot});
     }
   };
 
   add("Event", 1, "event", "", "", "Event number", 400, 0.0, 400.0,
       true);
-  add("QDC0", 32, "qdc0[%d]", "h_qdc0", "QDC0", "QDC raw value", 4096,
+  add("QDC0", 32, "qdc0[%d]", "h_qdc0", "QDC0", "QDC raw value", 512,
       0.0, 4096.0);
-  add("TDC0", 32, "tdc0[%d]", "h_tdc0", "TDC0", "TDC raw value", 4096,
+  add("TDC0", 32, "tdc0[%d]", "h_tdc0", "TDC0", "TDC raw value", 512,
       0.0, 4096.0);
   add("TLE0", 128, "tle0[%d][0]", "h_tle0", "V1190 Leading",
-      "Leading time raw value", 4096, 0.0, 1048576.0);
+      "Leading time raw value", 512, 0.0, 1048576.0);
   add("TTR0", 128, "ttr0[%d][0]", "h_ttr0", "V1190 Trailing",
-      "Trailing time raw value", 4096, 0.0, 1048576.0);
+      "Trailing time raw value", 512, 0.0, 1048576.0);
   add("EADC0", 64, "eadc0[%d]", "h_eadc0", "EASIROC ADC", "ADC raw value",
-      4096, 0.0, 4096.0);
+      512, 0.0, 4096.0);
   add("ETLE0", 64, "etle0[%d][0]", "h_etle0", "EASIROC Leading",
-      "Leading time raw value", 4096, 0.0, 1048576.0);
+      "Leading time raw value", 512, 0.0, 1048576.0);
   add("ETTR0", 64, "ettr0[%d][0]", "h_ettr0", "EASIROC Trailing",
-      "Trailing time raw value", 4096, 0.0, 1048576.0);
-  add("FADC0", 8, "fadc0[%d][0]", "h_fadc0", "FADC0", "FADC raw value",
-      4096, 0.0, 4096.0);
+      "Trailing time raw value", 512, 0.0, 1048576.0);
   return configs;
 }
 

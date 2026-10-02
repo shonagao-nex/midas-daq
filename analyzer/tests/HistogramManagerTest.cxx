@@ -92,6 +92,12 @@ int main() {
   okay &= Check(manager.ActiveCount() == 1 &&
                     qdc_directory && !qdc_directory->Get("enabled"),
                 "disabled object should be deleted");
+  okay &= Check(manager.ApplyConfigs(reloaded),
+                "re-enabled configuration should be applied");
+  okay &= Check(manager.ActiveCount() == 2 &&
+                    qdc_directory && qdc_directory->Get("enabled") &&
+                    manager.Entries("enabled") == 0,
+                "re-enabled object should be booked with empty contents");
   manager.EndRun();
 
   if (!okay) return 1;

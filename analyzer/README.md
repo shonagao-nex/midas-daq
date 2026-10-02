@@ -1,5 +1,34 @@
 # MIDAS common analyzer
 
+## Quick start (development)
+
+From `/home/nagao/midas/midas/online`:
+
+```sh
+cmake -S analyzer -B analyzer/build \
+  -DMIDASSYS=/home/nagao/midas/midas_src \
+  -DROOTANA_DIR=/home/nagao/midas/rootana
+cmake --build analyzer/build -j
+ctest --test-dir analyzer/build --output-on-failure
+```
+
+The one `bin/midas_analyzer` executable handles online monitoring, offline
+analysis, and ODB histogram initialization:
+
+```sh
+analyzer/bin/midas_analyzer --no-profiler -R8182
+analyzer/bin/midas_analyzer -f /home/nagao/midas/midas/data/run00125.mid.lz4 -w /tmp/run00125.root
+analyzer/bin/midas_analyzer --init-hist-odb
+```
+
+The online and ODB commands connect to the selected MIDAS experiment; use the
+development `daq-dev` environment when working under `/home/nagao`. The ODB
+initialization command creates settings and is only needed for a new ODB.
+Offline analysis does not connect to ODB. `build/` contains CMake and compiler
+output, `bin/` contains the user executable, `bin/test/` contains test
+executables, `src/` contains implementation, and `tests/` contains test source.
+CTest runs the tests without invoking the files in `bin/test/` by hand.
+
 This directory contains the initial offline/online common analysis layer for
 the VME and NIM-EASIROC frontends. `EventInspector` classifies physics events
 by bank composition (not event ID), reports the raw MIDAS structure, and feeds
@@ -36,15 +65,14 @@ ETTR payload, so `nim_easiroc` remains `-999`.
 ## Build
 
 ```sh
-cd /home/daq/midas/midas/online/analyzer
-export MIDASSYS=/home/daq/midas/midas_src
-export ROOTSYS=/home/daq/root/current
-cmake -S . -B build -DROOTANA_DIR=/home/daq/midas/rootana
+cd /home/nagao/midas/midas/online/analyzer
+export MIDASSYS=/home/nagao/midas/midas_src
+cmake -S . -B build -DROOTANA_DIR=/home/nagao/midas/rootana
 cmake --build build -j
 ```
 
 The build is out-of-source and uses the installed MIDAS/manalyzer targets and
-`/home/daq/midas/rootana/lib/librootana.a`; it does not write into either
+`/home/nagao/midas/rootana/lib/librootana.a`; it does not write into either
 dependency source tree.
 
 ## Command line and operating modes
@@ -52,6 +80,14 @@ dependency source tree.
 `-f` selects offline mode. With no `-f` or positional input file, the analyzer
 uses manalyzer's live MIDAS mode. The same event builder, decoders, decoded
 event type, expression resolver, and histogram manager are used in both modes.
+
+At online BOR, the analyzer reads `/Equipment/VME/Common/Enabled` and
+`/Equipment/EASIROC/Common/Enabled` without changing the ODB. If only one
+source is enabled, each decoded event from that source is sent to the online
+histograms immediately. If both are enabled, events are paired by MIDAS serial
+number as before. Offline analysis retains the two-source pairing behavior.
+Missing Enabled settings or both sources disabled produce a warning and retain
+the two-source behavior for that run.
 
 ```text
 Usage:
@@ -62,6 +98,7 @@ Usage:
   -f FILE    offline MIDAS input
   -w FILE    offline ROOT output
   -n N       maximum emitted DecodedEvent count (0 means unlimited)
+  --debug-events  print details for the first 8 events of each run
   -h         help
 
   --init-hist-odb
@@ -73,7 +110,7 @@ The MIDAS `mhttpd` default port is 8081. Online monitoring starts the standard
 ROOT `THttpServer` on `0.0.0.0:8082` by default, avoiding that port:
 
 ```sh
-./build/midas_analyzer --no-profiler
+./bin/midas_analyzer --no-profiler
 ```
 
 No online ROOT file is opened. `RootTreeWriter` is not constructed, and live
@@ -88,28 +125,18 @@ manalyzer has created its ROOT directory, since the installed manalyzer's own
 THttpServer, and `-R` is rejected with offline input. No mhttpd proxy or alias
 change is required for direct validation of the analyzer server.
 
-When the online analyzer is connected, the ROOT server also serves the
-histogram channel editor at
-`http://133.11.162.51:8082/Analyzer/HistogramEnable/` (substitute an explicitly
-selected `-R` port or a different DAQ host address). The ROOT Web homepage
-has a separate **Histogram Enable** link to this URL; the JSROOT hierarchy
-item is not a navigation link. It lists QDC0, TDC0, TLE0, TTR0, EADC0, ETLE0, ETTR0,
-and FADC0 by group. Checking or unchecking a channel sends one explicit
-WebSocket request that writes only the corresponding element of the existing
-`/Analyzer/Histograms/<Group>/Enabled[]` array. The handler verifies the
-group, channel count, and read-back value. Opening the page only reads ODB.
-If the compact tree is absent or malformed, the page reports an error and
-does not create keys. Event is intentionally excluded from this editor.
-The normal online poll applies a successful change to histogram booking.
-The page does not edit titles, page layouts, or other histogram fields.
-External access also requires the host firewall to permit the selected port.
+The analyzer uses the standard ROOT Web homepage. Histogram channels can be
+enabled or disabled by editing `/Analyzer/Histograms/<Group>/Enabled[]` in the
+MIDAS ODB editor. The online poll applies the change to histogram booking.
+External access to ROOT Web requires the host firewall to permit the selected
+port.
 
 ## systemd operation (online only)
 
 The repository's `../systemd/midas-analyzer.service` follows the existing
 MIDAS services: it runs as `daq` in the foreground, uses the local shared-memory
 experiment, starts after `network-online.target`, and restarts only on failure.
-It has no hard dependency on mhttpd. It runs `build/midas_analyzer
+It has no hard dependency on mhttpd. It runs `bin/midas_analyzer
 --no-profiler` with the normal online ROOT Web port 8082; it does not select
 offline input or create an online ROOT file. Build the analyzer before enabling
 the service. From the actual DAQ host shell, install and start it with:
@@ -144,7 +171,7 @@ For offline analysis, load ROOT and use:
 ```sh
 source /home/daq/root/current/bin/thisroot.sh
 cd /home/daq/midas/midas/online/analyzer
-./build/midas_analyzer -f /home/daq/midas/midas/data/run00062.mid.lz4
+./bin/midas_analyzer -f /home/daq/midas/midas/data/run00062.mid.lz4
 ```
 
 The default output is `/home/daq/midas/midas/rootfiles/run00062.root`. A `-w`
@@ -155,12 +182,12 @@ Manalyzer's `-e` counts raw records; use `-n` for the required decoded-event
 limit. `--mt` is rejected because live ROOT publication/rebooking is designed
 for manalyzer's single-thread event loop.
 
-The first few records are printed in detail. The end-of-run summary contains
-event counts, serial ranges and gaps, per-bank type/length distributions, and
-builder pairing statistics. Missing counterparts are still delivered as
-one-sided `DecodedEvent` objects and are summarized by count and counter range;
-they do not produce one warning per event. A warning is reserved for paired
-events whose two frontend counters disagree.
+Use `--debug-events` to print the first eight event headers and bank summaries
+in each run. Normal startup omits this detailed dump. The end-of-run summary
+contains event counts, serial ranges and gaps, per-bank type/length
+distributions, and builder pairing statistics. Missing counterparts are still
+delivered as one-sided `DecodedEvent` objects and are summarized by count and
+counter range; they do not produce one warning per event.
 
 ## Histogram configuration
 
@@ -177,11 +204,11 @@ ODB path or use an ODB API. Channel index 0 is the first element of each array:
     YTitle      = ["Counts", ...]
     Type        = ["TH1D", ...]
     Expression  = ["qdc0[0]", "qdc0[1]", ...]
-    Bins        = [4096, ...]
+    Bins        = [512, ...]
     Min         = [0, ...]
     Max         = [4096, ...]
     Cut         = ["", ...]
-    Enabled     = [false, ...]
+    Enabled     = [true, ...]
 ```
 
 The fields mean:
@@ -194,13 +221,18 @@ The fields mean:
 - `Enabled`: a false value keeps the definition but does not book or fill it.
 - `Title`, `XTitle`, and `YTitle` are copied to the ROOT histogram and axes.
 
-The default schema has 521 slots in these groups: `Event` (1), `QDC0` (32),
+The default schema has 513 slots in these groups: `Event` (1), `QDC0` (32),
 `TDC0` (32), `TLE0` (128), `TTR0` (128), `EADC0` (64), `ETLE0` (64),
-`ETTR0` (64), and `FADC0` (8). Every slot is created by the shared
-`DefaultHistogramConfigs()` generator. `Event[0]` is enabled by default;
-all channel slots are disabled until explicitly enabled in ODB. TLE/TTR and
-ETLE/ETTR defaults use the first hit (`[0]`), and FADC uses the first sample.
-The loader expands 99 ODB array fields (11 per group) into the 521 internal
+and `ETTR0` (64). Every slot is created by the shared
+`DefaultHistogramConfigs()` generator. All slots are enabled by default for
+new ODB initialization; an existing ODB tree retains its current values.
+TLE/TTR and ETLE/ETTR defaults use the first hit (`[0]`). FADC waveform data
+is still decoded and written to the offline ROOT tree, but the default
+histogram configuration no longer includes FADC0. The Event group has 400
+bins from 0 to 400; the other groups have 512 bins, with their existing axis
+limits. Existing ODB groups, including FADC0, are still loaded as configured
+until an operator updates them.
+The loader expands 88 ODB array fields (11 per group) into the 513 internal
 `HistogramConfig` objects, assigning `Ch00`, `Ch01`, and so on from array
 indices. All arrays in a group must have the same nonzero length; an
 incomplete group causes a non-writing in-memory fallback. The previous
@@ -264,11 +296,29 @@ EOR clears pending builder state and deletes live histogram objects. The
 standard mhttpd ODB editor can be used to edit the schema; there is no custom
 HTML page.
 
+## Online histogram fill prescale
+
+On online analyzer startup, the integer key
+`/Analyzer/OnlineHistogram/FillPrescale` is created with value `1` if absent.
+An existing value is preserved. The MIDAS ODB editor can set it directly: `1`
+fills every decoded event, and `N > 1` fills one of every N decoded events.
+Sampling uses the one-based count of events delivered by `EventBuilder` to
+`ConsumeDecodedEvent`; the first decoded event is filled, followed by every
+Nth event. The count spans paired and single-source events. Values of zero or
+less use an effective prescale of `1` and produce one warning while the value
+remains invalid.
+
+The value is read at BOR and again with the existing online controls poll (at
+most once per second). A changed effective value is logged once and applies
+to subsequent histogram fills. This setting does not change event reception,
+decoding, pairing, diagnostics, or offline ROOT tree and histogram output.
+Offline analysis does not read this ODB key and fills every decoded event.
+
 To initialize the tree explicitly, run the following only from the real DAQ
 host environment:
 
 ```sh
-./build/midas_analyzer --init-hist-odb
+./bin/midas_analyzer --init-hist-odb
 ```
 
 This management command connects to MIDAS/ODB, creates definitions from the

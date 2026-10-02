@@ -73,21 +73,18 @@ void EventBuilder::AddEvent(TMEvent& event, RawEventSource source) {
     DecodeEasiroc(event, pending);
   }
 
-  if (pending.has_vme && pending.has_easiroc) Emit(position);
+  const bool complete =
+      (expected_sources_ == ExpectedSources::kBoth && pending.has_vme &&
+       pending.has_easiroc) ||
+      (expected_sources_ == ExpectedSources::kVmeOnly && pending.has_vme) ||
+      (expected_sources_ == ExpectedSources::kEasirocOnly && pending.has_easiroc);
+  if (complete) Emit(position);
 }
 
 void EventBuilder::Emit(std::map<std::uint32_t, PendingEvent>::iterator position) {
   PendingEvent& pending = position->second;
   if (pending.has_vme && pending.has_easiroc) {
     ++statistics_.paired;
-    if (pending.decoded.counters.vme != pending.decoded.counters.easiroc) {
-      ++statistics_.counter_mismatches;
-      std::fprintf(stderr,
-                   "WARNING: frontend counter mismatch: VME=%lld "
-                   "EASIROC=%lld\n",
-                   static_cast<long long>(pending.decoded.counters.vme),
-                   static_cast<long long>(pending.decoded.counters.easiroc));
-    }
   } else if (pending.has_vme) {
     ++statistics_.vme_only;
     statistics_.vme_only_counters.insert(position->first);
@@ -104,7 +101,6 @@ void EventBuilder::Emit(std::map<std::uint32_t, PendingEvent>::iterator position
   record(statistics_.v775, pending.decoded.counters.v775);
   record(statistics_.v1190, pending.decoded.counters.v1190);
   record(statistics_.v1720, pending.decoded.counters.v1720);
-  record(statistics_.nim_easiroc, pending.decoded.counters.nim_easiroc);
 
   if (consumer_) consumer_(pending.decoded);
   pending_.erase(position);
@@ -122,6 +118,7 @@ void EventBuilder::DiscardPending() { pending_.clear(); }
 void EventBuilder::Clear() {
   pending_.clear();
   statistics_ = Statistics{};
+  expected_sources_ = ExpectedSources::kBoth;
 }
 
 }  // namespace ana

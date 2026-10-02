@@ -18,8 +18,8 @@ ELOG = "/Experiment/Run Elog"
 SUCCESS = 1
 MISSING = 312
 ANALYZER_PROGRAMS = {
-    "ana": f"{ROOT}/analyzer/build/midas_analyzer --no-profiler",
-    "ana_hist_odb_init": f"{ROOT}/analyzer/build/midas_analyzer --init-hist-odb",
+    "ana": f"{ROOT}/analyzer/bin/midas_analyzer --no-profiler",
+    "ana_hist_odb_init": f"{ROOT}/analyzer/bin/midas_analyzer --init-hist-odb",
 }
 
 # TID values in the installed MIDAS include/midas.h.

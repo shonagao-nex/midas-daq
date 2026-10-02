@@ -23,7 +23,7 @@ BINARIES = (
     "vme_frontend/bin/fevme",
     "easiroc_frontend/bin/feeasiroc",
     "daq_monitor/bin/daq_monitor",
-    "analyzer/build/midas_analyzer",
+    "analyzer/bin/midas_analyzer",
 )
 FRONTENDS = ("fevme", "feeasiroc")
 SERVICES = ("midas-daq-monitor.service", "midas-analyzer.service")

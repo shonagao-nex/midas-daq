@@ -93,7 +93,7 @@ start_process daq_monitor \
     -e "$MIDAS_EXPT_NAME"
 
 start_process analyzer \
-    "$ONLINE/analyzer/build/midas_analyzer" \
+    "$ONLINE/analyzer/bin/midas_analyzer" \
     --no-profiler \
     -R"$ROOTWEB_PORT"
 

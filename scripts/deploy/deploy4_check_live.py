@@ -85,7 +85,7 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
                  ("git", "-C", str(ROOT), "diff", "--cached", "--quiet")):
         subprocess.run(args, check=True)
     for binary in ("vme_frontend/bin/fevme", "easiroc_frontend/bin/feeasiroc",
-                   "daq_monitor/bin/daq_monitor", "analyzer/build/midas_analyzer"):
+                   "daq_monitor/bin/daq_monitor", "analyzer/bin/midas_analyzer"):
         path = ROOT / binary
         if not path.is_file() or not os.access(path, os.X_OK):
             raise RuntimeError(f"Missing production binary: {path}")
@@ -138,7 +138,7 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
         if active and name in SERVICES[2:]:
             pid = int(command("systemctl", "show", "--property=MainPID", "--value", name))
             binary = ("daq_monitor/bin/daq_monitor" if name == SERVICES[2] else
-                      "analyzer/build/midas_analyzer")
+                      "analyzer/bin/midas_analyzer")
             executable_matches(pid, ROOT / binary)
             client = "daq_monitor" if name == SERVICES[2] else "ana"
             if rpc.call("cm_exist", {"name": client, "unique": True})["status"] != 1:

@@ -49,9 +49,17 @@ int main() {
   const auto normal_online =
       ana::ParseAnalyzerCli({"midas_analyzer", "--no-profiler"});
   okay &= Check(normal_online.okay && !normal_online.init_hist_odb &&
+                    !normal_online.inspector_options.debug_events &&
                     Contains(normal_online.manalyzer_arguments,
                              "--no-profiler"),
                 "normal online startup must remain separate from init mode");
+
+  const auto debug_events =
+      ana::ParseAnalyzerCli({"midas_analyzer", "--debug-events"});
+  okay &= Check(debug_events.okay &&
+                    debug_events.inspector_options.debug_events &&
+                    !Contains(debug_events.manalyzer_arguments, "--debug-events"),
+                "debug event output must be explicit and analyzer-owned");
 
   const auto initialize =
       ana::ParseAnalyzerCli({"midas_analyzer", "--init-hist-odb"});
@@ -61,6 +69,10 @@ int main() {
                 "management mode must not start the ROOT web server");
   okay &= Check(initialize.root_web_port == 0,
                 "management mode should not configure a ROOT web port");
+  okay &= Check(!ana::ParseAnalyzerCli(
+                     {"midas_analyzer", "--init-hist-odb", "--debug-events"})
+                     .okay,
+                "management mode must reject event debugging");
 
   const auto initialize_with_connection = ana::ParseAnalyzerCli(
       {"midas_analyzer", "--init-hist-odb", "-Hdaqhost", "-Edaq",

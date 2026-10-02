@@ -39,21 +39,21 @@ ROOT_GENERATE_DICTIONARY(G__RootTreeTypes
   LINKDEF "${CMAKE_CURRENT_SOURCE_DIR}/include/RootTreeLinkDef.h"
 )
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 add_executable(midas_analyzer
   src/analyzer_main.cxx
   src/AnalyzerCli.cxx
   src/EventInspector.cxx
+  src/EventDiagnostics.cxx
   src/EventBuilder.cxx
   src/RootTreeWriter.cxx
   src/ExpressionResolver.cxx
   src/HistogramConfig.cxx
   src/HistogramConfigLoader.cxx
-  src/HistogramEnableControl.cxx
-  src/HistogramEnableWebHandler.cxx
-  src/HistogramEnableHttpServer.cxx
   src/HistogramOdbInitializer.cxx
   src/HistogramManager.cxx
   src/OnlineHistogramState.cxx
+  src/OnlineHistogramPrescale.cxx
   src/HistogramPdfWriter.cxx
   src/PageConfig.cxx
   src/PageConfigLoader.cxx
@@ -77,21 +77,21 @@ target_compile_options(midas_analyzer PRIVATE
   -Wpedantic
 )
 
-configure_file(web/histogram_enable.html
-  "${CMAKE_CURRENT_BINARY_DIR}/histogram_enable.html" COPYONLY)
-configure_file(web/online_home.html
-  "${CMAKE_CURRENT_BINARY_DIR}/online_home.html" COPYONLY)
-target_compile_definitions(midas_analyzer PRIVATE
-  ANA_HISTOGRAM_ENABLE_PAGE="file:${CMAKE_CURRENT_BINARY_DIR}/histogram_enable.html"
-  ANA_ROOT_WEB_HOME="${CMAKE_CURRENT_BINARY_DIR}/online_home.html"
-)
-
 target_link_libraries(midas_analyzer PRIVATE
   manalyzer_main
   rootana::rootana
 )
 
+# ROOT looks for the executable's dictionary PCM beside the executable.
+# Keep the generated PCM in build/ and expose only a runtime link in bin/.
+add_custom_command(TARGET midas_analyzer POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E create_symlink
+    "${CMAKE_CURRENT_BINARY_DIR}/libRootTreeTypes_rdict.pcm"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bin/libRootTreeTypes_rdict.pcm"
+)
+
 enable_testing()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin/test")
 add_executable(expression_resolver_test
   tests/ExpressionResolverTest.cxx
   src/ExpressionResolver.cxx
@@ -158,11 +158,43 @@ target_compile_options(analyzer_cli_test PRIVATE
 )
 add_test(NAME analyzer_cli_test COMMAND analyzer_cli_test)
 
+add_executable(event_diagnostics_test
+  tests/EventDiagnosticsTest.cxx
+  src/EventDiagnostics.cxx
+)
+target_include_directories(event_diagnostics_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_options(event_diagnostics_test PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+)
+target_link_libraries(event_diagnostics_test PRIVATE rootana::rootana midas::midas)
+add_test(NAME event_diagnostics_test COMMAND event_diagnostics_test)
+
+add_executable(event_builder_test
+  tests/EventBuilderTest.cxx
+  src/EventBuilder.cxx
+  decoder/V792Decoder.cxx
+  decoder/V775Decoder.cxx
+  decoder/V1190Decoder.cxx
+  decoder/V1720Decoder.cxx
+  decoder/EasirocDecoder.cxx
+)
+target_include_directories(event_builder_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/decoder"
+)
+target_compile_options(event_builder_test PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(event_builder_test PRIVATE rootana::rootana midas::midas)
+add_test(NAME event_builder_test COMMAND event_builder_test)
+
 add_executable(histogram_config_loader_test
   tests/HistogramConfigLoaderTest.cxx
   src/HistogramConfigLoader.cxx
-  src/HistogramEnableControl.cxx
   src/HistogramOdbInitializer.cxx
+  src/OnlineHistogramPrescale.cxx
   src/HistogramConfig.cxx
   src/ExpressionResolver.cxx
 )
@@ -179,26 +211,6 @@ target_link_libraries(histogram_config_loader_test PRIVATE
 )
 add_test(NAME histogram_config_loader_test
   COMMAND histogram_config_loader_test
-)
-
-add_executable(histogram_enable_http_server_test
-  tests/HistogramEnableHttpServerTest.cxx
-  src/HistogramEnableHttpServer.cxx
-)
-target_include_directories(histogram_enable_http_server_test PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-)
-target_compile_options(histogram_enable_http_server_test PRIVATE
-  -Wall
-  -Wextra
-  -Wpedantic
-)
-target_compile_definitions(histogram_enable_http_server_test PRIVATE
-  ANA_ROOT_WEB_HOME="${CMAKE_CURRENT_BINARY_DIR}/online_home.html"
-)
-target_link_libraries(histogram_enable_http_server_test PRIVATE ROOT::RHTTP)
-add_test(NAME histogram_enable_http_server_test
-  COMMAND histogram_enable_http_server_test
 )
 
 add_executable(histogram_pdf_writer_test

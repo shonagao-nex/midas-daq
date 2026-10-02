@@ -44,6 +44,12 @@ Build/
 build-*/
 **/build/
 **/bin/
+!analyzer/bin/
+analyzer/bin/*
+!analyzer/bin/.gitignore
+!analyzer/bin/test/
+analyzer/bin/test/*
+!analyzer/bin/test/.gitignore
 
 # CMake generated files
 CMakeFiles/

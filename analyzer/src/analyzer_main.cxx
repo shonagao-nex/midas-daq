@@ -2,9 +2,8 @@
 #include "EventInspector.h"
 #include "HistogramConfigLoader.h"
 #include "HistogramOdbInitializer.h"
-#include "HistogramEnableWebHandler.h"
-#include "HistogramEnableHttpServer.h"
 #include "OnlineHistogramState.h"
+#include "OnlineHistogramPrescale.h"
 #include "manalyzer.h"
 #include "midas.h"
 #include "mvodb.h"
@@ -83,7 +82,7 @@ class EventInspectorFactory : public TAFactory {
     if (!TARootHelper::fgHttpServer && root_web_port_ > 0) {
       const std::string address =
           "http:0.0.0.0:" + std::to_string(root_web_port_);
-      auto* server = new ana::HistogramEnableHttpServer(address.c_str());
+      auto* server = new THttpServer(address.c_str());
       if (!server->IsAnyEngine()) {
         std::fprintf(stderr,
                      "ERROR: cannot start ROOT Web on 0.0.0.0:%d\n",
@@ -91,7 +90,6 @@ class EventInspectorFactory : public TAFactory {
         delete server;
         std::exit(EXIT_FAILURE);
       }
-      server->SetDefaultPage(ANA_ROOT_WEB_HOME);
       TARootHelper::fgHttpServer = server;
     }
 
@@ -99,6 +97,14 @@ class EventInspectorFactory : public TAFactory {
     // the run is stopped (when no TARunObject exists). This makes the initial
     // histogram configuration check observable without starting a run.
     TMFE* mfe = TMFE::Instance();
+    if (!prescale_odb_checked_ && mfe && mfe->fOdbRoot) {
+      prescale_odb_checked_ = true;
+      if (!ana::OnlineHistogramPrescale::EnsureOdb(mfe->fOdbRoot))
+        std::fprintf(stderr,
+                     "WARNING: cannot initialize %s; online histogram "
+                     "fill will use 1 until the key is available\n",
+                     ana::OnlineHistogramPrescale::kOdbPath);
+    }
     if (!pdf_watch_active_ && mfe && mfe->fOdbRoot) {
       HNDLE database = 0;
       HNDLE analyzer_key = 0;
@@ -114,17 +120,6 @@ class EventInspectorFactory : public TAFactory {
         std::fprintf(stderr,
                      "INFO: /Analyzer ODB tree is absent; STOP-state PDF "
                      "request watch is unavailable until analyzer restart.\n");
-      }
-    }
-    if (!histogram_enable_web_ && TARootHelper::fgHttpServer && mfe &&
-        mfe->fOdbRoot) {
-      histogram_enable_web_ =
-          std::make_unique<ana::HistogramEnableWebHandler>(mfe->fOdbRoot);
-      if (!TARootHelper::fgHttpServer->Register(
-              "/Analyzer", histogram_enable_web_.get())) {
-        std::fprintf(stderr,
-                     "WARNING: cannot register histogram channel web page\n");
-        histogram_enable_web_.reset();
       }
     }
     const auto result = histogram_config_loader_.Load(
@@ -164,11 +159,11 @@ class EventInspectorFactory : public TAFactory {
   ana::EventInspectorOptions options_;
   int root_web_port_ = 0;
   ana::HistogramConfigLoader histogram_config_loader_;
-  std::unique_ptr<ana::HistogramEnableWebHandler> histogram_enable_web_;
   ana::OnlineHistogramState online_state_;
   HNDLE pdf_watch_database_ = 0;
   HNDLE pdf_watch_key_ = 0;
   bool pdf_watch_active_ = false;
+  bool prescale_odb_checked_ = false;
 };
 
 EventInspectorFactory event_inspector_factory;

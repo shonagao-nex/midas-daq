@@ -1,6 +1,6 @@
 #include "HistogramConfigLoader.h"
-#include "HistogramEnableControl.h"
 #include "HistogramOdbInitializer.h"
+#include "OnlineHistogramPrescale.h"
 
 #include "mvodb.h"
 
@@ -85,6 +85,19 @@ class TrackingOdb final : public MVOdb {
     auto& values = Child(Child(Child(state_->root, "Analyzer"),
                                "Histograms"), group).values;
     std::get<std::vector<int>>(values.at(field)).pop_back();
+  }
+  void SetInteger(const std::string& directory, const std::string& key,
+                  int value) {
+    Node* node = &state_->root;
+    std::size_t begin = 0;
+    while (begin < directory.size()) {
+      const std::size_t end = directory.find('/', begin);
+      node = &Child(*node, directory.substr(begin, end - begin));
+      if (end == std::string::npos) break;
+      begin = end + 1;
+    }
+    node->values[key] = value;
+    ++state_->write_operations;
   }
 
   bool IsReadOnly() const override { return false; }
@@ -355,38 +368,33 @@ int main() {
                 "normal load must perform zero create operations");
   okay &= Check(missing.WriteOperations() == 0,
                 "normal load must perform zero write operations");
-  std::string enable_error;
-  okay &= Check(!ana::HistogramEnableControl::Set(
-                    &missing, "QDC0", 0, true, &enable_error) &&
-                    missing.CreateOperations() == 0 &&
-                    missing.WriteOperations() == 0,
-                "channel control must not create a missing compact schema");
-
   TrackingOdb empty_for_initialization;
   const auto initialized =
       ana::InitializeHistogramOdb(&empty_for_initialization);
   const auto defaults = ana::DefaultHistogramConfigs();
   const std::map<std::string, std::size_t> expected_slots{
       {"Event", 1},  {"QDC0", 32},  {"TDC0", 32},  {"TLE0", 128},
-      {"TTR0", 128}, {"EADC0", 64}, {"ETLE0", 64}, {"ETTR0", 64},
-      {"FADC0", 8}};
+      {"TTR0", 128}, {"EADC0", 64}, {"ETLE0", 64}, {"ETTR0", 64}};
   std::map<std::string, std::size_t> actual_slots;
   for (const auto& config : defaults) {
     ++actual_slots[config.group];
     okay &= Check(!config.title.empty() && !config.x_title.empty() &&
                       config.y_title == "Counts",
                   "every default slot should have display metadata");
-    okay &= Check(config.group == "Event" ? config.enabled : !config.enabled,
-                  "only Event should be enabled by default");
+    okay &= Check(config.enabled,
+                  "every histogram should be enabled by default");
   }
-  okay &= Check(actual_slots == expected_slots && defaults.size() == 521,
-                "default groups should contain all 521 channel slots");
-  okay &= Check(ana::HistogramEnableControl::GroupNames().size() == 8,
-                "enable editor should expose all eight channel groups");
-  for (const auto& group : ana::HistogramEnableControl::GroupNames())
-    okay &= Check(ana::HistogramEnableControl::ChannelCount(group) ==
-                      expected_slots.at(group),
-                  "enable editor channel count should match defaults");
+  okay &= Check(actual_slots == expected_slots && defaults.size() == 513,
+                "default groups should contain all 513 channel slots");
+  for (const auto& config : defaults) {
+    const bool event = config.group == "Event";
+    const bool time = config.group == "TLE0" || config.group == "TTR0" ||
+                      config.group == "ETLE0" || config.group == "ETTR0";
+    okay &= Check(config.bins == (event ? 400 : 512) && config.min == 0.0 &&
+                      config.max == (event ? 400.0
+                                         : time ? 1048576.0 : 4096.0),
+                  "default bin count and axis range must match the group");
+  }
   okay &= Check(initialized.okay,
                 "explicit initialization should succeed on an empty ODB");
   okay &= Check(initialized.created == defaults.size() &&
@@ -398,12 +406,12 @@ int main() {
                     empty_for_initialization.WriteOperations() ==
                         static_cast<int>(expected_slots.size() * 11),
                 "explicit initialization should write 11 arrays per group");
-  okay &= Check(empty_for_initialization.GroupCount() == 9 &&
-                    empty_for_initialization.FieldCount() == 99 &&
+  okay &= Check(empty_for_initialization.GroupCount() == 8 &&
+                    empty_for_initialization.FieldCount() == 88 &&
                     empty_for_initialization.ChannelDirectoryCount() == 0 &&
                     empty_for_initialization.FieldCount() <
                         defaults.size() * 11 / 10,
-                "compact schema should have 9 groups and only 99 fields");
+                "compact schema should have 8 groups and only 88 fields");
   const auto round_trip = loader.Load(&empty_for_initialization);
   auto actual_configs = round_trip.configs;
   auto expected_configs = defaults;
@@ -414,68 +422,37 @@ int main() {
   std::sort(actual_configs.begin(), actual_configs.end(), by_name);
   std::sort(expected_configs.begin(), expected_configs.end(), by_name);
   okay &= Check(actual_configs == expected_configs,
-                "create then load should preserve all 521 configs");
+                "create then load should preserve all 513 configs");
 
-  const int writes_before_enable = empty_for_initialization.WriteOperations();
-  ana::HistogramEnableGroup qdc_group;
-  enable_error.clear();
-  okay &= Check(ana::HistogramEnableControl::Read(
-                    &empty_for_initialization, "QDC0", &qdc_group,
-                    &enable_error) &&
-                    qdc_group.enabled.size() == 32 && !qdc_group.enabled[5],
-                "web control should read the existing QDC0 Enabled array");
-  okay &= Check(empty_for_initialization.WriteOperations() ==
-                    writes_before_enable,
-                "viewing channel checkboxes must not write ODB");
-  okay &= Check(ana::HistogramEnableControl::Set(
-                    &empty_for_initialization, "QDC0", 5, true,
-                    &enable_error),
-                "explicit channel toggle should succeed");
-  const auto enabled_result = loader.Load(&empty_for_initialization);
-  const auto changed = std::find_if(
-      enabled_result.configs.begin(), enabled_result.configs.end(),
-      [](const ana::HistogramConfig& config) {
-        return config.group == "QDC0" && config.slot == "Ch05";
-      });
-  okay &= Check(changed != enabled_result.configs.end() &&
-                    changed->enabled && changed->title == "QDC0 Ch.5" &&
-                    empty_for_initialization.WriteOperations() ==
-                        writes_before_enable + 1,
-                "toggle should change one Enabled element and preserve metadata");
-  okay &= Check(ana::HistogramEnableControl::Set(
-                    &empty_for_initialization, "QDC0", 5, true,
-                    &enable_error) &&
-                    empty_for_initialization.WriteOperations() ==
-                        writes_before_enable + 1,
-                "repeating the same toggle must not write again");
-  okay &= Check(ana::HistogramEnableControl::Set(
-                    &empty_for_initialization, "QDC0", 5, false,
-                    &enable_error),
-                "explicit channel disable should succeed");
-  ana::HistogramEnableGroup disabled_group;
-  okay &= Check(ana::HistogramEnableControl::Read(
-                    &empty_for_initialization, "QDC0", &disabled_group,
-                    &enable_error) &&
-                    !disabled_group.enabled[5] &&
-                    empty_for_initialization.WriteOperations() ==
-                        writes_before_enable + 2,
-                "disable should update only one existing array element");
-  okay &= Check(!ana::HistogramEnableControl::Set(
-                    &empty_for_initialization, "QDC0", 99, true,
-                    &enable_error) &&
-                    !ana::HistogramEnableControl::Set(
-                        &empty_for_initialization, "Unknown", 0, true,
-                        &enable_error) &&
-                    empty_for_initialization.WriteOperations() ==
-                        writes_before_enable + 2,
-                "invalid group and channel must not write ODB");
+  std::unique_ptr<MVOdb> analyzer_odb(
+      empty_for_initialization.Chdir("Analyzer/Histograms/QDC0", false, nullptr));
+  okay &= Check(static_cast<bool>(analyzer_odb),
+                "initialized QDC0 group should exist");
+  if (analyzer_odb) {
+    MVOdbError error;
+    analyzer_odb->WBAI("Enabled", 5, false, &error);
+    const auto disabled_result = loader.Load(&empty_for_initialization);
+    const auto changed = std::find_if(
+        disabled_result.configs.begin(), disabled_result.configs.end(),
+        [](const ana::HistogramConfig& config) {
+          return config.group == "QDC0" && config.slot == "Ch05";
+        });
+    okay &= Check(changed != disabled_result.configs.end() &&
+                      !changed->enabled && changed->title == "QDC0 Ch.5",
+                  "ODB Enabled false should load without changing metadata");
+    analyzer_odb->WBAI("Enabled", 5, true, &error);
+    auto restored = loader.Load(&empty_for_initialization).configs;
+    std::sort(restored.begin(), restored.end(), by_name);
+    okay &= Check(restored == expected_configs,
+                  "ODB Enabled true should restore the default configuration");
+  }
 
   empty_for_initialization.TruncateField("QDC0", "Bins");
   const auto malformed_result = loader.Load(&empty_for_initialization);
   okay &= Check(!malformed_result.loaded_from_odb &&
                     malformed_result.configs == defaults,
                 "a mismatched group array should use defaults without writes");
-  okay &= Check(empty_for_initialization.WriteOperations() == 101,
+  okay &= Check(empty_for_initialization.WriteOperations() == 90,
                 "malformed group load must remain read-only");
 
   TrackingOdb existing;
@@ -514,6 +491,57 @@ int main() {
   okay &= Check(after_rejected_initialization.configs ==
                     before_rejected_initialization,
                 "rejected initialization must preserve existing values");
+
+  TrackingOdb prescale_odb;
+  okay &= Check(ana::OnlineHistogramPrescale::EnsureOdb(&prescale_odb),
+                "online startup should create the integer prescale key");
+  std::unique_ptr<MVOdb> prescale_directory(
+      prescale_odb.Chdir("Analyzer/OnlineHistogram", false, nullptr));
+  int stored_prescale = 0;
+  MVOdbError prescale_error;
+  if (prescale_directory)
+    prescale_directory->RI("FillPrescale", &stored_prescale, false,
+                           &prescale_error);
+  okay &= Check(prescale_directory && !prescale_error.fError &&
+                    stored_prescale == 1 && prescale_odb.WriteOperations() == 1,
+                "new FillPrescale should be an integer with default 1");
+  okay &= Check(ana::OnlineHistogramPrescale::EnsureOdb(&prescale_odb) &&
+                    prescale_odb.WriteOperations() == 1,
+                "online startup should preserve an existing prescale value");
+
+  ana::OnlineHistogramPrescale prescale;
+  prescale.BeginRun(&prescale_odb);
+  const auto selected = [&prescale](ana::AnalyzerMode mode) {
+    std::size_t count = 0;
+    for (std::size_t event = 1; event <= 17426; ++event)
+      if (prescale.ShouldFill(mode, event)) ++count;
+    return count;
+  };
+  okay &= Check(selected(ana::AnalyzerMode::kOnline) == 17426,
+                "prescale 1 should fill every online decoded event");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "FillPrescale", 2);
+  prescale.Poll(&prescale_odb);
+  okay &= Check(prescale.EffectiveValue() == 2 &&
+                    selected(ana::AnalyzerMode::kOnline) == 8713,
+                "live prescale 2 should select half the decoded events");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "FillPrescale", 10);
+  prescale.Poll(&prescale_odb);
+  okay &= Check(prescale.EffectiveValue() == 10 &&
+                    selected(ana::AnalyzerMode::kOnline) == 1743 &&
+                    selected(ana::AnalyzerMode::kOffline) == 17426,
+                "live prescale 10 should select 1743 online events but all offline events");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "FillPrescale", 0);
+  prescale.Poll(&prescale_odb);
+  okay &= Check(prescale.EffectiveValue() == 1 &&
+                    selected(ana::AnalyzerMode::kOnline) == 17426,
+                "invalid prescale should fall back to 1");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "FillPrescale", 10);
+  prescale.Poll(&prescale_odb);
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "FillPrescale", 1);
+  prescale.Poll(&prescale_odb);
+  okay &= Check(prescale.EffectiveValue() == 1 &&
+                    selected(ana::AnalyzerMode::kOnline) == 17426,
+                "live 10-to-1 update should restore full histogram fill");
 
   if (!okay) return 1;
   std::printf("HistogramConfigLoader tests passed\n");

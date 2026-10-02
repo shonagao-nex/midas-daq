@@ -18,6 +18,7 @@ enum class RawEventSource { kUnknown, kVme, kEasiroc };
 class EventBuilder {
  public:
   using Consumer = std::function<void(const DecodedEvent&)>;
+  enum class ExpectedSources { kBoth, kVmeOnly, kEasirocOnly };
 
   struct Statistics {
     struct RawCounters {
@@ -27,7 +28,6 @@ class EventBuilder {
     std::size_t paired = 0;
     std::size_t vme_only = 0;
     std::size_t easiroc_only = 0;
-    std::size_t counter_mismatches = 0;
     std::size_t duplicate_source = 0;
     std::size_t decoder_errors = 0;
     std::set<std::uint32_t> vme_only_counters;
@@ -36,11 +36,11 @@ class EventBuilder {
     RawCounters v775;
     RawCounters v1190;
     RawCounters v1720;
-    RawCounters nim_easiroc;
   };
 
   explicit EventBuilder(Consumer consumer = {});
 
+  void SetExpectedSources(ExpectedSources sources) { expected_sources_ = sources; }
   void AddEvent(TMEvent& event, RawEventSource source);
   void Finish();
   void DiscardPending();
@@ -61,6 +61,7 @@ class EventBuilder {
   void Emit(std::map<std::uint32_t, PendingEvent>::iterator position);
 
   Consumer consumer_;
+  ExpectedSources expected_sources_ = ExpectedSources::kBoth;
   std::map<std::uint32_t, PendingEvent> pending_;
   Statistics statistics_;
 };

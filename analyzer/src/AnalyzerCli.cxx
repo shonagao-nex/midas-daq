@@ -116,6 +116,10 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
       result.init_hist_odb = true;
       continue;
     }
+    if (argument == "--debug-events") {
+      result.inspector_options.debug_events = true;
+      continue;
+    }
     if (argument == "-f" || argument == "-w" || argument == "-n") {
       if (i + 1 >= arguments.size()) {
         result.error = argument + " requires a value";
@@ -209,7 +213,8 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   if (result.init_hist_odb) {
     if (!requested_input.empty() || !positional_inputs.empty() ||
         !requested_output.empty() || has_limit || has_legacy_root_output ||
-        has_http_port || !management_incompatible_option.empty()) {
+        has_http_port || result.inspector_options.debug_events ||
+        !management_incompatible_option.empty()) {
       result.error = "--init-hist-odb cannot be combined with analysis, "
                      "event-loop, or ROOT output options";
       return result;
@@ -259,6 +264,7 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "             Default: " << RootOutputDirectory().string()
        << "/<input>.root\n"
        << "  -n N       Process at most N decoded events (0 = unlimited)\n"
+       << "  --debug-events  Print details for the first 8 events of each run\n"
        << "  -h         Show this help\n\n"
        << "Management option:\n"
        << "  --init-hist-odb\n"
