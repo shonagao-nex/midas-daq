@@ -3311,13 +3311,13 @@ INT read_vme_event(char *pevent, INT off)
         uint8_t csr1 = 0;
         if (timing.active) timing.clear_call_ns = monotonic_ns();
         const int clear_status = timing.active ?
-            rpv130_clear_busy1_and_rearm_timed(
+            rpv130_clear_busy1_preserving_arm_timed(
                 gVme, RPV130_BASE_ADDRESS, &csr1, &timing.writes) :
-            rpv130_clear_busy1_and_rearm(
+            rpv130_clear_busy1_preserving_arm(
                 gVme, RPV130_BASE_ADDRESS, &csr1);
         if (timing.active) timing.clear_return_ns = monotonic_ns();
         if (clear_status != MVME_SUCCESS) {
-            fail_single_event_busy("CLR1/re-arm or CSR1 readback failed");
+            fail_single_event_busy("CLR1 or CSR1 readback failed");
             return 0;
         }
         if (!publish_rpv130_busy_state(

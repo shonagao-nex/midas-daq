@@ -217,6 +217,57 @@ int rpv130_clear_busy1_and_rearm_timed(MVME_INTERFACE *mvme, mvme_addr_t base,
     return write_channel1_sequence(mvme, base, true, csr1, timing);
 }
 
+static int clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
+                                      uint8_t *csr1, RPV130_BUSY_TIMING *timing)
+{
+    if (timing) *timing = {};
+    if (!mvme) return MVME_INVALID_PARAM;
+    int saved_am = 0, saved_dmode = 0;
+    int result = select_rpv130_mode(mvme, &saved_am, &saved_dmode);
+    if (result != MVME_SUCCESS) return result;
+
+    uint8_t before = 0;
+    result = read_d16(mvme, base + RPV130_CSR1, &before);
+    const uint8_t settings = before &
+        (RPV130_CSR1_ENABLE3 | RPV130_CSR1_CHANNEL1_ARMED);
+    if (result == MVME_SUCCESS &&
+        (settings & RPV130_CSR1_CHANNEL1_ARMED) != RPV130_CSR1_CHANNEL1_ARMED)
+        result = MVME_ACCESS_ERROR;
+    if (result == MVME_SUCCESS) {
+        // BUSY status bits are read-only; write only settings and CLR1.
+        if (timing) timing->clr1_before_ns = monotonic_ns();
+        result = write_d16(mvme, base + RPV130_CSR1,
+                           settings | RPV130_CSR1_CLR1);
+        if (timing) timing->clr1_after_ns = monotonic_ns();
+    }
+    uint8_t raw = 0;
+    if (result == MVME_SUCCESS)
+        result = read_d16(mvme, base + RPV130_CSR1, &raw);
+    if (result == MVME_SUCCESS) {
+        // A new FIN1 may set BUSY1 before this readback.
+        if ((raw & (RPV130_CSR1_ENABLE3 | RPV130_CSR1_CHANNEL1_ARMED)) !=
+            settings)
+            result = MVME_ACCESS_ERROR;
+        if (csr1) *csr1 = raw;
+    }
+    const int restore_result = restore_mode(mvme, saved_am, saved_dmode);
+    if (result == MVME_SUCCESS) result = restore_result;
+    return result;
+}
+
+int rpv130_clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
+                                      uint8_t *csr1)
+{
+    return clear_busy1_preserving_arm(mvme, base, csr1, NULL);
+}
+
+int rpv130_clear_busy1_preserving_arm_timed(MVME_INTERFACE *mvme,
+                                            mvme_addr_t base, uint8_t *csr1,
+                                            RPV130_BUSY_TIMING *timing)
+{
+    return clear_busy1_preserving_arm(mvme, base, csr1, timing);
+}
+
 int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
                                     uint8_t *csr1)
 {

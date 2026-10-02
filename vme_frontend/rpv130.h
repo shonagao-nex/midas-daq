@@ -27,7 +27,7 @@ typedef struct {
     uint8_t csr2;
 } RPV130_STATUS;
 
-/* CLOCK_MONOTONIC timestamps around the two CSR1 writes (nanoseconds). */
+/* CLOCK_MONOTONIC timestamps around CSR1 writes (nanoseconds). */
 typedef struct {
     uint64_t clr1_before_ns;
     uint64_t clr1_after_ns;
@@ -54,6 +54,12 @@ int rpv130_clear_busy1_and_rearm(MVME_INTERFACE *mvme, mvme_addr_t base,
 int rpv130_clear_busy1_and_rearm_timed(MVME_INTERFACE *mvme, mvme_addr_t base,
                                         uint8_t *csr1,
                                         RPV130_BUSY_TIMING *timing);
+/* Normal event clear: keep the current channel enables/mask in one CSR1 write. */
+int rpv130_clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
+                                      uint8_t *csr1);
+int rpv130_clear_busy1_preserving_arm_timed(MVME_INTERFACE *mvme,
+                                            mvme_addr_t base, uint8_t *csr1,
+                                            RPV130_BUSY_TIMING *timing);
 /* Call only while an independent trigger veto is already asserted. */
 int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
                                     uint8_t *csr1);
