@@ -82,34 +82,9 @@ uint8_t read_register(MVME_INTERFACE *mvme, mvme_addr_t address, int *status)
 
 } // namespace
 
-uint8_t rpv130_read_latch1(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
-{
-    return read_register(mvme, base + RPV130_LATCH1, status);
-}
-
-uint8_t rpv130_read_latch2(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
-{
-    return read_register(mvme, base + RPV130_LATCH2, status);
-}
-
-uint8_t rpv130_read_rsff(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
-{
-    return read_register(mvme, base + RPV130_RSFF, status);
-}
-
-uint8_t rpv130_read_through(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
-{
-    return read_register(mvme, base + RPV130_THROUGH, status);
-}
-
 uint8_t rpv130_read_csr1(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
 {
     return read_register(mvme, base + RPV130_CSR1, status);
-}
-
-uint8_t rpv130_read_csr2(MVME_INTERFACE *mvme, mvme_addr_t base, int *status)
-{
-    return read_register(mvme, base + RPV130_CSR2, status);
 }
 
 int rpv130_read_status(MVME_INTERFACE *mvme, mvme_addr_t base,
@@ -161,10 +136,8 @@ int rpv130_read_busy1(MVME_INTERFACE *mvme, mvme_addr_t base,
 }
 
 static int write_channel1_sequence(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                    bool rearm, uint8_t *csr1,
-                                    RPV130_BUSY_TIMING *timing)
+                                    bool rearm, uint8_t *csr1)
 {
-    if (timing) *timing = {};
     if (!mvme) return MVME_INVALID_PARAM;
     int saved_am = 0, saved_dmode = 0;
     int result = select_rpv130_mode(mvme, &saved_am, &saved_dmode);
@@ -174,15 +147,12 @@ static int write_channel1_sequence(MVME_INTERFACE *mvme, mvme_addr_t base,
     result = read_d16(mvme, base + RPV130_CSR1, &before);
     const uint8_t preserve = before & RPV130_CSR1_ENABLE3;
     if (result == MVME_SUCCESS) {
-        if (timing) timing->clr1_before_ns = monotonic_ns();
         result = write_d16(mvme, base + RPV130_CSR1,
                            preserve | RPV130_CSR1_CLR1);
-        if (timing) timing->clr1_after_ns = monotonic_ns();
     }
     if (result == MVME_SUCCESS) {
         result = write_d16(mvme, base + RPV130_CSR1,
                            preserve | (rearm ? RPV130_CSR1_CHANNEL1_ARMED : 0));
-        if (timing) timing->rearm_after_ns = monotonic_ns();
     }
     uint8_t raw = 0;
     if (result == MVME_SUCCESS)
@@ -207,18 +177,12 @@ static int write_channel1_sequence(MVME_INTERFACE *mvme, mvme_addr_t base,
 int rpv130_clear_busy1_and_rearm(MVME_INTERFACE *mvme, mvme_addr_t base,
                                   uint8_t *csr1)
 {
-    return write_channel1_sequence(mvme, base, true, csr1, NULL);
+    return write_channel1_sequence(mvme, base, true, csr1);
 }
 
-int rpv130_clear_busy1_and_rearm_timed(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                        uint8_t *csr1,
-                                        RPV130_BUSY_TIMING *timing)
-{
-    return write_channel1_sequence(mvme, base, true, csr1, timing);
-}
-
-static int clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                      uint8_t *csr1, RPV130_BUSY_TIMING *timing)
+static int clear_busy1_preserving_enable_state(
+    MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t *csr1,
+    RPV130_BUSY_TIMING *timing)
 {
     if (timing) *timing = {};
     if (!mvme) return MVME_INVALID_PARAM;
@@ -255,21 +219,21 @@ static int clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
     return result;
 }
 
-int rpv130_clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                      uint8_t *csr1)
+int rpv130_clear_busy1_preserving_enable_state(
+    MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t *csr1)
 {
-    return clear_busy1_preserving_arm(mvme, base, csr1, NULL);
+    return clear_busy1_preserving_enable_state(mvme, base, csr1, NULL);
 }
 
-int rpv130_clear_busy1_preserving_arm_timed(MVME_INTERFACE *mvme,
-                                            mvme_addr_t base, uint8_t *csr1,
-                                            RPV130_BUSY_TIMING *timing)
+int rpv130_clear_busy1_preserving_enable_state_timed(
+    MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t *csr1,
+    RPV130_BUSY_TIMING *timing)
 {
-    return clear_busy1_preserving_arm(mvme, base, csr1, timing);
+    return clear_busy1_preserving_enable_state(mvme, base, csr1, timing);
 }
 
 int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
                                     uint8_t *csr1)
 {
-    return write_channel1_sequence(mvme, base, false, csr1, NULL);
+    return write_channel1_sequence(mvme, base, false, csr1);
 }

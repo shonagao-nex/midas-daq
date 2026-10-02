@@ -27,19 +27,13 @@ typedef struct {
     uint8_t csr2;
 } RPV130_STATUS;
 
-/* CLOCK_MONOTONIC timestamps around CSR1 writes (nanoseconds). */
+/* CLOCK_MONOTONIC timestamps around the normal-event CSR1 clear write (nanoseconds). */
 typedef struct {
     uint64_t clr1_before_ns;
     uint64_t clr1_after_ns;
-    uint64_t rearm_after_ns;
 } RPV130_BUSY_TIMING;
 
-uint8_t rpv130_read_latch1(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
-uint8_t rpv130_read_latch2(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
-uint8_t rpv130_read_rsff(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
-uint8_t rpv130_read_through(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
 uint8_t rpv130_read_csr1(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
-uint8_t rpv130_read_csr2(MVME_INTERFACE *mvme, mvme_addr_t base, int *status);
 
 /* Read all read-capable registers in one A16/D16 access-mode session. */
 int rpv130_read_status(MVME_INTERFACE *mvme, mvme_addr_t base,
@@ -48,18 +42,15 @@ int rpv130_read_status(MVME_INTERFACE *mvme, mvme_addr_t base,
 /* CSR1 D5 is the FIN1-driven hardware BUSY1 state. */
 int rpv130_read_busy1(MVME_INTERFACE *mvme, mvme_addr_t base,
                       bool *busy, uint8_t *csr1);
-/* KEK sequence: CLR1, then ENABLE1|MASK1; preserve unrelated ENABLE3. */
+/* BOR arm: CLR1, then ENABLE1|MASK1; preserve unrelated ENABLE3. */
 int rpv130_clear_busy1_and_rearm(MVME_INTERFACE *mvme, mvme_addr_t base,
                                   uint8_t *csr1);
-int rpv130_clear_busy1_and_rearm_timed(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                        uint8_t *csr1,
-                                        RPV130_BUSY_TIMING *timing);
-/* Normal event clear: keep the current channel enables/mask in one CSR1 write. */
-int rpv130_clear_busy1_preserving_arm(MVME_INTERFACE *mvme, mvme_addr_t base,
-                                      uint8_t *csr1);
-int rpv130_clear_busy1_preserving_arm_timed(MVME_INTERFACE *mvme,
-                                            mvme_addr_t base, uint8_t *csr1,
-                                            RPV130_BUSY_TIMING *timing);
+/* Normal event: clear BUSY1 in one write while preserving ENABLE1/MASK1/ENABLE3. */
+int rpv130_clear_busy1_preserving_enable_state(MVME_INTERFACE *mvme,
+                                               mvme_addr_t base, uint8_t *csr1);
+int rpv130_clear_busy1_preserving_enable_state_timed(
+    MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t *csr1,
+    RPV130_BUSY_TIMING *timing);
 /* Call only while an independent trigger veto is already asserted. */
 int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
                                     uint8_t *csr1);

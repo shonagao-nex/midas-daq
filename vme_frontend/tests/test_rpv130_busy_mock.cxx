@@ -85,7 +85,7 @@ int main() {
     // BUSY1/BUSY3 status must not be echoed into the write value.
     reset(0x80 | RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE3 |
           RPV130_CSR1_CHANNEL1_ARMED);
-    assert(rpv130_clear_busy1_preserving_arm(
+    assert(rpv130_clear_busy1_preserving_enable_state(
                &vme, RPV130_BASE_ADDRESS, &raw) == MVME_SUCCESS);
     assert(writes == std::vector<uint8_t>({0x5a}));
     assert(raw == 0x58 && reads == 2);
@@ -93,27 +93,17 @@ int main() {
 
     reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED);
     RPV130_BUSY_TIMING event_timing = {};
-    assert(rpv130_clear_busy1_preserving_arm_timed(
+    assert(rpv130_clear_busy1_preserving_enable_state_timed(
                &vme, RPV130_BASE_ADDRESS, &raw, &event_timing)
            == MVME_SUCCESS);
     assert(writes == std::vector<uint8_t>({0x1a}));
     assert(raw == 0x18 && event_timing.clr1_before_ns > 0 &&
-           event_timing.clr1_before_ns <= event_timing.clr1_after_ns &&
-           event_timing.rearm_after_ns == 0);
+           event_timing.clr1_before_ns <= event_timing.clr1_after_ns);
 
     reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE1);
-    assert(rpv130_clear_busy1_preserving_arm(
+    assert(rpv130_clear_busy1_preserving_enable_state(
                &vme, RPV130_BASE_ADDRESS, &raw) == MVME_ACCESS_ERROR);
     assert(writes.empty());
-
-    reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED);
-    RPV130_BUSY_TIMING timing = {};
-    assert(rpv130_clear_busy1_and_rearm_timed(
-               &vme, RPV130_BASE_ADDRESS, &raw, &timing) == MVME_SUCCESS);
-    assert(writes == std::vector<uint8_t>({0x02, 0x18}));
-    assert(timing.clr1_before_ns > 0 &&
-           timing.clr1_before_ns <= timing.clr1_after_ns &&
-           timing.clr1_after_ns <= timing.rearm_after_ns);
 
     reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE3 |
           RPV130_CSR1_CHANNEL1_ARMED);
@@ -132,9 +122,9 @@ int main() {
            gate < write);
     const auto event = source.find("INT read_vme_event(");
     const auto event_gate = source.find("if (gVmeState.single_event_busy_enabled_for_run)", event);
-    const auto event_write = source.find("rpv130_clear_busy1_preserving_arm(", event);
+    const auto event_write = source.find("rpv130_clear_busy1_preserving_enable_state(", event);
     const auto event_timed_write = source.find(
-        "rpv130_clear_busy1_preserving_arm_timed(", event);
+        "rpv130_clear_busy1_preserving_enable_state_timed(", event);
     assert(event != std::string::npos && event_gate < event_write &&
            event_gate < event_timed_write);
     std::puts("test_rpv130_busy_mock: passed");

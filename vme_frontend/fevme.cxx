@@ -3311,9 +3311,9 @@ INT read_vme_event(char *pevent, INT off)
         uint8_t csr1 = 0;
         if (timing.active) timing.clear_call_ns = monotonic_ns();
         const int clear_status = timing.active ?
-            rpv130_clear_busy1_preserving_arm_timed(
+            rpv130_clear_busy1_preserving_enable_state_timed(
                 gVme, RPV130_BASE_ADDRESS, &csr1, &timing.writes) :
-            rpv130_clear_busy1_preserving_arm(
+            rpv130_clear_busy1_preserving_enable_state(
                 gVme, RPV130_BASE_ADDRESS, &csr1);
         if (timing.active) timing.clear_return_ns = monotonic_ns();
         if (clear_status != MVME_SUCCESS) {
