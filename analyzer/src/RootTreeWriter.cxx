@@ -20,7 +20,7 @@ bool RootTreeWriter::BeginRun(TFile* output_file) {
 
   output_file_ = output_file;
   output_file_->cd();
-  tree_ = new TTree("Events", "Decoded events");
+  tree_ = new TTree("tree", "Decoded events");
 
   tree_->Branch("event", &event_, "event/L");
   tree_->Branch("vme_counter", &vme_counter_, "vme_counter/L");
