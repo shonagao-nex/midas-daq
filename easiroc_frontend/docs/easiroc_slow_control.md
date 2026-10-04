@@ -534,8 +534,8 @@ execute a transaction.
 - `EasirocSlowControlConfig` stores raw numeric ASIC fields. The confirmed raw
   threshold (`DAC code`, 10 bits) and per-channel Input DAC codes (32 x 9 bits)
   are supported without a physical-unit conversion.
-- `EasirocSlowControlConfig::legacySiteDefaults()` is the production baseline
-  for future ODB overlays. It starts with the complete legacy
+- `EasirocSlowControlConfig::legacySiteDefaults()` is the baseline used by
+  the current ODB-backed ASIC image encoder. It starts with the complete legacy
   `DefaultRegisterValue.yml` configuration and applies the confirmed site
   overrides from `RegisterValue.yml` and `InputDAC.yml`: DAC code 600, fine
   slope (1), all Input DAC codes 350, 100 fF HG/LG feedback, 100 ns HG shaping,

@@ -106,7 +106,7 @@ def specs():
         (f"{STATUS}/VMEEvents", INT64, 0, 0),
         (f"{STATUS}/EASIROCEvents", INT64, 0, 0),
         (f"{STATUS}/HULEvents", INT64, 0, -1),
-        (f"{STATUS}/EventSlipCount", UINT64, 0, 0),
+        (f"{STATUS}/EventSlipCount", INT64, 0, 0),
         (f"{STATUS}/DAQStatus", STRING, 512, ""),
         (f"{STATUS}/DAQSummary", STRING, 512, ""),
         (f"{STATUS}/Scaler64ch", KEY, 0, None),
@@ -212,6 +212,32 @@ def ensure_key(rpc, path, tid, minimum, initial):
                                          "new_string_lengths": [minimum]})
     if not inspect_key(rpc, path, tid, minimum):
         raise RuntimeError(f"Cannot verify ODB key: {path}")
+
+
+def ensure_signed_slips(rpc):
+    """Convert only the Runlog slip key from legacy UINT64 to INT64."""
+    path = f"{STATUS}/EventSlipCount"
+    key = rpc.key(path)
+    if key is None or key["type"] == INT64:
+        ensure_key(rpc, path, INT64, 0, 0)
+        return
+    if key["type"] != UINT64 or key["num_values"] != 1:
+        raise RuntimeError(f"Unexpected ODB type/array at {path}: {key}")
+    raw = rpc.value(path)
+    if isinstance(raw, str):
+        value = int(raw, 16 if raw.lower().startswith("0x") else 10)
+    elif isinstance(raw, int):
+        value = raw
+    else:
+        raise RuntimeError(f"Unexpected ODB value at {path}: {raw!r}")
+    if value < 0 or value > 0x7FFFFFFFFFFFFFFF:
+        raise RuntimeError(f"Runlog slip count cannot be represented as INT64: {value}")
+    require_stopped(rpc)
+    rpc.checked("db_delete", {"paths": [path]})
+    rpc.checked("db_create", [{"path": path, "type": INT64}])
+    rpc.checked("db_paste", {"paths": [path], "values": [value]})
+    if not inspect_key(rpc, path, INT64, 0) or not same_value(rpc.value(path), value):
+        raise RuntimeError(f"Cannot verify converted ODB key: {path}")
 
 
 def link_map(rpc, phase):
@@ -338,7 +364,10 @@ def configure(rpc):
         if path == f"{ELOG}/Web Port" and rpc.key(path) is not None and \
                 rpc.value(path) != 8081:
             raise RuntimeError("Existing Run Elog Web Port is not 8081")
-        ensure_key(rpc, path, tid, minimum, initial)
+        if path == f"{STATUS}/EventSlipCount":
+            ensure_signed_slips(rpc)
+        else:
+            ensure_key(rpc, path, tid, minimum, initial)
     for path, expected in MANAGED_VALUES.items():
         if not same_value(rpc.value(path), expected):
             require_stopped(rpc)

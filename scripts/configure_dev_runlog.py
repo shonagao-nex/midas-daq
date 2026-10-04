@@ -57,6 +57,35 @@ def ensure_string_size(path, minimum):
         raise RuntimeError(f"Cannot resize {path}: {resized}")
 
 
+def ensure_signed_slips(path):
+    """Migrate the Runlog slip value to INT64 so unavailable reads remain -1."""
+    if get(path)[0] != 1:
+        ensure_key(path, 17)
+        return
+    result = rpc("db_key", {"paths": [path]})
+    if result["status"] != [1]:
+        raise RuntimeError(f"Cannot inspect {path}: {result}")
+    tid = result["keys"][0]["type"]
+    if tid == 17:
+        return
+    if tid != 18:
+        raise RuntimeError(f"{path} has unexpected ODB type {tid}")
+    old = str(get(path)[1])
+    value = int(old, 16 if old.lower().startswith("0x") else 10)
+    if value > 0x7FFFFFFFFFFFFFFF:
+        raise RuntimeError(f"{path} cannot be represented as INT64")
+    deleted = rpc("db_delete", {"paths": [path]})
+    if deleted["status"] != [1]:
+        raise RuntimeError(f"Cannot replace {path}: {deleted}")
+    ensure_key(path, 17)
+    pasted = rpc("db_paste", {"paths": [path], "values": [value]})
+    status, actual = get(path)
+    text = str(actual)
+    restored = int(text, 16 if text.lower().startswith("0x") else 10) if status == 1 else None
+    if pasted["status"] != [1] or restored != value:
+        raise RuntimeError(f"Cannot restore {path}: {pasted}")
+
+
 def ensure_link(name, target, phase):
     path = f"{JSON_ROOT}/Links {phase}/{name}"
     status, _ = get(path)
@@ -129,10 +158,10 @@ def main():
     for name, tid, length in (
             ("DurationSec", 18, 0), ("VMEEvents", 17, 0),
             ("EASIROCEvents", 17, 0), ("HULEvents", 17, 0),
-            ("EventSlipCount", 18, 0),
             ("DAQStatus", 12, 512), ("DAQSummary", 12, 512)):
         ensure_key(f"{root}/{name}", tid,
                    **({"string_length": length} if length else {}))
+    ensure_signed_slips(f"{root}/EventSlipCount")
     set_value(f"{root}/HULEvents", -1)
 
     for name, target in (

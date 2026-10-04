@@ -3,53 +3,23 @@ set -euo pipefail
 
 RUNTIME="/home/nagao/midas/midas"
 RUN_DIR="$RUNTIME/dev-run"
+source "$(dirname -- "${BASH_SOURCE[0]}")/dev_pid.sh"
 
 if [[ "$(id -un)" != "nagao" ]]; then
-    echo "ERROR: dev_stop.sh must be run as user nagao." >&2
-    exit 1
+  echo "ERROR: dev_stop.sh must be run as user nagao." >&2
+  exit 1
 fi
 
-stop_process()
-{
-    local name="$1"
-    local pidfile="$RUN_DIR/$name.pid"
-
-    if [[ ! -f "$pidfile" ]]; then
-        echo "$name: not running"
-        return
-    fi
-
-    local pid
-    pid="$(cat "$pidfile")"
-
-    if ! kill -0 "$pid" 2>/dev/null; then
-        echo "$name: stale PID file ($pid)"
-        rm -f "$pidfile"
-        return
-    fi
-
-    echo "Stopping $name (PID $pid)..."
-    kill "$pid"
-
-    for _ in {1..20}; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            rm -f "$pidfile"
-            echo "  stopped"
-            return
-        fi
-        sleep 0.25
-    done
-
-    echo "  graceful stop timed out; sending SIGKILL"
-    kill -KILL "$pid" 2>/dev/null || true
-    rm -f "$pidfile"
-}
-
 # Stop in reverse dependency/order
-stop_process analyzer
-stop_process daq_monitor
-stop_process mlogger
-stop_process mhttpd
+incomplete=0
+dev_pid_stop analyzer "$RUN_DIR/analyzer.pid" /home/nagao/midas/midas/online/analyzer/bin/midas_analyzer || incomplete=1
+dev_pid_stop daq_monitor "$RUN_DIR/daq_monitor.pid" /home/nagao/midas/midas/online/daq_monitor/bin/daq_monitor || incomplete=1
+dev_pid_stop mlogger "$RUN_DIR/mlogger.pid" /home/nagao/midas/midas_src/bin/mlogger || incomplete=1
+dev_pid_stop mhttpd "$RUN_DIR/mhttpd.pid" /home/nagao/midas/midas_src/bin/mhttpd || incomplete=1
 
 echo
+if ((incomplete)); then
+  echo "Development DAQ stop incomplete; inspect the PID files above." >&2
+  exit 1
+fi
 echo "Development DAQ services stopped."

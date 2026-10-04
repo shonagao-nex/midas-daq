@@ -1,5 +1,9 @@
 # MIDAS common analyzer
 
+For the development service order, experiment, and ports, start with the
+[repository README](../README.md). This document covers analyzer modes and
+configuration.
+
 ## Offline workflow
 
 From the analyzer directory, decode a run with the same `bin/midas_analyzer`
@@ -53,11 +57,12 @@ analysis, and ODB histogram initialization:
 analyzer/bin/midas_analyzer --no-profiler -R8182
 analyzer/bin/midas_analyzer -f /home/nagao/midas/midas/data/run00125.mid.lz4 -w /tmp/run00125.root
 analyzer/bin/midas_analyzer --init-hist-odb
+analyzer/bin/midas_analyzer --init-page-odb
 ```
 
 The online and ODB commands connect to the selected MIDAS experiment; use the
 development `daq-dev` environment when working under `/home/nagao`. The ODB
-initialization command creates settings and is only needed for a new ODB.
+initialization commands create settings and are only needed for a new ODB.
 Offline analysis does not connect to ODB. `build/` contains CMake and compiler
 output, `bin/` contains the user executable, `bin/test/` contains test
 executables, `src/` contains implementation, and `tests/` contains test source.
@@ -68,7 +73,7 @@ the VME and NIM-EASIROC frontends. `EventInspector` classifies physics events
 by bank composition (not event ID), reports the raw MIDAS structure, and feeds
 `EventBuilder`. `EventBuilder` joins equal frontend serial numbers without
 dropping one-sided events. Hardware decoders write only to `DecodedEvent`.
-`RootTreeWriter` stores each built `DecodedEvent` as one entry in the `Events`
+`RootTreeWriter` stores each built `DecodedEvent` as one entry in the `tree`
 TTree. `HistogramManager` fills configuration-driven `TH1D` objects from the
 same `DecodedEvent` through `ExpressionResolver`. No live ODB access or
 hardware access is performed when an input file is specified. Histogram
@@ -128,6 +133,7 @@ Usage:
   midas_analyzer [online options]
   midas_analyzer -f INPUT [offline options]
   midas_analyzer --init-hist-odb [connection options]
+  midas_analyzer --init-page-odb [connection options]
 
   -f FILE    offline MIDAS input
   -w FILE    offline ROOT output
@@ -137,6 +143,9 @@ Usage:
 
   --init-hist-odb
       create default histogram configuration in MIDAS ODB and exit;
+      existing configuration is never overwritten
+  --init-page-odb
+      create default Page layouts in MIDAS ODB and exit;
       existing configuration is never overwritten
 ```
 

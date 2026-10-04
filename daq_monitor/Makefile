@@ -15,6 +15,7 @@ TEST_TARGET := $(BIN_DIR)/tests/status_policy_test
 OBJECTS := $(BUILD_DIR)/daq_monitor.o $(BUILD_DIR)/status_policy.o \
 	$(BUILD_DIR)/alarm_policy.o $(BUILD_DIR)/monitor_alarms.o \
 	$(BUILD_DIR)/monitor_odb_utils.o \
+	$(BUILD_DIR)/runlog_index_retry.o \
 	$(BUILD_DIR)/runlog_edit.o \
 	$(BUILD_DIR)/runlog_edit_rpc.o
 TEST_OBJECTS := $(BUILD_DIR)/tests/status_policy_test.o $(BUILD_DIR)/status_policy.o
@@ -26,11 +27,13 @@ RUNLOG_EDIT_RPC_TEST_OBJECTS := $(BUILD_DIR)/tests/runlog_edit_rpc_test.o \
 	$(BUILD_DIR)/runlog_edit.o $(BUILD_DIR)/runlog_edit_rpc.o
 TEST_TARGETS := $(TEST_TARGET) $(BIN_DIR)/tests/alarm_policy_test \
 	$(BIN_DIR)/tests/monitor_odb_utils_test \
+	$(BIN_DIR)/tests/runlog_index_retry_test \
 	$(BIN_DIR)/tests/runlog_edit_test \
 	$(BIN_DIR)/tests/runlog_edit_rpc_test
 DEPS := $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
 	$(ALARM_TEST_OBJECTS:.o=.d) $(RUNLOG_EDIT_TEST_OBJECTS:.o=.d) \
 	$(BUILD_DIR)/tests/monitor_odb_utils_test.d \
+	$(BUILD_DIR)/tests/runlog_index_retry_test.d \
 	$(RUNLOG_EDIT_RPC_TEST_OBJECTS:.o=.d)
 
 .PHONY: all daq_monitor test check clean
@@ -45,6 +48,7 @@ check: $(TEST_TARGETS)
 	./$(TEST_TARGET)
 	./$(BIN_DIR)/tests/alarm_policy_test
 	./$(BIN_DIR)/tests/monitor_odb_utils_test
+	./$(BIN_DIR)/tests/runlog_index_retry_test
 	./$(BIN_DIR)/tests/runlog_edit_test
 	./$(BIN_DIR)/tests/runlog_edit_rpc_test
 	python3 tests/test_event_count_contract.py
@@ -73,6 +77,18 @@ $(BUILD_DIR)/monitor_alarms.o: monitor_alarms.cxx monitor_alarms.h monitor_odb_u
 $(BUILD_DIR)/monitor_odb_utils.o: monitor_odb_utils.cxx monitor_odb_utils.h status_policy.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/runlog_index_retry.o: runlog_index_retry.cxx runlog_index_retry.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/tests/runlog_index_retry_test.o: tests/runlog_index_retry_test.cxx runlog_index_retry.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(BIN_DIR)/tests/runlog_index_retry_test: $(BUILD_DIR)/tests/runlog_index_retry_test.o $(BUILD_DIR)/runlog_index_retry.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/tests/monitor_odb_utils_test.o: tests/monitor_odb_utils_test.cxx monitor_odb_utils.h
 	@mkdir -p $(dir $@)

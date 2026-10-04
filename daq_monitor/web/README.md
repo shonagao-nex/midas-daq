@@ -1,10 +1,14 @@
 # DAQ general-user Custom page
 
+For the development experiment, startup commands, and ports, start with the
+[repository README](../../README.md). This document covers Custom-page data
+sources and behavior.
+
 ## Run Summary (development)
 
 `run-summary.html` is registered as `/Custom/Run Summary` in the development
 ODB on port 8181. It reads `/runlogs/runlog_index.json`, applies
-`/runlogs/runlog_selection.json`, and requests ten listed JSON Runlog
+`/runlogs/runlog_selection.json`, and requests 30 listed JSON Runlog
 files per page through mhttpd, with four requests in flight. The `runlogs`
 symlink in this directory points to `$HOME/midas/midas/runlogs` relative to
 the common repository layout. It does
@@ -18,8 +22,11 @@ not change older runs. Older Runlogs without the field show an empty value.
 replaces `runlog_index.json`. `daq_monitor` launches it after a completed STOP,
 outside the transition. It can also be run manually with the Runlog directory
 as its argument, for example after removing or recovering files. A failed
-refresh leaves the previous index intact and cannot fail STOP. The index is
-derived data; never edit the standard MIDAS JSON Runlogs to change the list.
+refresh leaves the previous index intact and cannot fail STOP. The monitor
+marks a run indexed only after the child exits successfully; failed launches
+or child exits are retried after a five-second delay while it remains running.
+The index is derived data; never edit the standard MIDAS JSON Runlogs to change
+the list.
 The monitor finds the index script relative to its own `bin/daq_monitor`
 executable, so deployments need both the binary and `scripts/` in the same
 repository layout. Restart the monitor to activate a rebuilt binary;
@@ -185,7 +192,10 @@ staging view for discriminator thresholds, HG/LG feedback capacitance, and both
 legacy ASIC code shown); the finite options are 0 fF/NoC and 100--1500 fF in
 100 fF steps. Editing does not write ODB or hardware. `Save to ODB` writes all
 Settings values and requires an ODB readback of every value before accepting
-the save. `Apply to hardware` is disabled until the staged values equal ODB,
+the save. It checks STOPPED before and during the sequential writes. If a write
+fails or the run state changes, the page warns that a partial save is possible
+and reloads the actual ODB settings. It does not automatically apply them.
+`Apply to hardware` is disabled until the staged values equal ODB,
 the run is STOPPED, EASIROC is enabled, and the frontend mailbox is idle.
 
 Valid saved HG/LG feedback settings are included in the manual ASIC image.

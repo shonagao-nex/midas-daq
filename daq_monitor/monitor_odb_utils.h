@@ -4,6 +4,7 @@
 #include "midas.h"
 #include "status_policy.h"
 
+#include <cstdint>
 #include <string>
 
 namespace daq_monitor {
@@ -25,6 +26,7 @@ bool read_value(HNDLE database, const char* path, DWORD type, T* value) {
 
 bool read_string(HNDLE database, const std::string& path,
                  std::string* value);
+std::int64_t read_runlog_slips(HNDLE database, bool vme_participating);
 RunState policy_run_state(INT state);
 
 }  // namespace daq_monitor

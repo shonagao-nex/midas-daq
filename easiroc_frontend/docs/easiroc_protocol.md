@@ -1,8 +1,10 @@
 # NIM-EASIROC communication protocol
 
-This note records only details confirmed from the legacy controller under
-`reference/controller_20170425/`. It does not fill gaps from generic SiTCP or
-RBCP documentation.
+The protocol and legacy sequence below are grounded in
+`reference/controller_20170425/`; the current MIDAS behavior is identified
+separately under **MIDAS frontend event readout**. The legacy Ruby controller
+is reference material, not the code that handles current BOR/EOR transitions.
+This note does not fill gaps from generic SiTCP or RBCP documentation.
 
 ## Primary sources
 
@@ -25,8 +27,8 @@ The controller constructs `VmeEasiroc.new(ipaddr, 24, 4660)`
   (`RBCP.rb:119-136`).
 
 The legacy default IP is `192.168.10.16` (`Controller.rb:644` and
-`README:11-14`). The current default `192.168.10.26` is specified by the local
-`AGENTS.md`, not the controller source.
+`README:11-14`). The current frontend's ODB default is `192.168.10.26`
+(`easiroc_odb.cxx`); the configured ODB value determines the actual target.
 
 ## RBCP request packet
 
@@ -120,8 +122,9 @@ does not verify event delivery, event framing, DAQ start, or DAQ readout.
 
 `readEvent` connects to TCP port 24, discards buffered bytes, enters DAQ mode
 by an RBCP write, and reads the requested events (`VME-EASIROC.rb:294-308,
-560-577`). The standalone diagnostic does not exercise this path because DAQ
-start is prohibited.
+560-577`). The read-only `easiroc_test` diagnostic does not exercise this path;
+the explicitly write-capable `easiroc_read_one` and `easiroc_read_many`
+diagnostics exercise the current transport and parser described below.
 
 `receiveNbyte` loops on `recv` until exactly the requested count is accumulated
 (`VME-EASIROC.rb:589-598`). Normal header/data reads have no explicit timeout
@@ -187,7 +190,12 @@ words differs from header bits 11:0. The legacy live receiver obtains exactly
 the count from the header rather than accepting a caller-supplied event buffer,
 so that last consistency check is specific to the offline buffer interface.
 
-## DAQ start/stop register sequence (documented, not executed)
+## Legacy DAQ start/stop register sequence
+
+The sequence in this section describes the Ruby controller. The current
+`feeasiroc` frontend uses the same register and ON/OFF values, but executes
+them explicitly at BOR/EOR as described below. Reading this section or running
+the software-only unit tests does not send hardware commands.
 
 The DAQ/status register address is **`0x00000077`**
 (`VME-EASIROC.rb:444-445`). `writeStatusRegister` composes one byte as follows
@@ -258,10 +266,9 @@ three enable booleans and provides:
 
 It has no network address, socket, RBCP object, transport pointer, or callback.
 Construction, enable changes, start-value generation, stop-value generation,
-and destruction perform no I/O. A future transport layer must be invoked
-separately and explicitly to execute a returned register value. This separation
-also means merely creating a frontend-side DAQ policy can never start, stop, or
-otherwise write to the hardware.
+and destruction perform no I/O. The current `feeasiroc` calls `RbcpClient::write`
+with these values during acquisition transitions. Merely constructing
+`DaqControl` does not write to hardware.
 
 `easiroc_daq_control_test` verifies the address and ON/OFF values for the
 legacy default and other enable combinations, bit-0 behavior, enable updates,
@@ -353,12 +360,15 @@ sums of squares for its final mean and population-RMS report.
 ## MIDAS frontend event readout
 
 `feeasiroc` owns all direct NIM-EASIROC access in one process. At BOR it waits
-for any stopped-state read-only diagnostic to finish, reads ODB settings,
-requires ADC ON / TDC ON / scaler OFF, opens TCP port 24, performs the bounded
-pre-acquisition drain, creates a fresh `EventStreamParser`, and explicitly
-writes DAQ ON (`0x07`). A failure at any step rejects the run transition. If
-the ON write was attempted, cleanup also attempts DAQ OFF and reports the
-hardware state as unknown if that write fails.
+for any stopped-state read-only diagnostic to finish, reads ODB settings and
+run participation, validates the ASIC settings, and snapshots the requested
+configuration. A frontend or module excluded from the run skips acquisition
+hardware access. For a participating, enabled module, BOR requires ADC ON /
+TDC ON / scaler OFF, clears any previous acquisition state, opens TCP port 24,
+performs the bounded pre-acquisition drain, creates a fresh
+`EventStreamParser`, and explicitly writes DAQ ON (`0x07`) through RBCP.
+A failure rejects the transition. Once the ON write has been attempted,
+cleanup attempts DAQ OFF and reports hardware state as unknown if that fails.
 
 During RUNNING, the polled Physics Equipment first serves any decoded events
 in its FIFO. When the FIFO is empty it performs a non-blocking readability
@@ -386,8 +396,10 @@ The current MIDAS banks use `TID_WORD`:
 | `ETTR` | variable-length repeating `channel, hit, value` trailing triplets |
 
 Zero-hit TDC events contain valid zero-length `ETLE` and/or `ETTR` banks. At
-EOR the frontend writes DAQ OFF (`0x06`), performs a bounded post-acquisition
-drain after a confirmed stop, and closes TCP. Frontend exit and acquisition
-error paths also attempt DAQ OFF whenever a DAQ-ON write had been attempted.
+EOR, an active acquisition writes DAQ OFF (`0x06`), performs a bounded
+post-acquisition drain after a confirmed stop, and closes TCP. A run that
+skipped acquisition clears software state without a hardware write. Frontend
+exit, acquisition errors, and start-abort cleanup also attempt DAQ OFF whenever
+a DAQ-ON write had been attempted.
 The periodic read-only Status Equipment remains present, but it does not start
 new RBCP/TCP probes while acquisition owns the hardware connections.

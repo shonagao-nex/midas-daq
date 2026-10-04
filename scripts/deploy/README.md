@@ -1,86 +1,119 @@
-# Live deployment
+# Live deployment procedure
 
-通常の更新手順は次のとおりです。
+This procedure is for the actual DAQ host shell as user `daq`. It changes the
+live checkout, services, and selected ODB configuration. Do not run it from the
+development sandbox. Finish development and tests under `/home/nagao`, commit
+and push the intended changes, then schedule a maintenance window with the run
+STOPPED and no Run Start during deployment.
 
-1. `nagao` の `/home/nagao/midas/midas/online` で開発・testを行う。
-2. 変更をcommitし、`origin/main`へpushする。
-3. 実DAQホスト `nexdaq1` に `daq` ユーザーでログインする。
-4. `/home/daq/midas/midas/online` へ移動し、次の1コマンドを実行する。
+Runlog `EventSlipCount` uses `INT64` so `-1` represents N/A. Step 3 converts
+only an existing `UINT64` Runlog slip key to `INT64` while STOPPED, preserving
+nonnegative values that fit in `INT64`. An out-of-range value or any other
+unexpected type stops deployment before conversion.
 
-   ```sh
-   ./scripts/deploy/deploy1_init.sh
-   ```
-
-RunはSTOPPEDで、作業中にRun Startを行わない保守時間に実行してください。完了表示と
-`deploy4` のread-only smoke test成功を確認してから運用に戻します。
-
-## 初回導入の前提
-
-既存のlive checkoutにはこの4ファイルがまだ存在しません。**最初の1回だけ**、
-`daq` の実ホストシェルで追跡対象に未commit変更がないことを確認し、
-`git pull --ff-only origin main` でbootstrapを取得してください。その後の更新は
-上の1コマンドです。この初回取得もlive変更なので、開発環境から実行しません。
-
-`/home/daq/midas/midas/exptab`、MIDAS、ROOT、ROOTANA、既存の4つのsystemd unit、
-8081番ポートのmhttpd、Runlogディレクトリが必要です。`daq` がパスワード入力なしで
-`midas-daq-monitor.service` と `midas-analyzer.service` を `systemctl stop/start`
-できる限定権限も必要です。unitのinstall/updateはこの初版では行いません。
-追跡中のunitと設置済みunitが異なる場合は、プロセスを停止する前に中断します。
-ホスト名は安全確認として `nexdaq1` に固定しています。ホストを交換・改名した場合は
-実機構成を確認してGit上でこの条件を更新してください。
-
-## 番号順の処理
-
-- `deploy1_init.sh`: `daq`・host・checkout・Git状態・STOPPED・遷移なしを確認し、
-  元のfrontend/service状態を記録します。排他ロックを保持し、自分自身を一時コピー
-  してから `git pull --ff-only origin main` を実行し、更新後のstep 2を呼びます。
-  未追跡ファイルは削除しません。Gitが未追跡ファイルとの衝突を検出したら停止します。
-- `deploy2_impl.sh`: ODBを一意のファイルへbackupし、再開用journalを保存します。
-  必要なときだけ稼働中のfrontendとmonitor/analyzerを停止してproduction build・
-  unit testを実施します。step 3、Runlog用の欠けた派生ファイルの準備、元々稼働
-  していたプロセスだけの復帰、step 4を順に行います。同一commit・同一binaryで
-  完了済みならプロセスを再起動しません。
-- `deploy3_configure_live_odb.py`: 固定schemaのキー・型・文字列長、JSON Runlogの
-  BOR/EOR linkのリンク先と順序、ProgramsとCustomの管理対象だけを収束させます。
-  ODB全体のloadはしません。予期しないlink名・型・本番パスなら停止します。
-- `deploy4_check_live.py`: Git commit、binary、固定ODB schema、本番パス、Programs、
-  Custom、Runlog/ELOG、service/frontend状態、8081番ポートのページを読み取り専用
-  で確認します。Run Startやhardware testはしません。
-
-## 失敗・再実行
-
-失敗したらRun Startをせず、表示された失敗箇所を調べてください。ODB backupは
-`/home/daq/midas/midas/backups/odb-before-deploy-*.odb`、再開用journalは
-`/home/daq/midas/midas/deploy-state.json` です。buildや切替途中で失敗した場合は
-journalが元の稼働状態を保持します。原因を直して `deploy1_init.sh` を再実行すると、
-元々起動していたfrontendだけを復帰します。journalを手作業で消さないでください。
-backupを自動で丸ごとODBへloadする処理はありません。
-
-STOPPED確認は各変更段階で再実行します。標準MIDASのRun Start全経路をこの
-スクリプトだけで原子的に禁止する仕組みはありません。保守中のRun Startを
-運用上禁止してください。開始との競合を検出した場合、処理は停止します。
-
-## 保持するlive値
-
-Run Number、Run ParametersのType/Comment/ExperimentLabel、Run Elogの
-Enabled・Last Run・Last Attempt Run・Last Status・Last Error、DAQ実測値、
-機器設定、AnalyzerのHistogram/Page設定、既存DAQ data・Runlog・ELOG、既存の
-`runlog_selection.json`、無関係なPrograms/Custom設定は上書きしません。
-新規に欠けた履歴キーを作る場合の初期値は0または空文字であり、既存履歴は変更しません。
-`/Custom/Path` と Run Elog Web Portはlive値を検証し、不一致なら停止します。
-`scripts/archive_midas_data.sh` はlive固有の未追跡ファイルとして保持します。
-`git reset --hard` と `git clean` は使用しません。
-
-## 個別診断
-
-実ホスト上で、RunがSTOPPEDであることを確認してから行います。
+From the live checkout, the normal update is:
 
 ```sh
 cd /home/daq/midas/midas/online
-python3 scripts/deploy/deploy4_check_live.py   # 読み取り専用
-python3 scripts/deploy/deploy3_configure_live_odb.py  # 固定schemaを変更し得る
+./scripts/deploy/deploy1_init.sh
 ```
 
-step 2はbootstrapのロックと元の稼働状態を必要とするため、単独実行しません。
-静的確認には `bash -n scripts/deploy/deploy{1,2}_*.sh` と
-`python3 -m py_compile scripts/deploy/deploy{3,4}_*.py` を使えます。
+Check its completion message and the read-only step 4 smoke test before
+resuming operation. The script requires user `daq`, host `nexdaq1`, branch
+`main`, a clean tracked working tree, and experiment `daq` STOPPED with no
+transition on mhttpd port 8081. It also requires the existing MIDAS, ROOT,
+ROOTANA, Runlog directory, `exptab`, and four installed systemd units. The
+installed monitor and analyzer units must match their tracked files. The `daq`
+user needs passwordless permission to stop/start only those two services.
+Deployment does not install or update units.
+
+If this is the first deployment of these scripts and the live checkout lacks
+them, fetch the committed bootstrap once from the actual host shell with
+`git pull --ff-only origin main` after checking for tracked local changes.
+Later updates use `deploy1_init.sh`.
+
+## One-time analyzer unit migration
+
+If an older installed analyzer unit still points to
+`analyzer/build/midas_analyzer`, the unit comparison in step 2 stops before the
+build. During a STOPPED maintenance window, prepare the new executable and
+install the tracked unit before running step 1:
+
+```sh
+cd /home/daq/midas/midas/online
+export MIDASSYS=/home/daq/midas/midas_src ROOTSYS=/home/daq/root/current
+cmake -S analyzer -B analyzer/build \
+  -DROOTANA_DIR=/home/daq/midas/rootana \
+  -DROOT_DIR=/home/daq/root/current/cmake \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build analyzer/build -j2
+test -x analyzer/bin/midas_analyzer
+sudo install -m 0644 systemd/midas-analyzer.service \
+  /etc/systemd/system/midas-analyzer.service
+sudo systemctl daemon-reload
+./scripts/deploy/deploy1_init.sh
+```
+
+Installing the unit and reloading systemd do not restart a running analyzer.
+Step 1 builds and tests again, then restores only processes that were running
+when deployment began. Do not remove the recovery journal or revert the unit
+as a way around a failed unit comparison.
+
+## Steps and effects
+
+- `deploy1_init.sh` checks identity, checkout, run state, and initial
+  frontend/service state. It holds an exclusive lock, copies its bootstrap,
+  pulls `origin/main` with `--ff-only`, then calls step 2. It does not clean
+  untracked files; Git stops if one conflicts with a tracked incoming path.
+- `deploy2_impl.sh` backs up ODB to a unique file and writes a recovery
+  journal. It stops only the frontends and monitor/analyzer services that were
+  running when needed, builds and runs unit tests, calls step 3, prepares
+  missing derived Runlog files, restores the original process state, and calls
+  step 4. A completed deployment of the same commit and binaries does not
+  restart processes again.
+- `deploy3_configure_live_odb.py` changes only its owned fixed schema,
+  Runlog BOR/EOR links and order, Programs, and Custom entries. It does not
+  load an entire ODB backup. Unexpected links, types, or paths stop deployment.
+- `deploy4_check_live.py` checks the Git commit, binaries, fixed ODB schema,
+  Programs, Custom pages, Runlog/ELOG resources, service/frontend state, and
+  port 8081 without writing ODB or starting a run. Its checks read live state,
+  so run it only from the actual host shell.
+
+`scripts/archive_midas_data.sh` is a **tracked** script in this repository.
+It is separate from these four deployment steps; executing it copies data to
+the mounted archive and is not a smoke test. Deployment does not run it or
+delete untracked files. Neither `git reset --hard` nor `git clean` is used.
+
+## Failure and recovery
+
+Keep Run Start disabled operationally while resolving a failure. ODB backups
+are written below `/home/daq/midas/midas/backups/` as
+`odb-before-deploy-*.odb`; the recovery journal is
+`/home/daq/midas/midas/deploy-state.json`. Correct the reported cause and
+rerun `deploy1_init.sh`. The journal retains the original process state; do
+not delete it manually. No automatic full-ODB restore is performed.
+
+The scripts recheck STOPPED before change stages, but they cannot atomically
+block every MIDAS Run Start path. A detected race stops deployment.
+
+Existing Run Number, Run Parameters, ELOG history, hardware settings, Analyzer
+Histogram/Page settings, DAQ data, Runlogs, ELOG files, `runlog_selection.json`,
+and unrelated Programs/Custom entries are preserved. Missing history keys may
+be initialized to zero or empty values. `/Custom/Path` and the ELOG web port
+are verified against the intended live values rather than overwritten.
+
+For targeted diagnosis on the actual host, check STOPPED first:
+
+```sh
+cd /home/daq/midas/midas/online
+python3 scripts/deploy/deploy4_check_live.py        # read-only smoke check
+python3 scripts/deploy/deploy3_configure_live_odb.py # changes owned ODB keys
+```
+
+Do not run step 2 alone; it needs the bootstrap lock and initial process state.
+Static syntax checks, which do not connect to ODB, are:
+
+```sh
+bash -n scripts/deploy/deploy1_init.sh scripts/deploy/deploy2_impl.sh
+python3 -m py_compile scripts/deploy/deploy3_configure_live_odb.py scripts/deploy/deploy4_check_live.py
+```

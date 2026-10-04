@@ -1,62 +1,83 @@
-# midaq-daq
+# MIDAS DAQ development
 
-## MIDAS Programs
+This repository contains the VME and NIM-EASIROC frontends, `daq_monitor`, a
+shared analyzer, and MIDAS Custom pages. Start here, then use the component
+documents for details:
 
-The standard MIDAS Programs page manages the two detector frontends as
-`fevme` and `feeasiroc`. Both entries have `Required` set to true so they remain
-visible and can be started individually from the Programs page while stopped.
-`Auto start`, `Auto stop`, and `Auto restart` remain false, so neither frontend
-is started, stopped, or restarted automatically.
+| Component | Entry point |
+|---|---|
+| Analyzer, online histograms, Pages, offline ROOT output | [analyzer/README.md](analyzer/README.md) |
+| VME frontend | [vme_frontend/fevme.cxx](vme_frontend/fevme.cxx), [vme_frontend/Makefile](vme_frontend/Makefile) |
+| NIM-EASIROC frontend | [easiroc_frontend/docs/easiroc_protocol.md](easiroc_frontend/docs/easiroc_protocol.md), [slow control](easiroc_frontend/docs/easiroc_slow_control.md) |
+| DAQ monitor and Custom pages | [daq_monitor/daq_monitor.cxx](daq_monitor/daq_monitor.cxx), [web/README.md](daq_monitor/web/README.md) |
+| Live deployment procedure | [scripts/deploy/README.md](scripts/deploy/README.md) |
 
-The live experiment keeps `/Experiment/Prevent start on required progs` set to
-false. With that setting, `Required` controls Programs-page visibility without
-making either frontend mandatory for Run Start. The supported configurations
-are therefore:
+## Development services
 
-- VME only: run `fevme` while `feeasiroc` remains stopped.
-- EASIROC only: run `feeasiroc` while `fevme` remains stopped.
-- Both: run `fevme` and `feeasiroc` together.
-
-Run Stop does not automatically stop either frontend.
-
-The checked-in definitions are in `scripts/frontend_programs.odb`. On the DAQ
-host, load them once while the local `daq` experiment is available:
+Work in `/home/nagao/midas/midas/online` with experiment `daq-dev` from
+`/home/nagao/midas/midas/exptab`. Build the clients before starting them:
 
 ```sh
-/home/daq/midas/midas/online/scripts/install_frontend_programs.sh
+cd /home/nagao/midas/midas/online
+make -C vme_frontend fevme
+make -C easiroc_frontend feeasiroc
+make -C daq_monitor daq_monitor
+cmake -S analyzer -B analyzer/build \
+  -DMIDASSYS=/home/nagao/midas/midas_src \
+  -DROOTANA_DIR=/home/nagao/midas/rootana
+cmake --build analyzer/build -j2
+./scripts/dev_start.sh
 ```
 
-This installer changes the live ODB, so it must not be run from a sandbox.
-After loading it, use the MIDAS Programs page to start or stop each frontend.
-Programs Stop uses the standard MIDAS `cm_shutdown()` request; there is no
-custom kill command.
+`dev_start.sh` starts development `mhttpd`, `mlogger`, `daq_monitor`, and the
+online analyzer in that order. It does **not** start either frontend or a run.
+Use `./scripts/dev_stop.sh` to stop those four services. The scripts authenticate
+their PID files before treating a process as theirs; inspect an error instead
+of killing an unrelated PID. Logs are in `/home/nagao/midas/midas/dev-log/`.
 
-The start wrappers set the local experiment environment explicitly and remove
-remote-server variables before executing the absolute frontend paths. Neither
-frontend currently reads runtime files through relative paths, so the wrappers
-do not depend on or change the inherited working directory.
+The development MIDAS GUI is on port **8181**; the development analyzer ROOT
+Web server is on **8182**. Both use `daq-dev`. The analyzer's standalone default
+ROOT Web port is 8082, so `dev_start.sh` explicitly passes `-R8182`. Frontends
+can be started individually from the development Programs page when configured.
+The development scripts do not manage them.
 
-The DAQ custom page links to `buffer-clear.html`. It submits monotonic ODB
-request IDs to the running frontend and shows per-module acknowledgement. Both
-the browser and frontend enforce STOPPED; frontend startup acknowledges but
-does not execute a request left behind while it was absent.
+## What each operation changes
 
-## daq_monitor service
+- Builds, `make -C vme_frontend check`, `make -C easiroc_frontend check`,
+  `make -C daq_monitor check`, and `ctest --test-dir analyzer/build` are local
+  software checks. The DAQ, EASIROC, and buffer-clear pages with `?mock=1`
+  use browser data and do not contact MIDAS. Analyzer `-f INPUT` reads recorded
+  data and writes a ROOT file; it does not contact ODB or hardware.
+- `dev_start.sh` and `dev_stop.sh` connect or disconnect development MIDAS
+  clients. Online monitoring reads ODB and publishes status; the logger and
+  monitor may write development logs, Runlogs, index files, and ODB status.
+- Frontend startup, run Start/Stop, the EASIROC Apply command, and manual
+  buffer clear can communicate with hardware. Web Save writes ODB settings;
+  EASIROC hardware Apply remains a separate action. Analyzer
+  `--init-hist-odb` and the `configure_dev_*.py` scripts change development
+  ODB configuration.
+- `scripts/archive_midas_data.sh` copies DAQ data to a mounted archive. It is
+  not part of development startup or the deployment pipeline; do not run it as
+  a read-only check.
 
-`systemd/midas-daq-monitor.service` follows the installed mhttpd/mlogger unit
-layout: it runs as `daq:daq` from this repository, uses the local `daq`
-experiment environment, and restarts after failures with a five-second delay.
-The monitor itself rejects a second MIDAS registration whose actual client
-name is not exactly `daq_monitor`, while systemd owns a single service process.
+Use the component documents above for command options and test scope. None of
+these development instructions applies to `/home/daq`; live deployment is a
+separate operation.
 
-After building `daq_monitor`, install the unit from the real DAQ host (not a
-sandbox), then enable and start it:
+## MIDAS Programs and monitor service
 
-```sh
-sudo /home/daq/midas/midas/online/scripts/install_daq_monitor_service.sh
-sudo systemctl enable --now midas-daq-monitor.service
-```
+The checked-in Programs definitions are in `scripts/frontend_programs.odb`.
+`fevme` and `feeasiroc` are individually selectable while STOPPED. Their
+`Required` flags keep them visible, while Auto start, Auto stop, and Auto
+restart are false. The intended configuration keeps
+`/Experiment/Prevent start on required progs` false, allowing VME-only,
+EASIROC-only, or combined runs. Run Stop leaves frontend processes connected.
+`scripts/install_frontend_programs.sh` changes the live ODB and is for the
+actual DAQ host only. Its wrappers set the local experiment explicitly;
+Programs Stop uses MIDAS `cm_shutdown()`.
 
-Run Stop does not affect this service. To inspect it without changing state,
-use `systemctl status midas-daq-monitor.service` and
-`journalctl -u midas-daq-monitor.service`.
+`systemd/midas-daq-monitor.service` is the live monitor unit. The live install
+helper `scripts/install_daq_monitor_service.sh` and the service commands in
+the deployment documentation change host state; they are not development
+startup commands. The dashboard's buffer-clear page submits ODB request IDs
+to frontends and can trigger hardware work while STOPPED.

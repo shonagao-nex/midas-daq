@@ -1,6 +1,7 @@
 #include "monitor_odb_utils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -85,6 +86,17 @@ int main() {
   EXPECT(!daq_monitor::read_value(123, "/Test/Scalar", TID_INT32,
                                       &scalar));
   EXPECT(scalar == 7);
+
+  const std::uint64_t zero = 0;
+  reply_with(zero);
+  EXPECT(daq_monitor::read_runlog_slips(123, true) == 0);
+  EXPECT(gLastPath == "/Equipment/VME/Variables/RunCounters/EventSlipCount" && gLastType == TID_QWORD);
+  const std::uint64_t nonzero = 17;
+  reply_with(nonzero);
+  EXPECT(daq_monitor::read_runlog_slips(123, true) == 17);
+  gRead.status = DB_NO_KEY;
+  EXPECT(daq_monitor::read_runlog_slips(123, true) == -1);
+  EXPECT(daq_monitor::read_runlog_slips(123, false) == 0);
 
   gRead = {};
   gRead.bytes = {'m', 'o', 'n', 'i', 't', 'o', 'r', '\0'};

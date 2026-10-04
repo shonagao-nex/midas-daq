@@ -62,7 +62,7 @@ const SETTINGS_PATHS = [ODB.asic1Code, ODB.asic1Slope, ODB.asic1HgFeedback, ODB.
 const FEEDBACK_OPTIONS = Object.freeze([[0, 0], [100, 8], [200, 4], [300, 12], [400, 2], [500, 10], [600, 6], [700, 14], [800, 1], [900, 9], [1000, 5], [1100, 13], [1200, 3], [1300, 11], [1400, 7], [1500, 15]]);
 const SHAPING_OPTIONS = Object.freeze([[25, 1], [50, 2], [75, 3], [100, 4], [125, 5], [150, 6], [175, 7]]);
 const TERMINAL_STATES = new Set(["Succeeded", "Failed", "Rejected", "Indeterminate"]);
-const state = {values: {}, loaded: null, staged: null, mock: false, scenario: "match", saving: false, applyPending: false, requestedId: null};
+const state = {values: {}, loaded: null, staged: null, mock: false, scenario: "match", saving: false, saveEpoch: 0, applyPending: false, requestedId: null};
 
 const element = id => document.getElementById(id);
 const present = value => value !== null && value !== undefined;
@@ -240,7 +240,10 @@ async function readValues(paths = PATHS) {
 
 async function refresh() {
   try {
-    const values = await readValues(); state.values = values;
+    const epoch = state.saveEpoch;
+    const values = await readValues();
+    if (state.saving || epoch !== state.saveEpoch) return;
+    state.values = values;
     const loaded = settingsFromValues(values);
     if (settingsAvailable(loaded)) {
       state.loaded = loaded;
@@ -253,28 +256,58 @@ async function refresh() {
 
 function requireStopped() { if (!editAllowed()) throw new Error("Settings and apply are allowed only while Run state is STOPPED"); }
 
+// Check the current ODB run state before writing another setting.
+async function requireStoppedNow() {
+  const values = await readValues([ODB.runState]);
+  state.values[ODB.runState] = values[ODB.runState];
+  requireStopped();
+}
+
+// Replace edited settings with a fresh ODB snapshot after an uncertain save.
+async function reloadSettings() {
+  const values = await readValues();
+  const loaded = settingsFromValues(values);
+  if (!settingsAvailable(loaded)) throw new Error("ASIC Settings could not be read from ODB");
+  state.values = values; state.loaded = loaded; state.staged = clone(loaded); syncSettingInputs();
+}
+
+// Save ASIC settings one key at a time and reconcile the page after any failure.
 async function saveSettings() {
   if (state.saving || !state.staged) return;
+  let attempted = false;
   try {
     clearMessage();
-    requireStopped();
     const validation = validateSettings(state.staged); if (validation) throw new Error(validation);
-    state.saving = true; updateUi();
+    state.saving = true; ++state.saveEpoch; updateUi();
+    await requireStoppedNow();
     const values = [state.staged.asic1.code, state.staged.asic1.slope, state.staged.asic1.hgFeedback, state.staged.asic1.lgFeedback, state.staged.asic1.hgShaping, state.staged.asic1.lgShaping, state.staged.asic1.input, state.staged.asic1.channelEnabled, state.staged.asic2.code, state.staged.asic2.slope, state.staged.asic2.hgFeedback, state.staged.asic2.lgFeedback, state.staged.asic2.hgShaping, state.staged.asic2.lgShaping, state.staged.asic2.input, state.staged.asic2.channelEnabled];
-    if (state.mock) SETTINGS_PATHS.forEach((path, index) => { state.values[path] = clone(values[index]); });
-    else {
-      for (let index = 0; index < SETTINGS_PATHS.length; ++index) {
+    for (let index = 0; index < SETTINGS_PATHS.length; ++index) {
+      if (index) await requireStoppedNow();
+      attempted = true;
+      if (state.mock) state.values[SETTINGS_PATHS[index]] = clone(values[index]);
+      else {
         const rpc = await mjsonrpc_db_set_value(SETTINGS_PATHS[index], values[index]);
         if (rpc.result.status[0] !== MIDAS_SUCCESS) throw new Error(`ODB write failed for ${SETTINGS_PATHS[index]}`);
       }
     }
+    await requireStoppedNow();
     const readback = await readValues(SETTINGS_PATHS);
     const check = settingsFromValues(readback);
     if (!sameSettings(state.staged, check)) throw new Error("ODB readback did not match all saved Settings");
+    await requireStoppedNow();
     Object.assign(state.values, readback); state.loaded = clone(check); state.staged = clone(check); syncSettingInputs();
     showMessage("success", "Saved: ODB readback matches all ASIC Settings.");
-  } catch (error) { showMessage("error", `Save failed: ${decodeError(error)}`); }
-  finally { state.saving = false; updateUi(); }
+  } catch (error) {
+    let detail = "ODB reread; displayed Settings reflect the current ODB.";
+    try { await reloadSettings(); }
+    catch (reloadError) {
+      state.loaded = null; state.staged = null;
+      element("save-button").disabled = true; element("apply-button").disabled = true;
+      detail = `ODB reread failed: ${decodeError(reloadError)}. Refresh the page before editing.`;
+    }
+    showMessage("error", `Save failed${attempted ? "; partial save possible" : ""}: ${decodeError(error)}. ${detail}`);
+  }
+  finally { state.saving = false; ++state.saveEpoch; updateUi(); }
 }
 
 function uint32(value) { const number = Number(value); return Number.isFinite(number) && number >= 0 && number <= 0xffffffff ? Math.floor(number) : 0; }

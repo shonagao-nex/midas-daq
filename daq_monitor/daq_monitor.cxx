@@ -4,6 +4,7 @@
 #include "monitor_alarms.h"
 #include "monitor_odb_utils.h"
 #include "runlog_edit_rpc.h"
+#include "runlog_index_retry.h"
 #include "status_policy.h"
 
 #include <algorithm>
@@ -997,10 +998,7 @@ INT capture_runlog_eor(INT run_number, char*) {
   // No HUL frontend or run participation record exists yet. -1 means absent.
   // Once HUL is integrated, capture its participation and Events sent here.
   const std::int64_t hul_events = -1;
-  std::uint64_t slips = 0;
-  if (participation.vme)
-    read_value(gDatabase, "/Equipment/VME/Variables/RunCounters/EventSlipCount",
-               TID_QWORD, &slips);
+  const std::int64_t slips = daq_monitor::read_runlog_slips(gDatabase, participation.vme);
   bool ok = publish_status() && times_ok;
   INT status_run = 0;
   std::string daq_status, daq_summary;
@@ -1017,7 +1015,7 @@ INT capture_runlog_eor(INT run_number, char*) {
   ok = write_value("/DAQ/Status/Runlog/HULEvents", &hul_events,
                    sizeof(hul_events), TID_INT64) && ok;
   ok = write_value("/DAQ/Status/Runlog/EventSlipCount", &slips,
-                   sizeof(slips), TID_QWORD) && ok;
+                   sizeof(slips), TID_INT64) && ok;
   // The marker identifies the run whose ODB EOR sources are complete;
   // Logger writes their JSON snapshot later in this STOP transition.
   if (ok)
@@ -1081,28 +1079,27 @@ void maybe_spawn_run_elog(INT* last_spawned_run) {
 //************************************//
 // Refresh the Runlog index after a completed run
 //************************************//
-void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
-                             INT* active_run) {
+void maybe_spawn_runlog_index(daq_monitor::RunlogIndexRetry* retry) {
   INT state = 0, transition = 0, eor_run = 0;
   if (!read_value(gDatabase, "/Runinfo/State", TID_INT32, &state) ||
       !read_value(gDatabase, "/Runinfo/Transition in progress", TID_INT32, &transition) ||
       !read_value(gDatabase, "/DAQ/Status/Runlog/EORCompleteRunNumber", TID_INT32,
                   &eor_run) ||
       state != STATE_STOPPED || transition != 0 || eor_run <= 0 ||
-      eor_run <= *last_spawned_run || *active_child > 0)
+      !retry->should_start(eor_run, daq_monitor::RunlogIndexRetry::Clock::now()))
     return;
 
   std::string directory, subdir;
   if (!read_string(gDatabase, "/Logger/Message dir", &directory) || directory.empty()) {
     if (!read_string(gDatabase, "/Logger/Data dir", &directory) || directory.empty()) {
       cm_msg(MERROR, kClientName, "Cannot locate JSON Runlog directory for index");
-      *last_spawned_run = eor_run;
+      retry->failed(eor_run, daq_monitor::RunlogIndexRetry::Clock::now());
       return;
     }
   }
   if (!read_string(gDatabase, "/Logger/Runlog/JSON/Subdir", &subdir)) {
     cm_msg(MERROR, kClientName, "Cannot read JSON Runlog subdirectory for index");
-    *last_spawned_run = eor_run;
+    retry->failed(eor_run, daq_monitor::RunlogIndexRetry::Clock::now());
     return;
   }
   const std::string path =
@@ -1113,7 +1110,7 @@ void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
   if (path_error) {
     cm_msg(MERROR, kClientName, "Cannot locate Runlog index script: %s",
            path_error.message().c_str());
-    *last_spawned_run = eor_run;
+    retry->failed(eor_run, daq_monitor::RunlogIndexRetry::Clock::now());
     return;
   }
   const std::string script =
@@ -1122,7 +1119,7 @@ void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
   if (!std::filesystem::is_regular_file(script, path_error)) {
     cm_msg(MERROR, kClientName, "Runlog index script is unavailable: %s",
            script.c_str());
-    *last_spawned_run = eor_run;
+    retry->failed(eor_run, daq_monitor::RunlogIndexRetry::Clock::now());
     return;
   }
   char* const arguments[] = {
@@ -1132,13 +1129,12 @@ void maybe_spawn_runlog_index(INT* last_spawned_run, pid_t* active_child,
   pid_t child = 0;
   const int result = posix_spawn(&child, arguments[0], nullptr, nullptr,
                                  arguments, environ);
-  *last_spawned_run = eor_run;
-  if (result != 0)
+  if (result != 0) {
     cm_msg(MERROR, kClientName, "Cannot launch Runlog index refresh for run %d: %s",
            eor_run, std::strerror(result));
-  else {
-    *active_child = child;
-    *active_run = eor_run;
+    retry->failed(eor_run, daq_monitor::RunlogIndexRetry::Clock::now());
+  } else {
+    retry->started(eor_run, child);
   }
 }
 
@@ -1285,9 +1281,7 @@ int main(int argc, char** argv) {
 
   INT yield_status = CM_SUCCESS;
   INT last_spawned_elog_run = 0;
-  INT last_spawned_index_run = 0;
-  INT active_index_run = 0;
-  pid_t active_index_child = 0;
+  daq_monitor::RunlogIndexRetry index_retry;
   while (!gStopRequested) {
     if (publish_status() &&
         !daq_monitor::update_monitor_alarms(&gMonitorState.alarms))
@@ -1295,17 +1289,22 @@ int main(int argc, char** argv) {
     int child_status = 0;
     pid_t reaped = 0;
     while ((reaped = waitpid(-1, &child_status, WNOHANG)) > 0) {
-      if (reaped == active_index_child) {
-        if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
+      if (reaped == index_retry.active_child()) {
+        const int run = index_retry.active_run();
+        if (!index_retry.finished(reaped, child_status,
+                                  daq_monitor::RunlogIndexRetry::Clock::now()))
           cm_msg(MERROR, kClientName,
                  "Runlog index refresh for run %d failed (child status %d)",
-                 active_index_run, child_status);
-        active_index_child = 0;
+                 run, child_status);
       }
     }
+    if (reaped < 0 && errno == ECHILD && index_retry.active_child() > 0) {
+      cm_msg(MERROR, kClientName, "Runlog index refresh for run %d lost its child",
+             index_retry.active_run());
+      index_retry.lost_child(daq_monitor::RunlogIndexRetry::Clock::now());
+    }
     maybe_spawn_run_elog(&last_spawned_elog_run);
-    maybe_spawn_runlog_index(&last_spawned_index_run, &active_index_child,
-                             &active_index_run);
+    maybe_spawn_runlog_index(&index_retry);
     yield_status = cm_yield(kUpdatePeriodMs);
     if (yield_status == RPC_SHUTDOWN || yield_status == SS_ABORT)
       break;

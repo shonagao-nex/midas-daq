@@ -1,6 +1,7 @@
 #include "monitor_odb_utils.h"
 
 #include <cstddef>
+#include <limits>
 
 namespace daq_monitor {
 namespace {
@@ -23,6 +24,15 @@ bool read_string(HNDLE database, const std::string& path,
   buffer[sizeof(buffer) - 1] = '\0';
   *value = buffer;
   return true;
+}
+
+// Read the final VME slip count, using -1 when a participating VME has no value.
+std::int64_t read_runlog_slips(HNDLE database, bool vme_participating) {
+  if (!vme_participating) return 0;
+  std::uint64_t slips = 0;
+  if (!read_value(database, "/Equipment/VME/Variables/RunCounters/EventSlipCount", TID_QWORD, &slips) ||
+      slips > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return -1;
+  return static_cast<std::int64_t>(slips);
 }
 
 //************************************//
