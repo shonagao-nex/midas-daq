@@ -122,20 +122,18 @@ network address setting, and its communication Variables. A missing ODB value
 is shown as `—`; the page does not fall back to a hard-coded value.
 
 The VME and EASIROC parent-row Enable switches use
-`/Equipment/{VME,EASIROC}/Settings/FrontendEnabled`. These settings select
-which connected frontends participate in the next run; they do not change any
-module Enable setting. The monitor records participation before BOR, and the
-frontends snapshot it in their RunSnapshot `Metadata/EnabledForRun` values.
-Connection, participation, and module readiness remain separate states.
-In STOPPED, the parent STATUS shows Disabled for FrontendEnabled=OFF,
-Not running for an enabled frontend absent from MIDAS Programs, and Connected
-for a connected frontend. During RUNNING or PAUSED, a frontend excluded from
-the recorded run participation shows Not participating. START requires every
-enabled frontend to be connected and names missing processes in the rejection.
+the same MIDAS frontend processes shown on the Programs page. The dashboard
+uses `cm_exist` for process state, `start_program` to start a frontend, and
+`cm_shutdown` to stop one. There is no separate frontend Enable ODB setting.
+The monitor records connected frontends as participants before BOR, and the
+frontends snapshot participation in their RunSnapshot `Metadata/EnabledForRun`.
+In STOPPED, a connected frontend shows Enabled and an absent one shows Disabled.
+During RUNNING or PAUSED, a frontend excluded from the recorded run shows
+Not participating. START requires at least one connected frontend.
 
-Enable controls are locked for RUNNING and PAUSED. While STOPPED, a change is
-written to the existing setting and then read back before the displayed state
-is accepted. The module-name links use mhttpd's installed
+Frontend Start/Stop controls are locked for RUNNING and PAUSED. While STOPPED,
+the dashboard rechecks MIDAS run state before calling the same RPCs as Programs
+and confirms the resulting process state. The module-name links use mhttpd's installed
 `?cmd=odb&odb_path=...` URL form and point to the corresponding Settings tree.
 
 Run Status and the Equipment parent rows show MIDAS physics `Events sent`

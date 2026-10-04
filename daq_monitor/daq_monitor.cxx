@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -157,7 +158,29 @@ ClientHealth client_health(const char* client_name) {
                                           &elapsed_ms);
   if (status != DB_SUCCESS)
     return {};
-  return {true, timeout_ms == 0 || elapsed_ms <= timeout_ms};
+  const bool connected = cm_exist(client_name, TRUE) == CM_SUCCESS;
+  return {connected, connected && (timeout_ms == 0 || elapsed_ms <= timeout_ms)};
+}
+
+bool client_stop_complete(const char* client_name) {
+  HNDLE clients = 0;
+  if (db_find_key(gDatabase, 0, "/System/Clients", &clients) != DB_SUCCESS)
+    return false;
+  for (INT index = 0;; ++index) {
+    HNDLE client = 0;
+    if (db_enum_key(gDatabase, clients, index, &client) != DB_SUCCESS)
+      break;
+    char name[NAME_LENGTH] = {};
+    INT size = sizeof(name);
+    if (db_get_value(gDatabase, client, "Name", name, &size, TID_STRING,
+                     FALSE) != DB_SUCCESS || std::strcmp(name, client_name) != 0)
+      continue;
+    INT state = 0;
+    size = sizeof(state);
+    return db_get_value(gDatabase, client, "Run state", &state, &size,
+                        TID_INT32, FALSE) == DB_SUCCESS && state == STATE_STOPPED;
+  }
+  return false;
 }
 
 bool timestamp_is_fresh(std::uint64_t now_unix,
@@ -178,6 +201,21 @@ bool publish_can_start(const daq_monitor::CanStartEvaluation& evaluation) {
   if (evaluation.allowed)
     ok = write_value("/DAQ/Status/Global/CanStart", &allowed,
                      sizeof(allowed), TID_BOOL) && ok;
+  return ok;
+}
+
+bool reset_nonparticipating_run_snapshots(bool vme, bool easiroc) {
+  const BOOL disabled = FALSE;
+  bool ok = true;
+  const auto reset = [&](bool participating, const char* path) {
+    if (participating) return;
+    HNDLE key = 0;
+    if (db_find_key(gDatabase, 0, path, &key) != DB_SUCCESS) return;
+    ok = db_set_value(gDatabase, 0, path, &disabled, sizeof(disabled), 1,
+                      TID_BOOL) == DB_SUCCESS && ok;
+  };
+  reset(vme, "/Equipment/VME/RunSnapshot/Metadata/EnabledForRun");
+  reset(easiroc, "/Equipment/EASIROC/RunSnapshot/Metadata/EnabledForRun");
   return ok;
 }
 
@@ -298,8 +336,6 @@ struct StatusInputs {
   BOOL easiroc_connected;
   BOOL easiroc_status_fresh;
   BOOL logger_connected;
-  BOOL vme_frontend_enabled;
-  BOOL easiroc_frontend_enabled;
   BOOL vme_configuration_ok;
   INT vme_configuration_run_number;
   std::uint64_t vme_configuration_checked_unix;
@@ -510,12 +546,6 @@ StatusInputs collect_status_inputs() {
   inputs.collection_ok = true;
   collect_runinfo_inputs(&inputs);
   collect_client_health_inputs(&inputs);
-  inputs.vme_frontend_enabled = TRUE;
-  inputs.easiroc_frontend_enabled = TRUE;
-  read_value(gDatabase, "/Equipment/VME/Settings/FrontendEnabled",
-             TID_BOOL, &inputs.vme_frontend_enabled);
-  read_value(gDatabase, "/Equipment/EASIROC/Settings/FrontendEnabled",
-             TID_BOOL, &inputs.easiroc_frontend_enabled);
   collect_configuration_inputs(&inputs);
   collect_vme_inputs(&inputs);
   collect_easiroc_inputs(&inputs);
@@ -572,8 +602,8 @@ StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
        timestamp_is_fresh(now_unix, previous_update_unix));
   raw_status.disk_free_gb = gMonitorState.disk.free_gb;
   raw_status.logger_connected = logger_connected != FALSE;
-  raw_status.vme_requested = inputs.vme_frontend_enabled != FALSE;
-  raw_status.easiroc_requested = inputs.easiroc_frontend_enabled != FALSE;
+  raw_status.vme_requested = vme_connected != FALSE;
+  raw_status.easiroc_requested = easiroc_connected != FALSE;
   const daq_monitor::ActiveParticipation participation =
       daq_monitor::resolve_run_participation(
           raw_status.run_state, run_number, inputs.run_participation);
@@ -610,44 +640,6 @@ StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
       daq_monitor::evaluate_status(raw_status);
 
   return {raw_status, participation, evaluation};
-}
-
-//************************************//
-// Preserve the largest observed event counts for the runlog
-//************************************//
-void publish_observed_event_counts(const StatusInputs& inputs,
-                                   const StatusDecision& decision) {
-  const auto& run_state = inputs.run_state;
-  const auto& run_number = inputs.run_number;
-  const auto& participation = decision.participation;
-  // Preserve the largest observed MIDAS event count if a participating
-  // frontend disconnects before EOR. The record is keyed by run number.
-  if (run_state == STATE_RUNNING || run_state == STATE_PAUSED) {
-    INT count_run = 0;
-    double previous_vme = 0, previous_easiroc = 0;
-    read_value(gDatabase, "/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
-    if (count_run == run_number) {
-      read_value(gDatabase, "/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
-                 &previous_vme);
-      read_value(gDatabase, "/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
-                 &previous_easiroc);
-    }
-    double current_vme = 0, current_easiroc = 0;
-    read_value(gDatabase, "/Equipment/VME/Statistics/Events sent", TID_DOUBLE,
-               &current_vme);
-    read_value(gDatabase, "/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
-               TID_DOUBLE, &current_easiroc);
-    const double observed_vme = participation.vme
-        ? std::max(previous_vme, current_vme) : 0;
-    const double observed_easiroc = participation.easiroc
-        ? std::max(previous_easiroc, current_easiroc) : 0;
-    write_value("/DAQ/Status/Runlog/ObservedVMEEvents", &observed_vme,
-                sizeof(observed_vme), TID_DOUBLE);
-    write_value("/DAQ/Status/Runlog/ObservedEASIROCEvents", &observed_easiroc,
-                sizeof(observed_easiroc), TID_DOUBLE);
-    write_value("/DAQ/Status/Runlog/CountRunNumber", &run_number,
-                sizeof(run_number), TID_INT32);
-  }
 }
 
 //************************************//
@@ -895,7 +887,6 @@ bool publish_status(bool synchronous_start_check = false) {
   const StatusInputs inputs = collect_status_inputs();
   const StatusDecision decision =
       evaluate_status_inputs(inputs, synchronous_start_check);
-  publish_observed_event_counts(inputs, decision);
   return publish_status_outputs(inputs, decision);
 }
 
@@ -907,8 +898,6 @@ INT validate_start_transition(INT run_number, char* error) {
   BOOL can_start = FALSE;
   BOOL vme_connected = FALSE;
   BOOL easiroc_connected = FALSE;
-  BOOL vme_enabled = FALSE;
-  BOOL easiroc_enabled = FALSE;
 
   // A successful synchronous collection makes freshness explicit without
   // sleeping or polling while this transition callback is running.
@@ -918,28 +907,27 @@ INT validate_start_transition(INT run_number, char* error) {
       !read_value(gDatabase, "/DAQ/Status/Frontends/VME/Connected", TID_BOOL,
                   &vme_connected) ||
       !read_value(gDatabase, "/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
-                  &easiroc_connected) ||
-      !read_value(gDatabase, "/Equipment/VME/Settings/FrontendEnabled",
-                  TID_BOOL, &vme_enabled) ||
-      !read_value(gDatabase, "/Equipment/EASIROC/Settings/FrontendEnabled",
-                  TID_BOOL, &easiroc_enabled)) {
+                  &easiroc_connected)) {
     evaluation = {false, "Monitor status unavailable"};
   } else {
     evaluation.allowed = can_start != FALSE;
   }
 
   if (evaluation.allowed &&
-      !record_run_participation(run_number,
-                                vme_connected && vme_enabled,
-                                easiroc_connected && easiroc_enabled)) {
+      !record_run_participation(run_number, vme_connected, easiroc_connected)) {
     evaluation = {false, "Cannot record frontend participation"};
+  }
+
+  if (evaluation.allowed &&
+      !reset_nonparticipating_run_snapshots(vme_connected, easiroc_connected)) {
+    evaluation = {false, "Cannot reset non-participating frontend snapshot"};
   }
 
   if (evaluation.allowed) {
     cm_msg(MINFO, kClientName,
            "Run %d participants: VME=%s EASIROC=%s", run_number,
-           vme_connected && vme_enabled ? "yes" : "no",
-           easiroc_connected && easiroc_enabled ? "yes" : "no");
+           vme_connected ? "yes" : "no",
+           easiroc_connected ? "yes" : "no");
     if (error != nullptr)
       error[0] = '\0';
     return CM_SUCCESS;
@@ -962,28 +950,50 @@ INT capture_runlog_eor(INT run_number, char*) {
     cm_msg(MERROR, kClientName, "No participation record for EOR run %d", run_number);
     return CM_SUCCESS;  // Never prevent STOP from completing.
   }
+  if ((participation.vme &&
+       (!client_health(kVmeClientName).connected ||
+        !client_stop_complete(kVmeClientName))) ||
+      (participation.easiroc &&
+       (!client_health(kEasirocClientName).connected ||
+        !client_stop_complete(kEasirocClientName)))) {
+    cm_msg(MERROR, kClientName,
+           "Cannot confirm frontend STOP completion for EOR run %d", run_number);
+    return CM_SUCCESS;  // Do not label a periodic sample as final.
+  }
   DWORD start = 0, stop = 0;
   bool times_ok = read_value(gDatabase, "/Runinfo/Start time binary", TID_DWORD, &start);
   times_ok = read_value(gDatabase, "/Runinfo/Stop time binary", TID_DWORD, &stop) &&
              times_ok;
   const std::uint64_t elapsed = stop >= start ? stop - start : 0;
+  // MFE STOP sequence 500 flushes physics events and publishes final
+  // Statistics/Events sent after frontend end_of_run. This callback runs at
+  // sequence 700, before Logger snapshots these fields at sequence 800.
   double vme_sent = 0, easiroc_sent = 0;
-  read_value(gDatabase, "/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent);
-  read_value(gDatabase, "/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
-             TID_DOUBLE, &easiroc_sent);
-  INT count_run = 0;
-  read_value(gDatabase, "/DAQ/Status/Runlog/CountRunNumber", TID_INT32, &count_run);
-  if (count_run == run_number) {
-    double observed = 0;
-    if (read_value(gDatabase, "/DAQ/Status/Runlog/ObservedVMEEvents", TID_DOUBLE,
-                   &observed)) vme_sent = std::max(vme_sent, observed);
-    if (read_value(gDatabase, "/DAQ/Status/Runlog/ObservedEASIROCEvents", TID_DOUBLE,
-                   &observed)) easiroc_sent = std::max(easiroc_sent, observed);
+  bool counts_ok = true;
+  if (participation.vme)
+    counts_ok = read_value(gDatabase,
+        "/Equipment/VME/Statistics/Events sent", TID_DOUBLE, &vme_sent) &&
+        counts_ok;
+  if (participation.easiroc)
+    counts_ok = read_value(gDatabase,
+        "/Equipment/NIM-EASIROC Physics/Statistics/Events sent",
+        TID_DOUBLE, &easiroc_sent) && counts_ok;
+  const auto valid_count = [](double count) {
+    // MIDAS stores Events sent as double; integers above 2^53-1 cannot be
+    // guaranteed exact after conversion to the INT64 runlog value.
+    return std::isfinite(count) && count >= 0 &&
+           count <= 9007199254740991.0 && std::floor(count) == count;
+  };
+  if (!counts_ok || (participation.vme && !valid_count(vme_sent)) ||
+      (participation.easiroc && !valid_count(easiroc_sent))) {
+    cm_msg(MERROR, kClientName,
+           "Cannot read final Events sent for EOR run %d", run_number);
+    return CM_SUCCESS;  // Leave the last completed run intact.
   }
   const std::int64_t vme_events =
-      daq_monitor::runlog_event_count(participation.vme, vme_sent, 0);
+      daq_monitor::runlog_event_count(participation.vme, vme_sent);
   const std::int64_t easiroc_events =
-      daq_monitor::runlog_event_count(participation.easiroc, easiroc_sent, 0);
+      daq_monitor::runlog_event_count(participation.easiroc, easiroc_sent);
   // No HUL frontend or run participation record exists yet. -1 means absent.
   // Once HUL is integrated, capture its participation and Events sent here.
   const std::int64_t hul_events = -1;

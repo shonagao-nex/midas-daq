@@ -47,6 +47,8 @@ check: $(TEST_TARGETS)
 	./$(BIN_DIR)/tests/monitor_odb_utils_test
 	./$(BIN_DIR)/tests/runlog_edit_test
 	./$(BIN_DIR)/tests/runlog_edit_rpc_test
+	python3 tests/test_event_count_contract.py
+	python3 tests/test_frontend_sync_contract.py
 
 $(TARGET): $(OBJECTS) $(MIDASLIB)
 	@mkdir -p $(dir $@)

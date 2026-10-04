@@ -118,7 +118,6 @@ static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
-static const char *FRONTEND_ENABLED_PATH = "/Equipment/VME/Settings/FrontendEnabled";
 
 /* Retain first-ten-event timing probes to preserve the readout sequence. */
 static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
@@ -2374,10 +2373,6 @@ static INT verify_startup_run_state(INT *current_run_state)
 //************************************//
 static INT initialize_frontend_odb_schema()
 {
-    const BOOL enabled = TRUE;
-    if (!vme_odb::ensure_odb_value(FRONTEND_ENABLED_PATH, &enabled,
-                                   sizeof(enabled), 1, TID_BOOL))
-        return FE_ERR_ODB;
     if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
         !initialize_v1720e_odb() || !initialize_run_counters_odb() ||
         !initialize_buffer_clear_mailbox()) {

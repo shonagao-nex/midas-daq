@@ -152,7 +152,7 @@ CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   if (!raw.monitor_status_fresh)
     return {false, "Monitor status stale"};
   if (!raw.vme_requested && !raw.easiroc_requested)
-    return {false, "No frontend enabled for next run"};
+    return {false, "No frontend running for next run"};
   std::string missing;
   if (raw.vme_requested && !raw.vme.connected)
     missing = "fevme";
@@ -191,11 +191,9 @@ ActiveParticipation resolve_run_participation(
   return {false, true, true};
 }
 
-std::int64_t runlog_event_count(bool participating, double latest,
-                                double largest_observed) {
+std::int64_t runlog_event_count(bool participating, double final_events_sent) {
   if (!participating) return -1;
-  const double count = std::max(std::isfinite(latest) ? latest : 0.0,
-                                std::isfinite(largest_observed) ? largest_observed : 0.0);
+  const double count = std::isfinite(final_events_sent) ? final_events_sent : 0.0;
   if (count <= 0.0) return 0;
   if (count >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
     return std::numeric_limits<std::int64_t>::max();

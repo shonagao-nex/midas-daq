@@ -265,7 +265,7 @@ void test_can_start() {
   EXPECT(evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason.empty());
 
-  // Every enabled frontend must be connected; disabled frontends are optional.
+  // Every selected (running) frontend must be connected; absent frontends are optional.
   for (int enabled = 0; enabled < 4; ++enabled) {
     for (int connected = 0; connected < 4; ++connected) {
       raw = normal_raw(RunState::kStopped);
@@ -288,7 +288,7 @@ void test_can_start() {
   raw.vme_requested = false;
   EXPECT(evaluate_can_start(raw).reason == "Frontend not running: feeasiroc");
   raw.easiroc_requested = false;
-  EXPECT(evaluate_can_start(raw).reason == "No frontend enabled for next run");
+  EXPECT(evaluate_can_start(raw).reason == "No frontend running for next run");
 
   raw = normal_raw(RunState::kStopped);
   raw.disk_free_gb = 10.0;
@@ -416,10 +416,42 @@ void test_run_participation() {
 
 void test_runlog_event_count() {
   using daq_monitor::runlog_event_count;
-  EXPECT(runlog_event_count(true, 0, 0) == 0);
-  EXPECT(runlog_event_count(false, 999, 999) == -1);
-  EXPECT(runlog_event_count(true, 12, 19) == 19);
-  EXPECT(runlog_event_count(true, 23, 19) == 23);
+  EXPECT(runlog_event_count(true, 0) == 0);
+  EXPECT(runlog_event_count(false, 999) == -1);
+  EXPECT(runlog_event_count(true, 12) == 12);
+  EXPECT(runlog_event_count(true, 23) == 23);
+
+  // RUNNING samples can lag or exceed the eventual MFE STOP value. EOR uses
+  // only the final Statistics/Events sent value for each participant.
+  struct Scenario {
+    const char* name;
+    bool vme;
+    bool easiroc;
+    double running_vme;
+    double running_easiroc;
+    double final_vme;
+    double final_easiroc;
+    std::int64_t expected_vme;
+    std::int64_t expected_easiroc;
+  };
+  const Scenario scenarios[] = {
+      {"VME only", true, false, 150, 0, 149, 0, 149, -1},
+      {"EASIROC only", false, true, 0, 85, 0, 87, -1, 87},
+      {"both frontends", true, true, 200, 300, 202, 299, 202, 299},
+  };
+  for (const auto& scenario : scenarios) {
+    if (scenario.vme)
+      EXPECT(scenario.running_vme != scenario.final_vme);
+    if (scenario.easiroc)
+      EXPECT(scenario.running_easiroc != scenario.final_easiroc);
+    EXPECT(runlog_event_count(scenario.vme, scenario.final_vme) ==
+           scenario.expected_vme);
+    EXPECT(runlog_event_count(scenario.easiroc, scenario.final_easiroc) ==
+           scenario.expected_easiroc);
+    std::printf("  %s: EOR VME=%lld EASIROC=%lld\n", scenario.name,
+                static_cast<long long>(scenario.expected_vme),
+                static_cast<long long>(scenario.expected_easiroc));
+  }
 }
 
 void test_transition_sequence() {

@@ -114,8 +114,7 @@ CanStartEvaluation evaluate_can_start(const RawStatus& raw);
 ActiveParticipation resolve_run_participation(
     RunState run_state, std::int32_t current_run_number,
     const RunParticipation& recorded);
-std::int64_t runlog_event_count(bool participating, double latest,
-                                double largest_observed);
+std::int64_t runlog_event_count(bool participating, double final_events_sent);
 StatusEvaluation evaluate_status(const RawStatus& raw);
 
 }  // namespace daq_monitor
