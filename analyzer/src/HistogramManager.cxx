@@ -66,6 +66,11 @@ bool HistogramManager::ConfigsMatch(
   return configs == requested_configs_;
 }
 
+void HistogramManager::Reset() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& histogram : histograms_) histogram.object->Reset();
+}
+
 bool HistogramManager::BookLocked() {
   bool all_valid = true;
   for (const auto& config : configs_) {

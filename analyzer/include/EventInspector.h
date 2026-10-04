@@ -40,6 +40,7 @@ class EventInspector : public TARunObject {
   EventDiagnostics diagnostics_;
   std::size_t decoded_events_ = 0;
   bool decoded_limit_reached_ = false;
+  bool monitor_pending_ = false;
   OnlineHistogramPrescale histogram_prescale_;
   std::unique_ptr<RootTreeWriter> tree_writer_;
   OnlineHistogramState* online_state_ = nullptr;  // Factory-owned; online only.

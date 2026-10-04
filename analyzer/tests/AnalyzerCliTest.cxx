@@ -74,6 +74,20 @@ int main() {
                      .okay,
                 "management mode must reject event debugging");
 
+  const auto initialize_pages =
+      ana::ParseAnalyzerCli({"midas_analyzer", "--init-page-odb"});
+  okay &= Check(initialize_pages.okay && initialize_pages.init_page_odb &&
+                    !initialize_pages.init_hist_odb &&
+                    initialize_pages.root_web_port == 0,
+                "page initialization must be a separate management mode");
+  okay &= Check(!ana::ParseAnalyzerCli(
+                     {"midas_analyzer", "--init-page-odb", "--init-hist-odb"})
+                     .okay &&
+                    !ana::ParseAnalyzerCli(
+                         {"midas_analyzer", "--init-page-odb", "-f", "run.mid"})
+                         .okay,
+                "page initialization must reject other modes");
+
   const auto initialize_with_connection = ana::ParseAnalyzerCli(
       {"midas_analyzer", "--init-hist-odb", "-Hdaqhost", "-Edaq",
        "--midas-progname", "hist_init"});

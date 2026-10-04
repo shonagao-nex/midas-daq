@@ -19,6 +19,7 @@ struct PageConfig {
 };
 
 bool IsSupportedPageLayout(const PageConfig& page);
+std::vector<PageConfig> DefaultPageConfigs();
 
 }  // namespace ana
 

@@ -7,11 +7,32 @@
 namespace ana {
 
 void EventDiagnostics::Reset() {
+  pending_warning_active_ = false;
   detailed_printed_ = 0;
   malformed_events_ = 0;
   event_ids_.clear();
   vme_ = SourceStatistics{};
   easiroc_ = SourceStatistics{};
+}
+
+std::string EventDiagnostics::PendingStatusMessage(
+    const EventBuilder& builder, bool online_both_source) {
+  if (!online_both_source) return {};
+  const std::size_t count = builder.PendingCount();
+  const bool warning = count >= 100;
+  if (warning == pending_warning_active_) return {};
+  pending_warning_active_ = warning;
+  std::string message = warning
+                            ? "WARNING: EventBuilder pending events accumulating: count="
+                            : "INFO: EventBuilder pending events recovered: count=";
+  message += std::to_string(count);
+  if (count != 0) {
+    message += ", oldest_serial=" +
+               std::to_string(*builder.OldestPendingSerial());
+    message += ", newest_serial=" +
+               std::to_string(*builder.NewestPendingSerial());
+  }
+  return message;
 }
 
 std::size_t EventDiagnostics::ElementSize(std::uint32_t type) {

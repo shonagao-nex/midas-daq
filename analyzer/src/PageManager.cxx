@@ -59,8 +59,9 @@ bool PageManager::BuildCanvas(const PageConfig& config,
                               const HistogramManager* histograms) {
   if (!pages_directory_ || !IsSupportedPageLayout(config)) return false;
   pages_directory_->cd();
-  auto* canvas = new TCanvas(config.name.c_str(), config.name.c_str(), 1200,
-                             900);
+  const bool wide_page = config.columns == 8 && config.rows == 4;
+  auto* canvas = new TCanvas(config.name.c_str(), config.name.c_str(),
+                             wide_page ? 1600 : 1200, wide_page ? 800 : 900);
   canvas->Divide(config.columns, config.rows);
   const auto pad_count = static_cast<std::size_t>(config.rows * config.columns);
   for (std::size_t index = 0; index < pad_count; ++index) {

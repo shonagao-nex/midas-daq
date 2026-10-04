@@ -12,18 +12,41 @@
 
 namespace ana {
 
-bool OnlineHistogramState::BeginRun(
+bool OnlineHistogramState::Initialize(
     TDirectory* parent, std::vector<HistogramConfig> histogram_configs,
-    std::vector<PageConfig> page_configs, int run_number) {
+    std::vector<PageConfig> page_configs) {
   // Canvases contain non-owning pointers to histograms. Remove them first.
   pages.ClearCanvases();
   histograms.SetConfigs(std::move(histogram_configs));
   const bool booked = histograms.BeginRun(parent, false);
   const bool page_directory_ready = pages.BeginRun(parent, &histograms);
   pages.ApplyConfigs(std::move(page_configs), &histograms);
+  initialized_ = booked && page_directory_ready;
+  return initialized_;
+}
+
+bool OnlineHistogramState::BeginRun(
+    TDirectory* parent, std::vector<HistogramConfig> histogram_configs,
+    std::vector<PageConfig> page_configs, int run_number) {
+  if (!initialized_) {
+    if (!Initialize(parent, std::move(histogram_configs),
+                    std::move(page_configs)))
+      return false;
+  } else {
+    const bool histogram_changed =
+        !histograms.ConfigsMatch(histogram_configs);
+    if (histogram_changed) {
+      pages.ClearCanvases();
+      histograms.ApplyConfigs(std::move(histogram_configs));
+    }
+    const bool pages_changed =
+        pages.ApplyConfigs(std::move(page_configs), &histograms);
+    if (histogram_changed && !pages_changed) pages.Rebuild(&histograms);
+  }
+  histograms.Reset();
   last_run_number_ = run_number;
   has_run_ = true;
-  return booked && page_directory_ready;
+  return true;
 }
 
 void OnlineHistogramState::EndRun() {
@@ -34,6 +57,7 @@ void OnlineHistogramState::Clear() {
   pages.Clear();
   histograms.EndRun();
   has_run_ = false;
+  initialized_ = false;
 }
 
 bool OnlineHistogramState::ExportPdf(const std::string& output_path,

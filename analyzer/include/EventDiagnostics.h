@@ -25,6 +25,8 @@ class EventDiagnostics {
   bool BeginEvent(TMEvent& event);
   void RecordSpecialEvent(const TMEvent& event);
   void RecordSourceEvent(const TMEvent& event, RawEventSource source);
+  std::string PendingStatusMessage(const EventBuilder& builder,
+                                   bool online_both_source);
   void PrintRunSummary(int run_number, bool offline, std::int64_t tree_entries,
                        std::size_t decoded_events,
                        std::int64_t event_hist_entries,
@@ -56,6 +58,7 @@ class EventDiagnostics {
   void PrintDetailedEvent(const TMEvent& event) const;
 
   bool debug_events_ = false;
+  bool pending_warning_active_ = false;
   static constexpr std::size_t kDetailedLimit = 8;
   std::size_t detailed_printed_ = 0;
   std::size_t malformed_events_ = 0;

@@ -1,4 +1,5 @@
 #include "EventBuilder.h"
+#include "EventDiagnostics.h"
 
 #include "midasio.h"
 
@@ -71,6 +72,9 @@ int main() {
   builder.AddEvent(vme4, ana::RawEventSource::kVme);
   okay &= Check(emitted == 0 && builder.PendingCount() == 1,
                 "both-source mode must wait after VME alone");
+  okay &= Check(builder.OldestPendingSerial() == 4 &&
+                    builder.NewestPendingSerial() == 4,
+                "one pending event must be both oldest and newest");
   builder.AddEvent(easiroc4, ana::RawEventSource::kEasiroc);
   okay &= Check(emitted == 1 && builder.PendingCount() == 0 &&
                     builder.GetStatistics().paired == 1,
@@ -80,6 +84,9 @@ int main() {
   builder.AddEvent(easiroc7, ana::RawEventSource::kEasiroc);
   okay &= Check(emitted == 1 && builder.PendingCount() == 2,
                 "different serials must remain unpaired");
+  okay &= Check(builder.OldestPendingSerial() == 6 &&
+                    builder.NewestPendingSerial() == 7,
+                "pending serial bounds must follow serial order");
   builder.AddEvent(easiroc6, ana::RawEventSource::kEasiroc);
   okay &= Check(emitted == 2 && builder.PendingCount() == 1,
                 "matching serial must pair without consuming mismatched event");
@@ -101,5 +108,62 @@ int main() {
                 "decoded hardware counters must be retained for gap reporting");
   okay &= Check(stats.decoder_errors == 0,
                 "synthetic banks must decode without errors");
+
+  okay &= Check(!builder.OldestPendingSerial() && !builder.NewestPendingSerial(),
+                "empty builder must have no pending serial bounds");
+
+  builder.Clear();
+  ana::EventDiagnostics diagnostics;
+  for (std::uint32_t serial = 5102; serial < 5201; ++serial) {
+    auto event = VmeEvent(serial);
+    builder.AddEvent(event, ana::RawEventSource::kVme);
+    okay &= Check(diagnostics.PendingStatusMessage(builder, true).empty(),
+                  "pending below 100 must not warn");
+  }
+  okay &= Check(builder.PendingCount() == 99 &&
+                    builder.OldestPendingSerial() == 5102 &&
+                    builder.NewestPendingSerial() == 5200,
+                "99 one-sided events must remain pending with correct bounds");
+  auto vme100 = VmeEvent(5201);
+  builder.AddEvent(vme100, ana::RawEventSource::kVme);
+  okay &= Check(diagnostics.PendingStatusMessage(builder, true) ==
+                    "WARNING: EventBuilder pending events accumulating: "
+                    "count=100, oldest_serial=5102, newest_serial=5201",
+                "100 pending events must produce one warning with bounds");
+  auto vme101 = VmeEvent(5202);
+  builder.AddEvent(vme101, ana::RawEventSource::kVme);
+  okay &= Check(diagnostics.PendingStatusMessage(builder, true).empty(),
+                "warning must not repeat for further pending events");
+  auto easiroc = EasirocEvent(5102);
+  builder.AddEvent(easiroc, ana::RawEventSource::kEasiroc);
+  okay &= Check(builder.PendingCount() == 100 &&
+                    builder.OldestPendingSerial() == 5103 &&
+                    diagnostics.PendingStatusMessage(builder, true).empty(),
+                "counterpart must reduce pending without repeating warning");
+  auto easiroc_next = EasirocEvent(5103);
+  builder.AddEvent(easiroc_next, ana::RawEventSource::kEasiroc);
+  okay &= Check(builder.PendingCount() == 99 &&
+                    diagnostics.PendingStatusMessage(builder, true) ==
+                        "INFO: EventBuilder pending events recovered: count=99, "
+                        "oldest_serial=5104, newest_serial=5202",
+                "falling below threshold must produce one recovery message");
+  okay &= Check(diagnostics.PendingStatusMessage(builder, true).empty(),
+                "recovery message must not repeat");
+
+  diagnostics.Reset();
+  okay &= Check(diagnostics.PendingStatusMessage(builder, false).empty(),
+                "offline mode must not warn for pending events");
+  auto vme_again = VmeEvent(5300);
+  builder.AddEvent(vme_again, ana::RawEventSource::kVme);
+  okay &= Check(diagnostics.PendingStatusMessage(builder, false).empty(),
+                "offline accumulation must not warn at threshold");
+  builder.Clear();
+  diagnostics.Reset();
+  builder.SetExpectedSources(ana::EventBuilder::ExpectedSources::kVmeOnly);
+  auto single = VmeEvent(5400);
+  builder.AddEvent(single, ana::RawEventSource::kVme);
+  okay &= Check(builder.PendingCount() == 0 &&
+                    diagnostics.PendingStatusMessage(builder, false).empty(),
+                "single-source mode must emit immediately without warning");
   return okay ? 0 : 1;
 }

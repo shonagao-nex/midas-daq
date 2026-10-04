@@ -88,10 +88,12 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
   decoded_events_ = 0;
   decoded_limit_reached_ = false;
   builder_.Clear();
+  monitor_pending_ = false;
   const bool online = options_.mode == AnalyzerMode::kOnline;
   if (online) {
     const auto expected_sources = ReadExpectedSources(runinfo->fOdb);
     builder_.SetExpectedSources(expected_sources);
+    monitor_pending_ = expected_sources == EventBuilder::ExpectedSources::kBoth;
     std::printf("EventBuilder expected sources: %s\n",
                 ExpectedSourcesName(expected_sources));
   }
@@ -207,6 +209,9 @@ void EventInspector::InspectEvent(TMEvent& event) {
   if (source == RawEventSource::kVme || source == RawEventSource::kEasiroc) {
     diagnostics_.RecordSourceEvent(event, source);
     builder_.AddEvent(event, source);
+    const auto message =
+        diagnostics_.PendingStatusMessage(builder_, monitor_pending_);
+    if (!message.empty()) std::fprintf(stderr, "%s\n", message.c_str());
   } else if (event.event_id == 0x0001) {
     std::fprintf(stderr,
                  "WARNING: physics event id=0x0001 serial=%u has unknown or "

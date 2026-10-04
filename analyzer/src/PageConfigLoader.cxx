@@ -40,7 +40,10 @@ bool ReadString(MVOdb* directory, const std::string& field,
 PageConfigLoader::Result PageConfigLoader::Load(MVOdb* odb) const {
   Result result;
   OdbPtr directory = FindDirectory(odb);
-  if (!directory) return result;
+  if (!directory) {
+    result.pages = DefaultPageConfigs();
+    return result;
+  }
   result.odb_path_found = true;
   if (!directory->IsReadOnly()) directory->SetPrintError(false);
 
@@ -78,6 +81,33 @@ PageConfigLoader::Result PageConfigLoader::Load(MVOdb* odb) const {
   }
   result.loaded_from_odb = true;
   return result;
+}
+
+bool PageConfigLoader::CreateDefaults(MVOdb* odb) const {
+  if (!odb || odb->IsReadOnly()) return false;
+  if (FindDirectory(odb)) {
+    std::fprintf(stderr, "ERROR: %s already exists. Nothing was modified.\n",
+                 kOdbPath);
+    return false;
+  }
+  MVOdbError error;
+  OdbPtr directory(odb->Chdir("Analyzer/Pages", true, &error));
+  if (!directory || error.fError) return false;
+  for (const auto& page : DefaultPageConfigs()) {
+    OdbPtr entry(directory->Chdir(page.name.c_str(), true, &error));
+    if (!entry || error.fError) return false;
+    entry->WI("Rows", page.rows, &error);
+    if (error.fError) return false;
+    entry->WI("Columns", page.columns, &error);
+    if (error.fError) return false;
+    for (std::size_t index = 0; index < page.pads.size(); ++index) {
+      char field[16];
+      std::snprintf(field, sizeof(field), "Pad%02zu", index + 1);
+      entry->WS(field, page.pads[index].c_str(), 64, &error);
+      if (error.fError) return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace ana

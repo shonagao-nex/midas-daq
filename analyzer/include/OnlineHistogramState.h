@@ -17,6 +17,8 @@ namespace ana {
 // deleted at EOR, while ROOT Web must retain the last run's objects.
 class OnlineHistogramState {
  public:
+  bool Initialize(TDirectory* parent, std::vector<HistogramConfig> histograms,
+                  std::vector<PageConfig> pages);
   bool BeginRun(TDirectory* parent, std::vector<HistogramConfig> histograms,
                 std::vector<PageConfig> pages, int run_number);
   void EndRun();  // Stop filling by ending the run object; retain ROOT objects.
@@ -32,6 +34,7 @@ class OnlineHistogramState {
   HistogramPdfWriter pdf_writer_;
   int last_run_number_ = 0;
   bool has_run_ = false;
+  bool initialized_ = false;
 };
 
 }  // namespace ana

@@ -4,6 +4,7 @@
 #include "HistogramOdbInitializer.h"
 #include "OnlineHistogramState.h"
 #include "OnlineHistogramPrescale.h"
+#include "PageConfigLoader.h"
 #include "manalyzer.h"
 #include "midas.h"
 #include "mvodb.h"
@@ -19,7 +20,7 @@
 
 namespace {
 
-int InitializeHistogramOdb(const ana::AnalyzerCliResult& options) {
+int InitializeOdb(const ana::AnalyzerCliResult& options) {
   const char* hostname =
       options.midas_hostname.empty() ? nullptr : options.midas_hostname.c_str();
   const char* experiment = options.midas_experiment.empty()
@@ -45,12 +46,21 @@ int InitializeHistogramOdb(const ana::AnalyzerCliResult& options) {
   }
 
   std::unique_ptr<MVOdb> odb(MakeMidasOdb(database));
-  const auto result = ana::InitializeHistogramOdb(odb.get());
+  const bool page_initialization = options.init_page_odb;
+  const bool pages_created =
+      page_initialization && ana::PageConfigLoader{}.CreateDefaults(odb.get());
+  ana::HistogramOdbInitializationResult histogram_result;
+  if (!page_initialization)
+    histogram_result = ana::InitializeHistogramOdb(odb.get());
   odb.reset();
   status = cm_disconnect_experiment();
-  if (!result.okay) {
+  if (page_initialization && !pages_created) {
+    std::fprintf(stderr, "ERROR: page ODB initialization failed\n");
+    return 1;
+  }
+  if (!page_initialization && !histogram_result.okay) {
     std::fprintf(stderr, "ERROR: histogram ODB initialization failed: %s\n",
-                 result.error.c_str());
+                 histogram_result.error.c_str());
     return 1;
   }
   if (status != CM_SUCCESS) {
@@ -59,13 +69,19 @@ int InitializeHistogramOdb(const ana::AnalyzerCliResult& options) {
     return 1;
   }
 
+  if (page_initialization) {
+    std::printf("Created four default pages under %s\n",
+                ana::PageConfigLoader::kOdbPath);
+    return 0;
+  }
   std::printf("Created histogram ODB defaults under:\n  %s\n\nHistograms:\n",
               ana::HistogramConfigLoader::kOdbPath);
-  for (const auto& name : result.histogram_names)
+  for (const auto& name : histogram_result.histogram_names)
     std::printf("  %s\n", name.c_str());
   std::printf("\n%zu configs created\n%zu configs loaded\n"
               "%zu configs valid\n\nODB initialization completed.\n",
-              result.created, result.loaded, result.valid);
+              histogram_result.created, histogram_result.loaded,
+              histogram_result.valid);
   return 0;
 }
 
@@ -122,8 +138,8 @@ class EventInspectorFactory : public TAFactory {
                      "request watch is unavailable until analyzer restart.\n");
       }
     }
-    const auto result = histogram_config_loader_.Load(
-        mfe ? mfe->fOdbRoot : nullptr);
+    MVOdb* odb = mfe ? mfe->fOdbRoot : nullptr;
+    auto result = histogram_config_loader_.Load(odb);
     if (!result.odb_path_found) {
       std::fprintf(stderr,
                    "WARNING: %s not found; using in-memory default histogram "
@@ -134,6 +150,12 @@ class EventInspectorFactory : public TAFactory {
                   "ODB definition(s)\n",
                   result.configs.size());
     }
+    auto pages = page_config_loader_.Load(odb);
+    if (!online_state_.Initialize(TARootHelper::fgDir,
+                                  std::move(result.configs),
+                                  std::move(pages.pages)))
+      std::fprintf(stderr,
+                   "ERROR: cannot initialize startup ROOT Histograms/Pages\n");
   }
 
   TARunObject* NewRunObject(TARunInfo* runinfo) override {
@@ -159,6 +181,7 @@ class EventInspectorFactory : public TAFactory {
   ana::EventInspectorOptions options_;
   int root_web_port_ = 0;
   ana::HistogramConfigLoader histogram_config_loader_;
+  ana::PageConfigLoader page_config_loader_;
   ana::OnlineHistogramState online_state_;
   HNDLE pdf_watch_database_ = 0;
   HNDLE pdf_watch_key_ = 0;
@@ -187,7 +210,8 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
-  if (parsed.init_hist_odb) return InitializeHistogramOdb(parsed);
+  if (parsed.init_hist_odb || parsed.init_page_odb)
+    return InitializeOdb(parsed);
 
   if (parsed.inspector_options.mode == ana::AnalyzerMode::kOffline &&
       !parsed.output_file.empty()) {

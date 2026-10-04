@@ -1,5 +1,6 @@
 #include "HistogramManager.h"
 #include "PageManager.h"
+#include "PageConfigLoader.h"
 
 #include "TCanvas.h"
 #include "TDirectory.h"
@@ -65,6 +66,71 @@ int main() {
   okay &= Check(pages.ApplyConfigs({page}, &histograms), "4x5 page apply");
   okay &= Check(histograms.Entries("h_qdc0_ch00") == 1,
                 "page changes preserve histogram contents");
+
+  const auto defaults = ana::DefaultPageConfigs();
+  const std::vector<std::string> expected_names{
+      "QDC0_00_31", "TDC0_00_31", "V1190_TLE_00_31",
+      "V1190_TTR_00_31"};
+  const std::vector<std::string> groups{"QDC0", "TDC0", "TLE0", "TTR0"};
+  const std::vector<std::string> prefixes{"qdc0", "tdc0", "tle0", "ttr0"};
+  okay &= Check(defaults.size() == 4, "four standard pages exist");
+  if (defaults.size() == 4) {
+    for (std::size_t page_index = 0; page_index < defaults.size(); ++page_index) {
+      const auto& standard = defaults[page_index];
+      okay &= Check(standard.name == expected_names[page_index] &&
+                        standard.rows == 4 && standard.columns == 8 &&
+                        standard.pads.size() == 32 &&
+                        ana::IsSupportedPageLayout(standard),
+                    "standard page name, order, and 8x4 layout");
+      if (standard.pads.size() != 32) continue;
+      for (int channel = 0; channel < 32; ++channel) {
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "%s/h_%s_ch%02d",
+                      groups[page_index].c_str(),
+                      prefixes[page_index].c_str(), channel);
+        okay &= Check(standard.pads[channel] == expected,
+                      "pad order must be row-major channels 00 through 31");
+      }
+    }
+  }
+  const auto fallback = ana::PageConfigLoader{}.Load(nullptr);
+  okay &= Check(!fallback.odb_path_found && fallback.pages == defaults,
+                "missing ODB pages must use in-memory defaults");
+
+  auto standard_histograms = ana::DefaultHistogramConfigs();
+  std::vector<ana::HistogramConfig> selected;
+  for (auto& config : standard_histograms) {
+    if (config.group != "QDC0" && config.group != "TDC0" &&
+        config.group != "TLE0" && config.group != "TTR0")
+      continue;
+    if (config.hist_name.size() >= 4 &&
+        config.hist_name.substr(config.hist_name.size() - 4) == "ch05")
+      config.enabled = false;
+    selected.push_back(config);
+  }
+  pages.ClearCanvases();
+  histograms.ApplyConfigs(std::move(selected));
+  okay &= Check(pages.ApplyConfigs(defaults, &histograms),
+                "standard pages apply");
+  okay &= Check(pages.ActiveCount() == 4,
+                "all four standard canvases are present");
+  for (std::size_t page_index = 0; page_index < expected_names.size(); ++page_index) {
+    auto* standard_canvas = dynamic_cast<TCanvas*>(
+        page_directory->Get(expected_names[page_index].c_str()));
+    okay &= Check(standard_canvas && standard_canvas->GetPad(32),
+                  "standard canvas has 32 pads");
+    if (!standard_canvas) continue;
+    for (int channel = 0; channel < 32; ++channel) {
+      auto* pad = standard_canvas->GetPad(channel + 1);
+      const bool expected_histogram = channel != 5;
+      const auto& path = defaults[page_index].pads[channel];
+      const auto name = path.substr(path.find('/') + 1);
+      okay &= Check(pad &&
+                        (pad->GetListOfPrimitives()->FindObject(name.c_str()) !=
+                         nullptr) == expected_histogram,
+                    "channel pad draws enabled histogram or stays empty");
+    }
+  }
 
   pages.ClearCanvases();
   histograms.ApplyConfigs({histogram_configs.front()});

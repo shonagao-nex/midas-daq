@@ -176,6 +176,7 @@ add_test(NAME event_diagnostics_test COMMAND event_diagnostics_test)
 add_executable(event_builder_test
   tests/EventBuilderTest.cxx
   src/EventBuilder.cxx
+  src/EventDiagnostics.cxx
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
   decoder/V1190Decoder.cxx
@@ -192,6 +193,8 @@ add_test(NAME event_builder_test COMMAND event_builder_test)
 
 add_executable(histogram_config_loader_test
   tests/HistogramConfigLoaderTest.cxx
+  src/PageConfig.cxx
+  src/PageConfigLoader.cxx
   src/HistogramConfigLoader.cxx
   src/HistogramOdbInitializer.cxx
   src/OnlineHistogramPrescale.cxx
@@ -240,6 +243,7 @@ add_test(NAME histogram_pdf_writer_test COMMAND histogram_pdf_writer_test)
 add_executable(page_manager_test
   tests/PageManagerTest.cxx
   src/PageConfig.cxx
+  src/PageConfigLoader.cxx
   src/PageManager.cxx
   src/HistogramManager.cxx
   src/HistogramConfig.cxx
@@ -259,6 +263,7 @@ target_link_libraries(page_manager_test PRIVATE
   ROOT::Hist
   ROOT::Graf
   ROOT::Gpad
+  midas::midas
 )
 add_test(NAME page_manager_test COMMAND page_manager_test)
 

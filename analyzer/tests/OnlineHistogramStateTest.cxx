@@ -30,15 +30,22 @@ int main() {
   TMemFile root("online_histogram_state_test.root", "RECREATE");
   ana::OnlineHistogramState state;
   ana::PageConfig page{"Monitor", 3, 3, {"QDC0/h_qdc0_ch00"}};
-  bool okay = Check(state.BeginRun(&root, {Config(100)}, {page}, 42),
-                    "first BOR books histograms and page");
+  bool okay = Check(state.Initialize(&root, {Config(100)}, {page}),
+                    "startup books histograms and page");
   auto* first = state.histograms.FindHistogram("QDC0/h_qdc0_ch00");
-  ana::DecodedEvent event;
-  event.v792.qdc0[0] = 12;
-  state.histograms.Fill(event);
   auto* pages_dir = root.GetDirectory("Pages");
   auto* first_page = pages_dir
       ? dynamic_cast<TCanvas*>(pages_dir->Get("Monitor")) : nullptr;
+  okay &= Check(first && first->GetEntries() == 0 && first_page,
+                "startup publishes empty histogram and page before BOR");
+  okay &= Check(state.BeginRun(&root, {Config(100)}, {page}, 42),
+                "first BOR accepts startup objects");
+  okay &= Check(state.histograms.FindHistogram("QDC0/h_qdc0_ch00") == first &&
+                    pages_dir->Get("Monitor") == first_page,
+                "BOR with unchanged ODB config reuses startup objects");
+  ana::DecodedEvent event;
+  event.v792.qdc0[0] = 12;
+  state.histograms.Fill(event);
   okay &= Check(first && first->GetEntries() == 1,
                 "RUNNING Fill increments entries");
   okay &= Check(first_page != nullptr, "RUNNING page exists");
@@ -62,14 +69,32 @@ int main() {
                 "PDF output is nonempty");
   std::filesystem::remove(pdf_path);
 
-  okay &= Check(state.BeginRun(&root, {Config(25)}, {page}, 43),
-                "next BOR accepts latest configuration");
+  okay &= Check(state.BeginRun(&root, {Config(100)}, {page}, 43),
+                "next BOR resets unchanged configuration");
+  okay &= Check(state.histograms.FindHistogram("QDC0/h_qdc0_ch00") == first &&
+                    first->GetEntries() == 0 &&
+                    pages_dir->Get("Monitor") == first_page,
+                "next BOR resets histogram without replacing it or its page");
+  state.histograms.Fill(event);
+  state.EndRun();
+
+  okay &= Check(state.BeginRun(&root, {Config(25)}, {page}, 44),
+                "BOR accepts changed histogram configuration");
   auto* second = state.histograms.FindHistogram("QDC0/h_qdc0_ch00");
   okay &= Check(second && second->GetNbinsX() == 25 &&
                     second->GetEntries() == 0,
-                "next BOR rebooks latest bins and resets contents");
+                "structural ODB change rebooks histogram with empty contents");
   okay &= Check(pages_dir->Get("Monitor") != nullptr,
-                "next BOR rebuilds page");
+                "histogram change rebuilds page references");
+  state.EndRun();
+
+  ana::PageConfig updated_page{"Updated", 3, 3,
+                                {"QDC0/h_qdc0_ch00"}};
+  okay &= Check(state.BeginRun(&root, {Config(25)}, {updated_page}, 45),
+                "BOR accepts changed page configuration");
+  okay &= Check(pages_dir->Get("Updated") != nullptr &&
+                    pages_dir->Get("Monitor") == nullptr,
+                "page ODB change replaces old canvas");
   state.EndRun();
   state.Clear();
   if (!okay) return 1;

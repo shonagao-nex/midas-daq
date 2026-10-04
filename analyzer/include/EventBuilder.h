@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 
 class TMEvent;
@@ -48,6 +49,14 @@ class EventBuilder {
 
   const Statistics& GetStatistics() const { return statistics_; }
   std::size_t PendingCount() const { return pending_.size(); }
+  std::optional<std::uint32_t> OldestPendingSerial() const {
+    if (pending_.empty()) return std::nullopt;
+    return pending_.begin()->first;
+  }
+  std::optional<std::uint32_t> NewestPendingSerial() const {
+    if (pending_.empty()) return std::nullopt;
+    return pending_.rbegin()->first;
+  }
 
  private:
   struct PendingEvent {

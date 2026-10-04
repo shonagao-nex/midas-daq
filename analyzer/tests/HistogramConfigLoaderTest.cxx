@@ -1,6 +1,7 @@
 #include "HistogramConfigLoader.h"
 #include "HistogramOdbInitializer.h"
 #include "OnlineHistogramPrescale.h"
+#include "PageConfigLoader.h"
 
 #include "mvodb.h"
 
@@ -223,14 +224,20 @@ class TrackingOdb final : public MVOdb {
     SetOk(error);                                                        \
   }
   UNUSED_SCALAR_WRITE(WB, bool)
-  UNUSED_SCALAR_WRITE(WI, int)
   UNUSED_SCALAR_WRITE(WD, double)
   UNUSED_SCALAR_WRITE(WF, float)
   UNUSED_SCALAR_WRITE(WU16, uint16_t)
   UNUSED_SCALAR_WRITE(WU32, uint32_t)
   UNUSED_SCALAR_WRITE(WU64, uint64_t)
 #undef UNUSED_SCALAR_WRITE
-  void WS(const char*, const char*, int, MVOdbError* error) override {
+  void WI(const char* name, int value, MVOdbError* error) override {
+    node_->values[name] = value;
+    ++state_->write_operations;
+    SetOk(error);
+  }
+  void WS(const char* name, const char* value, int,
+          MVOdbError* error) override {
+    node_->values[name] = std::string(value);
     ++state_->write_operations;
     SetOk(error);
   }
@@ -542,6 +549,37 @@ int main() {
   okay &= Check(prescale.EffectiveValue() == 1 &&
                     selected(ana::AnalyzerMode::kOnline) == 17426,
                 "live 10-to-1 update should restore full histogram fill");
+
+  ana::PageConfigLoader page_loader;
+  TrackingOdb page_odb;
+  const auto page_fallback = page_loader.Load(&page_odb);
+  okay &= Check(!page_fallback.odb_path_found &&
+                    page_fallback.pages == ana::DefaultPageConfigs() &&
+                    page_odb.CreateOperations() == 0 &&
+                    page_odb.WriteOperations() == 0,
+                "missing page ODB path must use read-only defaults");
+  okay &= Check(page_loader.CreateDefaults(&page_odb),
+                "explicit page initialization must create missing tree");
+  const auto initialized_pages = page_loader.Load(&page_odb);
+  okay &= Check(initialized_pages.odb_path_found &&
+                    initialized_pages.loaded_from_odb &&
+                    initialized_pages.pages.size() == 4 &&
+                    page_odb.WriteOperations() == 4 * 34,
+                "four pages must be readable with Rows, Columns, and 32 pads");
+  const auto defaults_pages = ana::DefaultPageConfigs();
+  for (const auto& expected : defaults_pages) {
+    const auto found = std::find_if(
+        initialized_pages.pages.begin(), initialized_pages.pages.end(),
+        [&](const ana::PageConfig& page) { return page.name == expected.name; });
+    okay &= Check(found != initialized_pages.pages.end() && *found == expected,
+                  "page ODB round trip must preserve all channel pads");
+  }
+  const int existing_writes = page_odb.WriteOperations();
+  okay &= Check(!page_loader.CreateDefaults(&page_odb) &&
+                    page_odb.WriteOperations() == existing_writes &&
+                    page_loader.Load(&page_odb).pages ==
+                        initialized_pages.pages,
+                "existing page tree must reject initialization without writes");
 
   if (!okay) return 1;
   std::printf("HistogramConfigLoader tests passed\n");

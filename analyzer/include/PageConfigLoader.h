@@ -17,8 +17,11 @@ class PageConfigLoader {
     bool loaded_from_odb = false;
   };
 
-  // Read-only loader. Missing /Analyzer/Pages is a normal empty result.
+  // Read-only loader. Missing /Analyzer/Pages uses in-memory defaults.
   Result Load(MVOdb* odb) const;
+
+  // Explicit initialization only; existing /Analyzer/Pages is never changed.
+  bool CreateDefaults(MVOdb* odb) const;
 
   static constexpr const char* kOdbPath = "/Analyzer/Pages";
 };

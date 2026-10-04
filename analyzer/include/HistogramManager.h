@@ -27,6 +27,7 @@ class HistogramManager {
   bool BeginRun(TDirectory* parent_directory, bool write_at_end);
   bool ApplyConfigs(std::vector<HistogramConfig> configs);
   bool ConfigsMatch(const std::vector<HistogramConfig>& configs) const;
+  void Reset();
   void Fill(const DecodedEvent& event);
   void EndRun();
 

@@ -116,6 +116,10 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
       result.init_hist_odb = true;
       continue;
     }
+    if (argument == "--init-page-odb") {
+      result.init_page_odb = true;
+      continue;
+    }
     if (argument == "--debug-events") {
       result.inspector_options.debug_events = true;
       continue;
@@ -210,12 +214,13 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   result.inspector_options.mode =
       offline ? AnalyzerMode::kOffline : AnalyzerMode::kOnline;
 
-  if (result.init_hist_odb) {
-    if (!requested_input.empty() || !positional_inputs.empty() ||
+  if (result.init_hist_odb || result.init_page_odb) {
+    if ((result.init_hist_odb && result.init_page_odb) ||
+        !requested_input.empty() || !positional_inputs.empty() ||
         !requested_output.empty() || has_limit || has_legacy_root_output ||
         has_http_port || result.inspector_options.debug_events ||
         !management_incompatible_option.empty()) {
-      result.error = "--init-hist-odb cannot be combined with analysis, "
+      result.error = "ODB initialization cannot be combined with analysis, "
                      "event-loop, or ROOT output options";
       return result;
     }
@@ -258,6 +263,7 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "  " << program_name << " [online options]\n"
        << "  " << program_name << " -f INPUT [offline options]\n"
        << "  " << program_name << " --init-hist-odb [connection options]\n\n"
+       << "  " << program_name << " --init-page-odb [connection options]\n\n"
        << "Options:\n"
        << "  -f FILE    Input MIDAS file for offline analysis\n"
        << "  -w FILE    Offline ROOT output filename\n"
@@ -270,6 +276,9 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "  --init-hist-odb\n"
        << "      Create default histogram configuration in MIDAS ODB and exit.\n"
        << "      Existing configuration is never overwritten.\n\n"
+       << "  --init-page-odb\n"
+       << "      Create four default Online Pages in MIDAS ODB and exit.\n"
+       << "      Existing /Analyzer/Pages is never overwritten.\n\n"
        << "Online defaults:\n"
        << "  No -f selects live MIDAS mode and enables ROOT THttpServer on "
           "0.0.0.0:8082. No ROOT file is created.\n"
