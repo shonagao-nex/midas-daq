@@ -643,6 +643,8 @@ bool initialize_acquisition_settings_odb() {
   const BOOL no = FALSE;
   if (!ensure_odb_value(odb_path(kSettingsPath, "Enabled"),
                         &yes, sizeof(yes), 1, TID_BOOL) ||
+      !ensure_odb_value(odb_path(kSettingsPath, "FrontendEnabled"),
+                        &yes, sizeof(yes), 1, TID_BOOL) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Network/IPAddress"),
                         default_ip, sizeof(default_ip), 1, TID_STRING) ||
       !ensure_odb_value(odb_path(kSettingsPath, "Acquisition/ADCEnabled"),

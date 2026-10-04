@@ -298,6 +298,8 @@ struct StatusInputs {
   BOOL easiroc_connected;
   BOOL easiroc_status_fresh;
   BOOL logger_connected;
+  BOOL vme_frontend_enabled;
+  BOOL easiroc_frontend_enabled;
   BOOL vme_configuration_ok;
   INT vme_configuration_run_number;
   std::uint64_t vme_configuration_checked_unix;
@@ -508,6 +510,12 @@ StatusInputs collect_status_inputs() {
   inputs.collection_ok = true;
   collect_runinfo_inputs(&inputs);
   collect_client_health_inputs(&inputs);
+  inputs.vme_frontend_enabled = TRUE;
+  inputs.easiroc_frontend_enabled = TRUE;
+  read_value(gDatabase, "/Equipment/VME/Settings/FrontendEnabled",
+             TID_BOOL, &inputs.vme_frontend_enabled);
+  read_value(gDatabase, "/Equipment/EASIROC/Settings/FrontendEnabled",
+             TID_BOOL, &inputs.easiroc_frontend_enabled);
   collect_configuration_inputs(&inputs);
   collect_vme_inputs(&inputs);
   collect_easiroc_inputs(&inputs);
@@ -564,6 +572,8 @@ StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
        timestamp_is_fresh(now_unix, previous_update_unix));
   raw_status.disk_free_gb = gMonitorState.disk.free_gb;
   raw_status.logger_connected = logger_connected != FALSE;
+  raw_status.vme_requested = inputs.vme_frontend_enabled != FALSE;
+  raw_status.easiroc_requested = inputs.easiroc_frontend_enabled != FALSE;
   const daq_monitor::ActiveParticipation participation =
       daq_monitor::resolve_run_participation(
           raw_status.run_state, run_number, inputs.run_participation);
@@ -897,6 +907,8 @@ INT validate_start_transition(INT run_number, char* error) {
   BOOL can_start = FALSE;
   BOOL vme_connected = FALSE;
   BOOL easiroc_connected = FALSE;
+  BOOL vme_enabled = FALSE;
+  BOOL easiroc_enabled = FALSE;
 
   // A successful synchronous collection makes freshness explicit without
   // sleeping or polling while this transition callback is running.
@@ -906,23 +918,28 @@ INT validate_start_transition(INT run_number, char* error) {
       !read_value(gDatabase, "/DAQ/Status/Frontends/VME/Connected", TID_BOOL,
                   &vme_connected) ||
       !read_value(gDatabase, "/DAQ/Status/Frontends/EASIROC/Connected", TID_BOOL,
-                  &easiroc_connected)) {
+                  &easiroc_connected) ||
+      !read_value(gDatabase, "/Equipment/VME/Settings/FrontendEnabled",
+                  TID_BOOL, &vme_enabled) ||
+      !read_value(gDatabase, "/Equipment/EASIROC/Settings/FrontendEnabled",
+                  TID_BOOL, &easiroc_enabled)) {
     evaluation = {false, "Monitor status unavailable"};
   } else {
     evaluation.allowed = can_start != FALSE;
   }
 
   if (evaluation.allowed &&
-      !record_run_participation(run_number, vme_connected != FALSE,
-                                easiroc_connected != FALSE)) {
+      !record_run_participation(run_number,
+                                vme_connected && vme_enabled,
+                                easiroc_connected && easiroc_enabled)) {
     evaluation = {false, "Cannot record frontend participation"};
   }
 
   if (evaluation.allowed) {
     cm_msg(MINFO, kClientName,
            "Run %d participants: VME=%s EASIROC=%s", run_number,
-           vme_connected != FALSE ? "yes" : "no",
-           easiroc_connected != FALSE ? "yes" : "no");
+           vme_connected && vme_enabled ? "yes" : "no",
+           easiroc_connected && easiroc_enabled ? "yes" : "no");
     if (error != nullptr)
       error[0] = '\0';
     return CM_SUCCESS;

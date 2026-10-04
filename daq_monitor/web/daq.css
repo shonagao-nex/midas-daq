@@ -18,3 +18,4 @@
 @media(max-width:1000px){.dashboard-pair,.secondary-pair{grid-template-columns:1fr}.equipment-section .equipment-table{min-width:680px}}
 @media(max-width:400px){.limits{grid-template-columns:minmax(0,1fr) 75px 43px}.limits label{white-space:normal}}
 @media(max-width:600px){.run-metadata{grid-template-columns:auto minmax(0,1fr);grid-template-rows:none}.run-metadata label[for="run-comment"],.run-metadata #run-comment{grid-column:auto;grid-row:auto}.run-metadata #run-comment{min-height:76px}}
+.transition-status.rejected{color:#b42318;font-weight:800}

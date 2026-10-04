@@ -121,10 +121,30 @@ V1720E, and RPV130. EASIROC uses `/Equipment/EASIROC/Settings/Enabled`, its
 network address setting, and its communication Variables. A missing ODB value
 is shown as `—`; the page does not fall back to a hard-coded value.
 
+The VME and EASIROC parent-row Enable switches use
+`/Equipment/{VME,EASIROC}/Settings/FrontendEnabled`. These settings select
+which connected frontends participate in the next run; they do not change any
+module Enable setting. The monitor records participation before BOR, and the
+frontends snapshot it in their RunSnapshot `Metadata/EnabledForRun` values.
+Connection, participation, and module readiness remain separate states.
+In STOPPED, the parent STATUS shows Disabled for FrontendEnabled=OFF,
+Not running for an enabled frontend absent from MIDAS Programs, and Connected
+for a connected frontend. During RUNNING or PAUSED, a frontend excluded from
+the recorded run participation shows Not participating. START requires every
+enabled frontend to be connected and names missing processes in the rejection.
+
 Enable controls are locked for RUNNING and PAUSED. While STOPPED, a change is
 written to the existing setting and then read back before the displayed state
 is accepted. The module-name links use mhttpd's installed
 `?cmd=odb&odb_path=...` URL form and point to the corresponding Settings tree.
+
+Run Status and the Equipment parent rows show MIDAS physics `Events sent`
+while RUNNING. After STOP, they show the last EOR-complete run's
+`/DAQ/Status/Runlog/{VMEEvents,EASIROCEvents}` values and label them
+`Last run <number>`. A rejected START may advance `/Runinfo/Run number` without
+changing this completed-run number. Missing EOR data shows `—`; a frontend
+absent from the completed run shows `N/A` (`-1` in Runlog). The Rate table
+continues to show current MIDAS Statistics.
 
 Raw hardware `EventCounter` values are deliberately excluded from the
 general-user HEALTH table. Their meanings and readout timing differ by module,
@@ -244,6 +264,13 @@ all events written by the Logger channel, including both streams.
 Start and Stop call the mhttpd JSON-RPC method `cm_transition` with
 `TR_START` or `TR_STOP`. The Start button directly follows the published
 `CanStart` value; the browser does not recalculate policy or severity.
+An accepted asynchronous START request remains pending until the final run
+state is observed. If STARTABORT returns to STOPPED after the run number
+advances, the page checks MIDAS Messages for that run's `start aborted`
+notification, releases the controls, and shows the monitor's CanStartReason or
+a MIDAS Messages fallback. The run-number change alone is not an abort signal:
+it can precede a successful BOR. A timeout releases a request whose final state
+cannot otherwise be confirmed.
 
 At START sequence 400, the monitor records the connected frontend set with the
 target run number and publishes the validity marker last. During that run only

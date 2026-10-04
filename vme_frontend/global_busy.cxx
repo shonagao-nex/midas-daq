@@ -250,7 +250,7 @@ INT after_start(INT run, char* error) {
     set_global_busy(true);
     return FE_ERR_ODB;
   }
-  const bool vme_ready = participants.vme &&
+  const bool vme_ready = !participants.vme ||
       ready("fevme", kStatus, true, run);
   cm_msg(MINFO, "global_busy", "START 600 fevme participant=%s Ready=%s",
          participants.vme ? "yes" : "no", vme_ready ? "yes" : "no");

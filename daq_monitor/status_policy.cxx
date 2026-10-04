@@ -151,11 +151,21 @@ ComponentStatus evaluate_easiroc(RunState run_state,
 CanStartEvaluation evaluate_can_start(const RawStatus& raw) {
   if (!raw.monitor_status_fresh)
     return {false, "Monitor status stale"};
-  if (!raw.vme.connected && !raw.easiroc.connected)
-    return {false, "No DAQ frontend running"};
-  if (raw.vme.connected && !raw.vme.status_fresh)
+  if (!raw.vme_requested && !raw.easiroc_requested)
+    return {false, "No frontend enabled for next run"};
+  std::string missing;
+  if (raw.vme_requested && !raw.vme.connected)
+    missing = "fevme";
+  if (raw.easiroc_requested && !raw.easiroc.connected) {
+    if (!missing.empty()) missing += ", ";
+    missing += "feeasiroc";
+  }
+  if (!missing.empty())
+    return {false, "Frontend not running: " + missing};
+  if (raw.vme_requested && raw.vme.connected && !raw.vme.status_fresh)
     return {false, "VME frontend status stale"};
-  if (raw.easiroc.connected && !raw.easiroc.status_fresh)
+  if (raw.easiroc_requested && raw.easiroc.connected &&
+      !raw.easiroc.status_fresh)
     return {false, "EASIROC frontend status stale"};
   if (raw.disk_free_gb < 0.0)
     return {false, "Disk free unavailable"};

@@ -79,6 +79,8 @@ struct RawStatus {
   bool monitor_status_fresh = false;
   double disk_free_gb = -1.0;
   bool logger_connected = false;
+  bool vme_requested = true;
+  bool easiroc_requested = true;
   VmeRawStatus vme;
   EasirocRawStatus easiroc;
   ConfigurationRawStatus vme_configuration;

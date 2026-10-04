@@ -69,6 +69,7 @@ using easiroc_odb::set_firmware_readback_valid;
 // access. All communication is explicit in BOR, polling, and cleanup paths.
 struct FrontendState {
   FrontendSettings settings;
+  bool frontend_enabled_for_run = true;
   bool run_active = false;
   easiroc::DaqControl daq_control;
 
@@ -763,7 +764,7 @@ void handle_acquisition_error(const std::string& message) {
 void populate_run_snapshot(const FrontendSettings& settings) {
   auto& snapshot = g_state.run_snapshot;
   snapshot.requested = settings;
-  snapshot.enabled_for_run = settings.enabled;
+  snapshot.enabled_for_run = g_state.frontend_enabled_for_run;
   snapshot.firmware =
       settings.enabled && g_state.firmware_observation.valid &&
               g_state.firmware_observation.observed_ip_address ==
@@ -821,7 +822,7 @@ void warn_for_bor_consistency(
 //************************************//
 bool configuration_ready(const FrontendSettings& settings) {
   if (!g_state.run_snapshot.frontend_bor_complete) return false;
-  if (!settings.enabled) return true;
+  if (!g_state.frontend_enabled_for_run || !settings.enabled) return true;
   return g_state.runtime.enabled_for_run &&
          g_state.runtime.rbcp_communication_ok &&
          g_state.runtime.tcp_reachable && g_state.runtime.tcp_connected &&
@@ -951,10 +952,32 @@ INT begin_of_run(INT run_number, char* error) {
     mark_configuration_failed(run_number);
     return status;
   }
+  BOOL participation_valid = FALSE, frontend_enabled = FALSE;
+  INT participation_run = 0;
+  INT size = sizeof(participation_valid);
+  bool participation_ok = db_get_value(hDB, 0,
+      "/DAQ/Status/Run/ParticipationValid", &participation_valid, &size,
+      TID_BOOL, FALSE) == DB_SUCCESS;
+  size = sizeof(participation_run);
+  participation_ok = db_get_value(hDB, 0,
+      "/DAQ/Status/Run/ParticipationRunNumber", &participation_run, &size,
+      TID_INT, FALSE) == DB_SUCCESS && participation_ok;
+  size = sizeof(frontend_enabled);
+  participation_ok = db_get_value(hDB, 0,
+      "/DAQ/Status/Run/EASIROCParticipating", &frontend_enabled, &size,
+      TID_BOOL, FALSE) == DB_SUCCESS && participation_ok;
+  if (!participation_ok || !participation_valid || participation_run != run_number) {
+    if (error != nullptr)
+      std::snprintf(error, 256, "Cannot read EASIROC run participation");
+    mark_configuration_failed(run_number);
+    return FE_ERR_ODB;
+  }
+  g_state.frontend_enabled_for_run = frontend_enabled != FALSE;
 
   if (const auto validation_error =
           easiroc::validateAsicSlowControlBorSettings(
-              run_settings.enabled, run_settings.asic_slow_control)) {
+              g_state.frontend_enabled_for_run && run_settings.enabled,
+              run_settings.asic_slow_control)) {
     cm_msg(MERROR, "begin_of_run", "%s", validation_error->c_str());
     if (error != nullptr)
       std::snprintf(error, 256, "%s", validation_error->c_str());
@@ -981,19 +1004,21 @@ INT begin_of_run(INT run_number, char* error) {
       run_settings.asic_slow_control, bor_last_applied,
       bor_hardware_state_indeterminate);
   if (easiroc::shouldWarnForAsicSlowControlConsistency(
-          run_settings.enabled, g_state.run_snapshot.consistency)) {
+          g_state.frontend_enabled_for_run && run_settings.enabled,
+          g_state.run_snapshot.consistency)) {
     warn_for_bor_consistency(g_state.run_snapshot.consistency);
   }
 
   g_state.settings = run_settings;
-  if (!publish_global_busy_ready(run_settings.enabled, false, 0))
+  if (!publish_global_busy_ready(
+          g_state.frontend_enabled_for_run && run_settings.enabled, false, 0))
     return FE_ERR_ODB;
   // Capture the validated requested configuration before any BOR hardware
   // access. The completed snapshot is published only after acquisition setup
   // succeeds, preserving FrontendBORComplete semantics.
   populate_run_snapshot(run_settings);
   g_state.run_active = true;
-  if (!run_settings.enabled) {
+  if (!g_state.frontend_enabled_for_run || !run_settings.enabled) {
     set_disabled_runtime_state();
     if (!finalize_run_snapshot(run_settings)) {
       g_state.run_active = false;
@@ -1024,8 +1049,14 @@ INT begin_of_run(INT run_number, char* error) {
       mark_configuration_failed(run_number);
       return FE_ERR_ODB;
     }
+    if (g_state.frontend_enabled_for_run &&
+        !publish_global_busy_ready(true, true, run_number)) {
+      if (error != nullptr)
+        std::snprintf(error, 256, "Cannot publish EASIROC DAQReady");
+      return FE_ERR_ODB;
+    }
     cm_msg(MINFO, "begin_of_run",
-           "Run %d: NIM-EASIROC disabled by BOR Settings snapshot; "
+           "Run %d: NIM-EASIROC frontend or module disabled at BOR; "
            "hardware access skipped",
            run_number);
     return SUCCESS;

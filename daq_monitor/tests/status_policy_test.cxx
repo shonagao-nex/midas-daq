@@ -265,22 +265,30 @@ void test_can_start() {
   EXPECT(evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason.empty());
 
-  // A single connected, fresh frontend is a valid DAQ configuration.
-  raw.vme.connected = false;
-  raw.vme.status_fresh = false;
-  EXPECT(evaluate_can_start(raw).allowed);
+  // Every enabled frontend must be connected; disabled frontends are optional.
+  for (int enabled = 0; enabled < 4; ++enabled) {
+    for (int connected = 0; connected < 4; ++connected) {
+      raw = normal_raw(RunState::kStopped);
+      raw.vme_requested = (enabled & 1) != 0;
+      raw.easiroc_requested = (enabled & 2) != 0;
+      raw.vme.connected = (connected & 1) != 0;
+      raw.easiroc.connected = (connected & 2) != 0;
+      raw.vme.status_fresh = raw.vme.connected;
+      raw.easiroc.status_fresh = raw.easiroc.connected;
+      const bool expected = enabled != 0 && (enabled & connected) == enabled;
+      EXPECT(evaluate_can_start(raw).allowed == expected);
+    }
+  }
   raw = normal_raw(RunState::kStopped);
-  raw.easiroc.connected = false;
-  raw.easiroc.status_fresh = false;
-  EXPECT(evaluate_can_start(raw).allowed);
-
-  raw = normal_raw(RunState::kStopped);
   raw.vme.connected = false;
-  raw.vme.status_fresh = false;
+  EXPECT(evaluate_can_start(raw).reason == "Frontend not running: fevme");
   raw.easiroc.connected = false;
-  raw.easiroc.status_fresh = false;
-  EXPECT(!evaluate_can_start(raw).allowed);
-  EXPECT(evaluate_can_start(raw).reason == "No DAQ frontend running");
+  EXPECT(evaluate_can_start(raw).reason ==
+         "Frontend not running: fevme, feeasiroc");
+  raw.vme_requested = false;
+  EXPECT(evaluate_can_start(raw).reason == "Frontend not running: feeasiroc");
+  raw.easiroc_requested = false;
+  EXPECT(evaluate_can_start(raw).reason == "No frontend enabled for next run");
 
   raw = normal_raw(RunState::kStopped);
   raw.disk_free_gb = 10.0;
@@ -308,14 +316,10 @@ void test_can_start() {
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason == "Monitor status stale");
   raw = normal_raw(RunState::kStopped);
-  raw.easiroc.connected = false;
-  raw.easiroc.status_fresh = false;
   raw.vme.status_fresh = false;
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason == "VME frontend status stale");
   raw = normal_raw(RunState::kStopped);
-  raw.vme.connected = false;
-  raw.vme.status_fresh = false;
   raw.easiroc.status_fresh = false;
   EXPECT(!evaluate_can_start(raw).allowed);
   EXPECT(evaluate_can_start(raw).reason ==
@@ -324,6 +328,7 @@ void test_can_start() {
   // Stale or failed configuration metadata is diagnostic only. Each connected
   // frontend establishes the current run's configuration in its own BOR.
   raw = normal_raw(RunState::kStopped);
+  raw.vme_requested = false;
   raw.vme.connected = false;
   raw.vme.status_fresh = false;
   raw.vme_configuration = {true, 41, 999};

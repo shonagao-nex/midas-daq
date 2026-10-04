@@ -29,7 +29,7 @@ int main() {
   const ParticipantReadiness disconnected{false, false, 0};
   const ParticipantReadiness wrong_run{true, true, run - 1};
 
-  // VME is mandatory; EASIROC is checked only if recorded as a participant.
+  // Each frontend is checked only if recorded as a participant.
   require(ready_for_run(true, ready, run) &&
               ready_for_run(false, disconnected, run),
           "VME-only run must accept disconnected EASIROC");
@@ -52,9 +52,9 @@ int main() {
               code.find("/DAQ/Status/Run/VMEParticipating") != std::string::npos &&
               code.find("/DAQ/Status/Run/EASIROCParticipating") != std::string::npos,
           "START 600 must use the recorded run participants");
-  require(code.find("const bool vme_ready = participants.vme &&") != std::string::npos &&
+  require(code.find("const bool vme_ready = !participants.vme ||") != std::string::npos &&
               code.find("participants.easiroc, run)") != std::string::npos,
-          "VME must be mandatory and EASIROC must use its participation flag");
+          "both frontends must use their participation flags");
   require(code.find("if (!participating) return ready_for_run(false, {}, run);") !=
               std::string::npos,
           "nonparticipant must bypass client and DAQReady lookup");

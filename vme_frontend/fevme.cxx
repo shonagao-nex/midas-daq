@@ -105,6 +105,7 @@ static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 //************************************//
 struct VmeState {
     bool readout_failed = false;
+    bool frontend_enabled_for_run = true;
     std::atomic<bool> blt_stop_requested{false};
     V1190_FIFO_BLT_STATE v1190_fifo_blt = {};
     DWORD rpv130_last_poll = 0;
@@ -117,6 +118,7 @@ static const char *VME_RUN_SNAPSHOT_PATH = "/Equipment/VME/RunSnapshot";
 static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
+static const char *FRONTEND_ENABLED_PATH = "/Equipment/VME/Settings/FrontendEnabled";
 
 /* Retain first-ten-event timing probes to preserve the readout sequence. */
 static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
@@ -1644,9 +1646,7 @@ static void capture_vme_requested_snapshot()
     gVmeModuleState.snapshot.rpv130_single_event_busy_enabled =
         gVmeState.single_event_busy_enabled_for_run ? TRUE : FALSE;
     gVmeModuleState.snapshot.enabled_for_run =
-        (gVmeConfig.v792.enabled || gV1190Config.run_settings.enabled ||
-         gVmeConfig.v775.enabled || gV1720State.run.settings.enabled ||
-         gVmeState.rpv130_enabled_for_run) ? TRUE : FALSE;
+        gVmeState.frontend_enabled_for_run ? TRUE : FALSE;
 }
 
 //************************************//
@@ -2374,6 +2374,10 @@ static INT verify_startup_run_state(INT *current_run_state)
 //************************************//
 static INT initialize_frontend_odb_schema()
 {
+    const BOOL enabled = TRUE;
+    if (!vme_odb::ensure_odb_value(FRONTEND_ENABLED_PATH, &enabled,
+                                   sizeof(enabled), 1, TID_BOOL))
+        return FE_ERR_ODB;
     if (!initialize_rpv130_odb() || !initialize_other_module_odb() ||
         !initialize_v1720e_odb() || !initialize_run_counters_odb() ||
         !initialize_buffer_clear_mailbox()) {
@@ -2645,6 +2649,30 @@ INT begin_of_run(INT run_number, char *error)
         return finish(FE_ERR_ODB);
     }
     vme_odb::reset_run_snapshot(gVmeModuleState.snapshot, run_number, frontend_name);
+    BOOL participation_valid = FALSE, frontend_enabled = FALSE;
+    INT participation_run = 0;
+    if (!get_absolute_odb_value("/DAQ/Status/Run/ParticipationValid",
+                                &participation_valid, sizeof(participation_valid), TID_BOOL) ||
+        !get_absolute_odb_value("/DAQ/Status/Run/ParticipationRunNumber",
+                                &participation_run, sizeof(participation_run), TID_INT) ||
+        !get_absolute_odb_value("/DAQ/Status/Run/VMEParticipating",
+                                &frontend_enabled, sizeof(frontend_enabled), TID_BOOL) ||
+        !participation_valid || participation_run != run_number) {
+        snprintf(error, 256, "Cannot read VME run participation");
+        return finish(FE_ERR_ODB);
+    }
+    gVmeState.frontend_enabled_for_run = frontend_enabled != FALSE;
+    if (!gVmeState.frontend_enabled_for_run) {
+        gVmeModuleState.snapshot.enabled_for_run = FALSE;
+        gVmeModuleState.snapshot.frontend_bor_complete = TRUE;
+        if (!vme_odb::publish_run_snapshot(gVmeModuleState.snapshot) ||
+            !publish_configuration_status(true, run_number) ||
+            !global_busy::publish_ready(false, false, 0)) {
+            snprintf(error, 256, "Cannot publish disabled VME frontend state");
+            return finish(FE_ERR_ODB);
+        }
+        return finish(SUCCESS);
+    }
 
     if (!validate_and_snapshot_module_settings() ||
         !v1720e_config::snapshot_run_settings(gV1720State) ||
@@ -2756,6 +2784,10 @@ INT begin_of_run(INT run_number, char *error)
 INT end_of_run(INT run_number, char *error)
 {
     global_busy::disable_readout();
+    if (!gVmeState.frontend_enabled_for_run) {
+        global_busy::publish_ready(false, false, 0);
+        return SUCCESS;
+    }
     global_busy::publish_ready(true, false, 0);
     bool restore_failed = false;
     printf("End run %d\n", run_number);
@@ -2806,11 +2838,11 @@ static INT start_abort(INT run_number, char *error)
     /* A successful BOR enables the legacy MFE readout before another client
      * can fail the common START. Stop software readout before hardware. */
     readout_enable(FALSE);
-    const bool rpv130_stopped =
+    const bool rpv130_stopped = !gVmeState.frontend_enabled_for_run ||
         quiesce_rpv130_single_event_busy("STARTABORT");
     V1720StopOutcome stop_outcome = V1720StopOutcome::Disabled;
-    const bool stopped = stop_v1720e_and_publish_state(
-        "STARTABORT rollback", &stop_outcome);
+    const bool stopped = !gVmeState.frontend_enabled_for_run ||
+        stop_v1720e_and_publish_state("STARTABORT rollback", &stop_outcome);
 
     gVmeModuleState.snapshot.frontend_bor_complete = FALSE;
     vme_odb::publish_run_snapshot(gVmeModuleState.snapshot);
@@ -2877,6 +2909,10 @@ INT frontend_loop()
     };
     if (due(now, gVmeStatistics.run_counters_last_publish, gVmeStatistics.run_counters_dirty))
         publish_run_counters();
+    if (run_state == STATE_RUNNING && !gVmeState.frontend_enabled_for_run) {
+        ss_sleep(FRONTEND_IDLE_SLEEP_MS);
+        return SUCCESS;
+    }
     if(gVmeConfig.v792.enabled && due(now,gVmeModuleState.v792_last_publish,gVmeModuleState.v792.dirty)) {
         WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v792.event_counter;
         if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 runtime Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 runtime Status2")) {
@@ -2920,6 +2956,8 @@ INT frontend_loop()
 //************************************//
 INT poll_event(INT source, INT count, BOOL test)
 {
+    if (!gVmeState.frontend_enabled_for_run)
+        return 0;
     if (!global_busy::readout_allowed())
         return 0;
     if (!gVme || gVmeState.readout_failed ||
@@ -3104,6 +3142,8 @@ static INT build_midas_event(char *pevent,
 //************************************//
 INT read_vme_event(char *pevent, INT off)
 {
+    if (!gVmeState.frontend_enabled_for_run)
+        return 0;
     Rpv130EventTiming timing;
     if (gVmeState.single_event_busy_enabled_for_run &&
         gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
