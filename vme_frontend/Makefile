@@ -55,9 +55,9 @@ COMMON_OBJS = $(BUILD_DIR)/caenvme.o \
            $(BUILD_DIR)/v1720e.o \
            $(BUILD_DIR)/rpv130.o \
            $(BUILD_DIR)/manual_buffer_clear.o
-OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/module_status_snapshot.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1190_micro.o $(BUILD_DIR)/v1190_clear.o $(BUILD_DIR)/v1190_readout.o $(BUILD_DIR)/v1720e_integrity.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/v792_config.o $(BUILD_DIR)/v792_readout.o $(BUILD_DIR)/v775_config.o $(BUILD_DIR)/v775_readout.o $(BUILD_DIR)/global_busy.o \
+OBJS = $(BUILD_DIR)/fevme.o $(BUILD_DIR)/module_status_snapshot.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1190_micro.o $(BUILD_DIR)/v1190.o $(BUILD_DIR)/v1190_readout.o $(BUILD_DIR)/v1720e_integrity.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/v792_config.o $(BUILD_DIR)/v792_readout.o $(BUILD_DIR)/v775_config.o $(BUILD_DIR)/v775_readout.o $(BUILD_DIR)/global_busy.o \
        $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
-DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/module_status_snapshot.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1190_micro.o $(BUILD_DIR)/v1190_clear.o $(BUILD_DIR)/v1190_readout.o $(BUILD_DIR)/v1720e_integrity.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/v792_config.o $(BUILD_DIR)/v792_readout.o $(BUILD_DIR)/v775_config.o $(BUILD_DIR)/v775_readout.o $(BUILD_DIR)/global_busy.o \
+DIAG_OBJS = $(BUILD_DIR)/fevme_diag.o $(BUILD_DIR)/module_status_snapshot.o $(BUILD_DIR)/vme_odb.o $(BUILD_DIR)/v1190_config.o $(BUILD_DIR)/v1190_micro.o $(BUILD_DIR)/v1190.o $(BUILD_DIR)/v1190_readout.o $(BUILD_DIR)/v1720e_integrity.o $(BUILD_DIR)/v1720e_config.o $(BUILD_DIR)/v7xx_config.o $(BUILD_DIR)/v792_config.o $(BUILD_DIR)/v792_readout.o $(BUILD_DIR)/v775_config.o $(BUILD_DIR)/v775_readout.o $(BUILD_DIR)/global_busy.o \
             $(BUILD_DIR)/out0_diagnostic.o $(COMMON_OBJS)
 RPV130_TEST_OBJ = $(BUILD_DIR)/tests/test_rpv130_status.o
 IDLE_POLICY_TEST = $(BIN_TEST_DIR)/test_fevme_idle_policy
@@ -227,7 +227,7 @@ $(V1190_FIFO_BLT_TEST): $(BUILD_DIR)/tests/test_v1190_fifo_blt32.o \
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $^ -lCAENVME
 
-$(V1190_CLEAR_MOCK_TEST): tests/test_v1190_clear_mock.cxx $(BUILD_DIR)/v1190_clear.o
+$(V1190_CLEAR_MOCK_TEST): tests/test_v1190_clear_mock.cxx $(BUILD_DIR)/v1190.o
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
@@ -267,11 +267,11 @@ $(BIN_TEST_DIR)/%: $(BUILD_DIR)/tests/%.o
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ $< -lCAENVME
 
-$(BUILD_DIR)/fevme.o: fevme.cxx v1720e_integrity.h vme_odb.h v1190_clear.h v1190_config.h v1720e_config.h v7xx_config.h
+$(BUILD_DIR)/fevme.o: fevme.cxx v1720e_integrity.h vme_odb.h v1190.h v1190_config.h v1720e_config.h v7xx_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(NORMAL_DEFINES) -c $< -o $@
 
-$(BUILD_DIR)/fevme_diag.o: fevme.cxx v1720e_integrity.h vme_odb.h v1190_clear.h v1190_config.h v1720e_config.h v7xx_config.h
+$(BUILD_DIR)/fevme_diag.o: fevme.cxx v1720e_integrity.h vme_odb.h v1190.h v1190_config.h v1720e_config.h v7xx_config.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(DIAGNOSTIC_DEFINES) -c $< -o $@
 
@@ -287,7 +287,7 @@ $(BUILD_DIR)/vme_odb.o: vme_odb.cxx vme_odb.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/v1190_clear.o: v1190_clear.cxx v1190_clear.h
+$(BUILD_DIR)/v1190.o: v1190.cxx v1190.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

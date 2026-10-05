@@ -27,6 +27,8 @@ std::string functionBody(const std::string& source, const char* begin,
 
 int main() {
   const std::string frontend = readFile("fevme.cxx");
+  require(frontend.find("#include \"v1190.h\"") != std::string::npos,
+          "frontend does not include V1190 device operations");
   const std::string driver = readFile("v1720e.c");
   const std::string v792 = readFile("v792_config.cxx");
   const std::string v775 = readFile("v775_config.cxx");
@@ -79,5 +81,5 @@ int main() {
               v1720.find("REG_SOFTWARE_RESET") == std::string::npos &&
               v1720.find("REG_CONFIG_RELOAD") == std::string::npos,
           "V1720E clear contains reset/reload command");
-  std::cout << "test_manual_buffer_clear_contract: 11 checks passed\n";
+  std::cout << "test_manual_buffer_clear_contract: 12 checks passed\n";
 }

@@ -23,7 +23,7 @@
 #include "out0_diagnostic.h"
 #include "vme_odb.h"
 #include "v1190_config.h"
-#include "v1190_clear.h"
+#include "v1190.h"
 #include "v1190_micro.h"
 #include "v1720e_config.h"
 #include "v1720e_integrity.h"

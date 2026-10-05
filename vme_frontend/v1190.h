@@ -1,5 +1,5 @@
-#ifndef V1190_CLEAR_H
-#define V1190_CLEAR_H
+#ifndef V1190_H
+#define V1190_H
 
 #include "midas.h"
 #include "mvmestd.h"
