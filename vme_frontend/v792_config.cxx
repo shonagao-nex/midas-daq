@@ -1,7 +1,33 @@
 #include "v792_config.h"
-#include "v7xx_config.h"
+#include "v792_basic.h"
+#include <cstring>
 
 namespace v792_config {
+
+V792Settings default_v792_settings()
+{
+    V792Settings s = {};
+    s.enabled = TRUE;
+    s.iped = 0x00FF;
+    s.zero_suppression_enabled = FALSE;
+    s.all_trigger_enabled = FALSE;
+    return s;
+}
+
+void capture_v792_readback(V792ReadbackSnapshot &snapshot, WORD firmware,
+                           WORD iped, WORD bits, BOOL zero_suppression,
+                           BOOL all_trigger, const WORD (&thresholds)[32],
+                           bool valid)
+{
+    snapshot.valid = valid ? TRUE : FALSE;
+    snapshot.firmware_revision = firmware;
+    snapshot.iped = iped;
+    snapshot.zero_suppression_enabled = zero_suppression;
+    snapshot.all_trigger_enabled = all_trigger;
+    snapshot.bit_set2_raw = bits;
+    std::memcpy(snapshot.threshold, thresholds, sizeof(thresholds));
+}
+
 
 // Apply IPED, zero suppression, and ALL TRG in the established order.
 bool configure_for_run(const Access &access, const V792Settings &settings)
@@ -9,8 +35,8 @@ bool configure_for_run(const Access &access, const V792Settings &settings)
   const DWORD zs_reg = settings.zero_suppression_enabled ? V792_BIT_CLEAR2_WO : V792_BIT_SET2_RW;
   const DWORD at_reg = settings.all_trigger_enabled ? V792_BIT_SET2_RW : V792_BIT_CLEAR2_WO;
   return access.write16(access.vme, access.base + V792_IPED_RW, settings.iped, "V792 Iped") &&
-         access.write16(access.vme, access.base + zs_reg, v7xx_config::kV792LowThreshold, "V792 zero suppression") &&
-         access.write16(access.vme, access.base + at_reg, v7xx_config::kV792AllTrigger, "V792 ALL TRG");
+         access.write16(access.vme, access.base + zs_reg, kV792LowThreshold, "V792 zero suppression") &&
+         access.write16(access.vme, access.base + at_reg, kV792AllTrigger, "V792 ALL TRG");
 }
 
 // Read V792 registers and compare their run settings.
@@ -22,8 +48,8 @@ VerifyStatus verify_configuration(const Access &access, const V792Settings &sett
       access.read_thresholds(access.vme, access.base, result.thresholds) != V792_MAX_CHANNELS)
     return VerifyStatus::ReadFailure;
 
-  result.zero_suppression = !(result.bits & v7xx_config::kV792LowThreshold);
-  result.all_trigger = !!(result.bits & v7xx_config::kV792AllTrigger);
+  result.zero_suppression = !(result.bits & kV792LowThreshold);
+  result.all_trigger = !!(result.bits & kV792AllTrigger);
   bool ok = true;
   const auto verify = [&](const char *item, unsigned expected, unsigned actual) {
     if (expected == actual) return true;
@@ -40,10 +66,7 @@ VerifyStatus verify_configuration(const Access &access, const V792Settings &sett
 // Write the Data Clear bit and then clear that bit.
 bool clear_data(const Access &access, bool manual)
 {
-  const char *set_desc = manual ? "V792 manual Data Clear set" : "V792 Data Clear set";
-  const char *clear_desc = manual ? "V792 manual Data Clear clear" : "V792 Data Clear clear";
-  return access.write16(access.vme, access.base + V792_BIT_SET2_RW, 0x0004, set_desc) &&
-         access.write16(access.vme, access.base + V792_BIT_CLEAR2_WO, 0x0004, clear_desc);
+  return v792_basic::clear_data(access.vme, access.base, access.write16, manual);
 }
 
 }

@@ -36,7 +36,7 @@ void reset() { calls.clear(); bits = status1 = 0; fail_address = 0; fail_occurre
 int main()
 {
   const v775_config::DiagnosticAccess access = {nullptr, 0, read16, write16, counter, sleep_ms};
-  v7xx_config::V775DiagnosticState state;
+  v775_config::V775DiagnosticState state;
   WORD readback = 0, s1 = 0, s2 = 0; DWORD count = 0; unsigned done = 0;
   reset();
   assert(v775_config::save_diagnostic_settings(access, state));

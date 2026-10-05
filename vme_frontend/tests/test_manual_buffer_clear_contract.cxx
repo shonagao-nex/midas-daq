@@ -30,8 +30,8 @@ int main() {
   require(frontend.find("#include \"v1190.h\"") != std::string::npos,
           "frontend does not include V1190 device operations");
   const std::string driver = readFile("v1720e.c");
-  const std::string v792 = readFile("v792_config.cxx");
-  const std::string v775 = readFile("v775_config.cxx");
+  const std::string v792 = readFile("v792_basic.h");
+  const std::string v775 = readFile("v775.h");
   const std::string clear = functionBody(
       frontend, "static bool validate_manual_buffer_clear_request(",
       "static bool verify_run_start_state()");

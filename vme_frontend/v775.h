@@ -119,6 +119,21 @@ void v775_FclrWindowSet(MVME_INTERFACE *mvme, DWORD base, WORD value);
 
 #ifdef __cplusplus
 }
+
+namespace v775_basic {
+
+// Preserve checked writes and the established Bit Set/Clear 2 order.
+inline bool clear_data(MVME_INTERFACE *vme, DWORD base,
+                       bool (*write16)(MVME_INTERFACE *, DWORD, WORD, const char *),
+                       bool manual)
+{
+  const char *set_desc = manual ? "V775 manual Data Clear set" : "V775 Data Clear set";
+  const char *clear_desc = manual ? "V775 manual Data Clear clear" : "V775 Data Clear clear";
+  return write16(vme, base + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, set_desc) &&
+         write16(vme, base + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, clear_desc);
+}
+
+}
 #endif
 
 #endif /* V775_LOCAL_DRIVER_H */

@@ -1,5 +1,6 @@
 #include "../v792_config.h"
-#include "../v7xx_config.h"
+#include "../v792_config.h"
+#include "../v775_config.h"
 #include <cassert>
 #include <cstdio>
 #include <string>
@@ -84,9 +85,9 @@ int main()
   assert(operations.size() == 3);
   assert(operations[0].address == kBase + V792_IPED_RW && operations[0].value == 0x00FF);
   assert(operations[1].address == kBase + V792_BIT_CLEAR2_WO &&
-         operations[1].value == v7xx_config::kV792LowThreshold);
+         operations[1].value == v792_config::kV792LowThreshold);
   assert(operations[2].address == kBase + V792_BIT_SET2_RW &&
-         operations[2].value == v7xx_config::kV792AllTrigger);
+         operations[2].value == v792_config::kV792AllTrigger);
 
   reset();
   settings.zero_suppression_enabled = FALSE;
@@ -103,14 +104,14 @@ int main()
   assert(operations.size() == 2);
 
   reset();
-  bits = v7xx_config::kV792AllTrigger;
+  bits = v792_config::kV792AllTrigger;
   v792_config::Readback result;
   assert(v792_config::verify_configuration(access, settings, result) == v792_config::VerifyStatus::Matched);
   assert(operations.size() == 4 && operations[3].kind == 'T');
   assert(result.firmware == firmware && result.thresholds[31] == 31);
 
   reset();
-  bits = v7xx_config::kV792LowThreshold;
+  bits = v792_config::kV792LowThreshold;
   assert(v792_config::verify_configuration(access, settings, result) == v792_config::VerifyStatus::Mismatch);
   assert(operations.size() == 4);
 

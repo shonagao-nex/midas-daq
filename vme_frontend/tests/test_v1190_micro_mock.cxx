@@ -1,4 +1,5 @@
-#include "../v1190_micro.h"
+#include "../v1190.h"
+#include "../v1190_config.h"
 #include <cassert>
 #include <cstdio>
 #include <vector>
@@ -68,7 +69,7 @@ int main()
   reset();
   values = {0x0001};
   WORD mode = 0;
-  assert(v1190_micro::read_acquisition_mode(access, mode));
+  assert(v1190_config::read_acquisition_mode(access, mode));
   assert(writes.size() == 1 && writes[0] == 0x0200 && mode == 0x0001);
 
   reset();

@@ -28,7 +28,7 @@ std::string section(const std::string& source, const char* begin,
 
 void gate_before_access(const std::string& body, const char* access,
                         const char* message) {
-  const auto gate = body.find("if (!global_busy::readout_allowed())\n        return 0;");
+  const auto gate = body.find("if (!global_busy::readout_allowed())\n    return 0;");
   require(gate != std::string::npos && gate < body.find(access), message);
 }
 }  // namespace

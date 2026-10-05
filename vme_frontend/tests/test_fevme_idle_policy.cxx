@@ -31,7 +31,7 @@ int main() {
   require(source.find("FRONTEND_IDLE_SLEEP_MS = 10") != std::string::npos,
           "STOPPED/PAUSED idle wait is not 10 ms");
   require(source.find("if (run_state != STATE_RUNNING)\n"
-                      "        ss_sleep(FRONTEND_IDLE_SLEEP_MS);") !=
+                      "    ss_sleep(FRONTEND_IDLE_SLEEP_MS);") !=
               std::string::npos,
           "frontend_loop does not yield CPU outside RUNNING");
 

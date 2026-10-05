@@ -1,5 +1,6 @@
 #include "../v775_config.h"
-#include "../v7xx_config.h"
+#include "../v792_config.h"
+#include "../v775_config.h"
 #include <cassert>
 #include <cstdio>
 #include <string>
@@ -77,7 +78,7 @@ int main()
 {
   const v775_config::Access access = {
       reinterpret_cast<MVME_INTERFACE *>(1), kBase, "test_v775_config_mock", read16, write16, read_thresholds};
-  const V775Settings settings = v7xx_config::default_v775_settings();
+  const V775Settings settings = v775_config::default_v775_settings();
 
   reset();
   assert(v775_config::configure_for_run(access, settings));

@@ -39,7 +39,6 @@ static const WORD V1190_MICRO_READ_OK = 0x0002;
 /* V1190 microcontroller opcodes and operands from the V1190 manual. */
 static const WORD V1190_OPCODE_TRIGGER_MATCH = 0x0000;
 static const WORD V1190_OPCODE_CONTINUOUS = 0x0100;
-static const WORD V1190_OPCODE_READ_ACQ_MODE = 0x0200;
 static const WORD V1190_OPCODE_SET_WINDOW_WIDTH = 0x1000;
 static const WORD V1190_OPCODE_SET_WINDOW_OFFSET = 0x1100;
 static const WORD V1190_OPCODE_SET_EXTRA_MARGIN = 0x1200;

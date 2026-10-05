@@ -1,13 +1,63 @@
 #include "v775_config.h"
-#include "v7xx_config.h"
+#include <cstring>
 
 namespace v775_config {
+
+V775Settings default_v775_settings()
+{
+    V775Settings s = {};
+    s.enabled = FALSE;
+    s.full_scale_range = 0x00FF; // nominal 140 ns / 35 ps LSB
+    s.over_range_enabled = TRUE;
+    s.low_threshold_enabled = TRUE;
+    s.common_stop = TRUE;
+    s.empty_program_enabled = TRUE;
+    s.valid_control_enabled = FALSE;
+    s.sliding_scale_enabled = FALSE;
+    s.all_trigger_enabled = FALSE;
+    return s;
+}
+
+void v775_run_bits(const V775Settings &settings, WORD &set, WORD &clear)
+{
+    set = 0;
+    clear = 0;
+#define V775BIT(flag, bit) do { if (flag) set |= bit; else clear |= bit; } while (0)
+    V775BIT(settings.over_range_enabled, V775_BIT2_OVER_RANGE);
+    V775BIT(settings.low_threshold_enabled, V775_BIT2_LOW_THRESHOLD);
+    V775BIT(settings.common_stop, V775_BIT2_COMMON_STOP);
+    V775BIT(settings.empty_program_enabled, V775_BIT2_EMPTY_PROGRAM);
+    V775BIT(settings.valid_control_enabled, V775_BIT2_VALID_CONTROL);
+    V775BIT(settings.sliding_scale_enabled, V775_BIT2_SLIDE_ENABLE);
+    V775BIT(settings.all_trigger_enabled, V775_BIT2_ALL_TRIGGER);
+#undef V775BIT
+}
+
+void capture_v775_readback(V775ReadbackSnapshot &snapshot, WORD firmware,
+                           WORD full_scale, WORD fast_clear, WORD bits,
+                           const WORD (&thresholds)[32], bool valid)
+{
+    snapshot.valid = valid ? TRUE : FALSE;
+    snapshot.firmware_revision = firmware;
+    snapshot.full_scale_range = full_scale;
+    snapshot.fast_clear_window = fast_clear;
+    snapshot.over_range_enabled = !!(bits & V775_BIT2_OVER_RANGE);
+    snapshot.low_threshold_enabled = !!(bits & V775_BIT2_LOW_THRESHOLD);
+    snapshot.common_stop = !!(bits & V775_BIT2_COMMON_STOP);
+    snapshot.empty_program_enabled = !!(bits & V775_BIT2_EMPTY_PROGRAM);
+    snapshot.valid_control_enabled = !!(bits & V775_BIT2_VALID_CONTROL);
+    snapshot.sliding_scale_enabled = !!(bits & V775_BIT2_SLIDE_ENABLE);
+    snapshot.all_trigger_enabled = !!(bits & V775_BIT2_ALL_TRIGGER);
+    snapshot.bit_set2_raw = bits;
+    std::memcpy(snapshot.threshold, thresholds, sizeof(thresholds));
+}
+
 
 // Apply full scale and Bit Set/Clear 2 in the established order.
 bool configure_for_run(const Access &access, const V775Settings &settings)
 {
   WORD set = 0, clear = 0;
-  v7xx_config::v775_run_bits(settings, set, clear);
+  v775_run_bits(settings, set, clear);
   return access.write16(access.vme, access.base + V775_FULL_SCALE_RANGE, settings.full_scale_range, "V775 Full Scale Range") &&
          access.write16(access.vme, access.base + V775_BIT_SET2, set, "V775 run bits set") &&
          access.write16(access.vme, access.base + V775_BIT_CLEAR2, clear, "V775 run bits clear");
@@ -45,14 +95,11 @@ VerifyStatus verify_configuration(const Access &access, const V775Settings &sett
 // Write the Data Clear bit and then clear that bit.
 bool clear_data(const Access &access, bool manual)
 {
-  const char *set_desc = manual ? "V775 manual Data Clear set" : "V775 Data Clear set";
-  const char *clear_desc = manual ? "V775 manual Data Clear clear" : "V775 Data Clear clear";
-  return access.write16(access.vme, access.base + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, set_desc) &&
-         access.write16(access.vme, access.base + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, clear_desc);
+  return v775_basic::clear_data(access.vme, access.base, access.write16, manual);
 }
 
 
-bool save_diagnostic_settings(const DiagnosticAccess &access, v7xx_config::V775DiagnosticState &state)
+bool save_diagnostic_settings(const DiagnosticAccess &access, V775DiagnosticState &state)
 {
   WORD bits = 0;
   if (!access.read16(access.vme, access.base + V775_BIT_SET2, bits, "V775 Bit Set 2 save")) return false;
@@ -62,7 +109,7 @@ bool save_diagnostic_settings(const DiagnosticAccess &access, v7xx_config::V775D
   return true;
 }
 
-EnableResult enable_empty_program(const DiagnosticAccess &access, v7xx_config::V775DiagnosticState &state, WORD &readback)
+EnableResult enable_empty_program(const DiagnosticAccess &access, V775DiagnosticState &state, WORD &readback)
 {
   if (state.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) return EnableResult::AlreadyEnabled;
   state.empty_program_may_have_changed = true;
@@ -72,7 +119,7 @@ EnableResult enable_empty_program(const DiagnosticAccess &access, v7xx_config::V
   return (readback & V775_BIT2_EMPTY_PROGRAM) ? EnableResult::Enabled : EnableResult::VerifyFailure;
 }
 
-RestoreResult restore_diagnostic_settings(const DiagnosticAccess &access, v7xx_config::V775DiagnosticState &state, WORD &readback)
+RestoreResult restore_diagnostic_settings(const DiagnosticAccess &access, V775DiagnosticState &state, WORD &readback)
 {
   if (!state.saved) return RestoreResult::NoSavedState;
   if ((state.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) == 0 && state.empty_program_may_have_changed) {

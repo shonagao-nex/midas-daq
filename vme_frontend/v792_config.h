@@ -7,6 +7,14 @@
 
 namespace v792_config {
 
+constexpr WORD kV792LowThreshold = 0x0010;
+constexpr WORD kV792AllTrigger = 0x4000;
+
+V792Settings default_v792_settings();
+void capture_v792_readback(V792ReadbackSnapshot &snapshot, WORD firmware,
+                           WORD iped, WORD bits, BOOL zero_suppression,
+                           BOOL all_trigger, const WORD (&thresholds)[32], bool valid);
+
 struct Access {
   MVME_INTERFACE *vme;
   DWORD base;

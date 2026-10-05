@@ -2,12 +2,20 @@
 #define V1190_CONFIG_H
 
 #include "vme_odb.h"
+#include "v1190.h"
 #include <cstddef>
 #include <functional>
 
 namespace v1190_config {
 
 constexpr size_t kChannelMaskWords = 8;
+constexpr WORD kReadAcquisitionModeOpcode = 0x0200;
+
+// Keep the opcode meaning with configuration; the transfer remains a basic operation.
+inline bool read_acquisition_mode(const v1190_micro::Access &access, WORD &mode)
+{
+    return v1190_micro::read_command(access, kReadAcquisitionModeOpcode, &mode, 1);
+}
 
 struct Access {
     bool (*read16)(DWORD, WORD &, const char *);

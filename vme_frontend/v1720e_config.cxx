@@ -1,4 +1,7 @@
 #include "v1720e_config.h"
+#include "v1720e_internal.h"
+
+#include <cstring>
 
 extern const char *frontend_name;
 
@@ -104,24 +107,20 @@ static bool make_run_configuration(const V1720ESettings &settings,
 //************************************//
 // Capture V1720E ODB settings for the next run
 //************************************//
-bool snapshot_run_settings(State &state)
+bool snapshot_run_settings(RunConfig &run, const V1720ESettings &settings)
 {
-    V1720ESettings settings = {};
     V1720E_CONFIG config = {};
     DWORD expected_event_words = 0;
     DWORD expected_channel_mask = 0;
-    if (!vme_odb::read_v1720e_settings(settings))
-        return false;
     if (settings.enabled &&
         !make_run_configuration(settings, config,
                                        expected_event_words,
                                        expected_channel_mask))
         return false;
-    state.run.settings = settings;
-    state.run.variables_enabled = settings.enabled != FALSE;
-    state.run.hardware = config;
-    state.run.expected_event_words = expected_event_words;
-    state.run.expected_channel_mask = expected_channel_mask;
+    run.settings = settings;
+    run.hardware = config;
+    run.expected_event_words = expected_event_words;
+    run.expected_channel_mask = expected_channel_mask;
     return true;
 }
 
@@ -205,3 +204,100 @@ bool verify_readback(const V1720E_CONFIG &expected,
 
 
 }  // namespace v1720e_config
+
+extern "C" {
+
+int v1720e_configure(MVME_INTERFACE *vme, DWORD base,
+                     const V1720E_CONFIG *config)
+{
+    DWORD control = 0, status_reg = 0, channel_config = 0;
+    unsigned channel;
+    int status;
+    if (!vme || !config)
+        return MVME_INVALID_PARAM;
+    status = v1720e_read32(vme, base, REG_ACQUISITION_CONTROL, &control);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_read32(vme, base, REG_ACQUISITION_STATUS, &status_reg);
+    if (status != MVME_SUCCESS)
+        return status;
+    if ((control & ACQUISITION_CONTROL_RUN_REQUEST) ||
+        (status_reg & ACQUISITION_STATUS_RUN_ACTIVE) ||
+        (status_reg & STATUS_EXTERNAL_CLOCK) ||
+        (status_reg & (STATUS_PLL_OK | STATUS_BOARD_READY)) !=
+            (STATUS_PLL_OK | STATUS_BOARD_READY))
+        return MVME_ACCESS_ERROR;
+    status = v1720e_read32(vme, base, REG_CHANNEL_CONFIG, &channel_config);
+    if (status != MVME_SUCCESS)
+        return status;
+    channel_config &= ~(CHANNEL_CONFIG_ZS_MASK | CHANNEL_CONFIG_PACK25);
+    status = v1720e_write_verify(vme, base, REG_CHANNEL_CONFIG, channel_config);
+    if (status != MVME_SUCCESS)
+        return status;
+
+    /*
+     * This exact configuration is verified on ROC FPGA firmware 4.5.
+     * In particular, Custom Size 0x40 produces 256 samples/channel.
+     * MEB cleanup is verified after RUN start, whose documented memory
+     * reset avoids adding a separate Software Clear.
+     */
+    status = v1720e_write_verify(vme, base, REG_BUFFER_ORGANIZATION,
+                          config->buffer_organization);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_write_verify(vme, base, REG_CUSTOM_SIZE, config->custom_size);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_write_verify(vme, base, REG_TRIGGER_SOURCE,
+                          config->trigger_source);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_write_verify(vme, base, REG_POST_TRIGGER, config->post_trigger);
+    if (status != MVME_SUCCESS)
+        return status;
+    status = v1720e_write_verify(vme, base, REG_CHANNEL_ENABLE,
+                          config->channel_enable);
+    if (status != MVME_SUCCESS)
+        return status;
+    for (channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        status = v1720e_write_verify(vme, base, REG_DC_OFFSET(channel),
+                              config->dc_offset[channel]);
+        if (status != MVME_SUCCESS)
+            return status;
+    }
+    return MVME_SUCCESS;
+}
+
+int v1720e_read_configuration(MVME_INTERFACE *vme, DWORD base,
+                              V1720E_CONFIG_READBACK *readback)
+{
+    DWORD dc_offset;
+    unsigned channel;
+    int status;
+    if (!vme || !readback)
+        return MVME_INVALID_PARAM;
+    memset(readback, 0, sizeof(*readback));
+#define READ_CONFIG(member, reg) \
+    do { \
+        status = v1720e_read32(vme, base, reg, &readback->member); \
+        if (status != MVME_SUCCESS) return status; \
+    } while (0)
+    READ_CONFIG(board_info, REG_BOARD_INFO);
+    READ_CONFIG(roc_firmware, REG_ROC_FIRMWARE);
+    READ_CONFIG(buffer_organization, REG_BUFFER_ORGANIZATION);
+    READ_CONFIG(custom_size, REG_CUSTOM_SIZE);
+    READ_CONFIG(post_trigger, REG_POST_TRIGGER);
+    READ_CONFIG(trigger_source, REG_TRIGGER_SOURCE);
+    READ_CONFIG(channel_enable, REG_CHANNEL_ENABLE);
+    READ_CONFIG(channel_config, REG_CHANNEL_CONFIG);
+#undef READ_CONFIG
+    for (channel = 0; channel < V1720E_CHANNEL_COUNT; ++channel) {
+        status = v1720e_read32(vme, base, REG_DC_OFFSET(channel), &dc_offset);
+        if (status != MVME_SUCCESS)
+            return status;
+        readback->dc_offset[channel] = (WORD)(dc_offset & 0xFFFFu);
+    }
+    return MVME_SUCCESS;
+}
+
+}

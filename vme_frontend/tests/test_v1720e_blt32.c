@@ -1,4 +1,5 @@
 #include "v1720e.h"
+#include "v1720e_readout.h"
 
 #include <stdint.h>
 #include <stdio.h>
