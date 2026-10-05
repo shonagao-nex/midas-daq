@@ -13,11 +13,13 @@ namespace {
 uint8_t csr1 = 0;
 int reads = 0;
 std::vector<uint8_t> writes;
+std::vector<char> csr1_accesses;
 
 void reset(uint8_t value) {
     csr1 = value;
     reads = 0;
     writes.clear();
+    csr1_accesses.clear();
 }
 }
 
@@ -41,6 +43,7 @@ extern "C" int mvme_read(MVME_INTERFACE *, void *dst,
                           mvme_addr_t address, mvme_size_t count) {
     assert(address == RPV130_BASE_ADDRESS + 0x0C && count == 2);
     ++reads;
+    csr1_accesses.push_back('R');
     const uint16_t value = csr1;
     std::memcpy(dst, &value, sizeof(value));
     return MVME_SUCCESS;
@@ -51,6 +54,7 @@ extern "C" int mvme_write(MVME_INTERFACE *, mvme_addr_t address,
     uint16_t value = 0;
     std::memcpy(&value, src, sizeof(value));
     writes.push_back(static_cast<uint8_t>(value));
+    csr1_accesses.push_back('W');
     if (value & RPV130_CSR1_CLR1) csr1 &= ~RPV130_CSR1_BUSY1;
     csr1 = (csr1 & RPV130_CSR1_BUSY1) |
            (value & (RPV130_CSR1_ENABLE3 | RPV130_CSR1_CHANNEL1_ARMED));
@@ -90,15 +94,20 @@ int main() {
     assert(writes == std::vector<uint8_t>({0x5a}));
     assert(raw == 0x58 && reads == 2);
     assert(vme.am == MVME_AM_A24_ND && vme.dmode == MVME_DMODE_D32);
+    const auto normal_accesses = csr1_accesses;
+    assert(normal_accesses == std::vector<char>({'R', 'W', 'R'}));
 
-    reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED);
+    reset(0x80 | RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE3 |
+          RPV130_CSR1_CHANNEL1_ARMED);
     RPV130_BUSY_TIMING event_timing = {};
     assert(rpv130_clear_busy1_preserving_enable_state_timed(
                &vme, RPV130_BASE_ADDRESS, &raw, &event_timing)
            == MVME_SUCCESS);
-    assert(writes == std::vector<uint8_t>({0x1a}));
-    assert(raw == 0x18 && event_timing.clr1_before_ns > 0 &&
+    assert(writes == std::vector<uint8_t>({0x5a}) &&
+           csr1_accesses == normal_accesses && reads == 2);
+    assert(raw == 0x58 && event_timing.clr1_before_ns > 0 &&
            event_timing.clr1_before_ns <= event_timing.clr1_after_ns);
+    assert(vme.am == MVME_AM_A24_ND && vme.dmode == MVME_DMODE_D32);
 
     reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE1);
     assert(rpv130_clear_busy1_preserving_enable_state(
@@ -123,9 +132,8 @@ int main() {
     const auto event = source.find("INT read_vme_event(");
     const auto event_gate = source.find("if (gVmeState.single_event_busy_enabled_for_run)", event);
     const auto event_write = source.find("rpv130_clear_busy1_preserving_enable_state(", event);
-    const auto event_timed_write = source.find(
-        "rpv130_clear_busy1_preserving_enable_state_timed(", event);
     assert(event != std::string::npos && event_gate < event_write &&
-           event_gate < event_timed_write);
+           source.find("rpv130_clear_busy1_preserving_enable_state_timed(", event)
+               == std::string::npos);
     std::puts("test_rpv130_busy_mock: passed");
 }

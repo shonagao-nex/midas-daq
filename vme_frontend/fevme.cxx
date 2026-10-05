@@ -15,14 +15,23 @@
 #include "v1720e.h"
 #include "v792_blt32.h"
 #include "v1190_fifo_blt32.h"
+#include "v1190_readout.h"
+#include "module_status_snapshot.h"
 #include "caenvme.h"
 #include "rpv130.h"
 #include "global_busy.h"
 #include "out0_diagnostic.h"
 #include "vme_odb.h"
 #include "v1190_config.h"
+#include "v1190_clear.h"
+#include "v1190_micro.h"
 #include "v1720e_config.h"
+#include "v1720e_integrity.h"
 #include "v7xx_config.h"
+#include "v792_config.h"
+#include "v775_config.h"
+#include "v775_readout.h"
+#include "v792_readout.h"
 
 using vme_odb::make_odb_path;
 using vme_odb::set_absolute_odb_value;
@@ -48,16 +57,16 @@ using vme_odb::set_module_output;
 #endif
 
 /* Bounded single-event readout limits and counter widths. */
-static const size_t V792_MAX_EVENT_WORDS = 64;
+static const size_t V792_MAX_EVENT_WORDS = v792_readout::kMaxEventWords;
 enum V792ReadoutMode { V792_SINGLE_D32, V792_BLT32 };
 /* Source selection for the V792 hardware comparison run. */
 static const V792ReadoutMode V792_READOUT_MODE_SELECT = V792_BLT32;
-static const size_t V1190_MAX_EVENT_WORDS = 4096;
+static const size_t V1190_MAX_EVENT_WORDS = v1190_readout::kMaxEventWords;
 enum V1190ReadoutMode { V1190_SINGLE_D32, V1190_EVENT_FIFO_BLT32 };
 static const V1190ReadoutMode V1190_READOUT_MODE_SELECT = V1190_EVENT_FIFO_BLT32;
 /* Set true for the original per-event Event FIFO Stored before/after checks. */
 static const bool V1190_FIFO_STRICT_SYNC_CHECK = false;
-static const size_t V775_MAX_EVENT_WORDS = 64;
+static const size_t V775_MAX_EVENT_WORDS = v775_readout::kMaxEventWords;
 static const DWORD V7XX_EVENT_COUNTER_MASK = 0x00FFFFFF;
 static const DWORD V1190_EVENT_COUNTER_MASK = 0x003FFFFF;
 
@@ -65,16 +74,11 @@ static const DWORD V1190_EVENT_COUNTER_MASK = 0x003FFFFF;
 static const unsigned V1190_READY_MAX_POLLS = 100;
 static const unsigned V775_READY_MAX_POLLS = 100;
 static const unsigned V1720E_READY_MAX_POLLS = 100;
-static const unsigned V775_SW_TRIGGER_MAX_POLLS = 100;
-static const unsigned V1190_MICRO_MAX_POLLS = 1000;
 
 /* V1190 regular registers and normal-run Control bits. */
 static const DWORD V1190_STATUS = 0x1002;
-static const DWORD V1190_SOFT_CLEAR = 0x1016;
 static const DWORD V1190_EVENT_COUNTER = 0x101C;
 static const DWORD V1190_EVENT_STORED = 0x1020;
-static const DWORD V1190_MICRO_DATA = 0x102E;
-static const DWORD V1190_MICRO_HANDSHAKE = 0x1030;
 static const DWORD V1190_EVENT_FIFO_STATUS = V1190_FIFO_STATUS_OFFSET;
 static const DWORD V1190_EVENT_FIFO_STORED = V1190_FIFO_STORED_OFFSET;
 static const WORD V1190_STATUS_DATA_READY = 0x0001;
@@ -82,11 +86,8 @@ static const WORD V1190_STATUS_ALMOST_FULL = 0x0002;
 static const WORD V1190_STATUS_FULL = 0x0004;
 static const WORD V1190_STATUS_TRIGGER_MATCH = 0x0008;
 static const WORD V1190_FIFO_STATUS_DATA_READY = 0x0001;
-static const WORD V1190_MICRO_WRITE_OK = 0x0001;
-static const WORD V1190_MICRO_READ_OK = 0x0002;
 
 /* V1190 microcontroller opcodes and operands from the V1190 manual. */
-static const WORD V1190_OPCODE_READ_ACQ_MODE = 0x0200;
 static const size_t V1190_CHANNEL_MASK_WORDS = 8;
 
 const char *frontend_name = "fevme";            // MIDAS frontend/client name
@@ -119,52 +120,12 @@ static const DWORD RPV130_POLL_PERIOD_MS = 5000;
 static const DWORD FRONTEND_IDLE_SLEEP_MS = 10;
 static const char *RPV130_SETTINGS_PATH = "/Equipment/VME/Settings/RPV130";
 
-/* Retain first-ten-event timing probes to preserve the readout sequence. */
-static const unsigned RPV130_TIMING_EVENT_LIMIT = 10;
-
-static uint64_t monotonic_ns()
-{
-    struct timespec ts = {};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
-}
-
-struct Rpv130EventTiming {
-    bool active = false;
-    unsigned index = 0;
-    DWORD serial = 0;
-    const char *outcome = "incomplete";
-    uint64_t poll_ready_ns = 0;
-    uint64_t poll_previous_miss_ns = 0;
-    uint64_t read_start_ns = 0;
-    uint64_t csr_confirm_ns = 0;
-    uint64_t peers_start_ns = 0;
-    uint64_t peers_end_ns = 0;
-    uint64_t v1190_ready_start_ns = 0, v1190_ready_end_ns = 0;
-    uint64_t v775_ready_start_ns = 0, v775_ready_end_ns = 0;
-    uint64_t v1720_ready_start_ns = 0, v1720_ready_end_ns = 0;
-    uint64_t v792_start_ns = 0, v792_end_ns = 0;
-    uint64_t v1190_start_ns = 0, v1190_end_ns = 0;
-    uint64_t v775_start_ns = 0, v775_end_ns = 0;
-    uint64_t v1720_start_ns = 0, v1720_end_ns = 0;
-    uint64_t consistency_end_ns = 0;
-    uint64_t build_start_ns = 0, build_end_ns = 0;
-    uint64_t clear_call_ns = 0, clear_return_ns = 0;
-    RPV130_BUSY_TIMING writes = {};
-
-
-};
-
 static const char *BUFFER_CLEAR_COMMAND_PATH =
     "/Equipment/VME/Commands/BufferClearRequestId";
 static const char *BUFFER_CLEAR_STATUS_PATH =
     "/Equipment/VME/Variables/BufferClear";
 
 static const DWORD V1720E_ACQ_RUN = 0x00000004u;
-static const DWORD V1720E_STATUS_EVENT_READY = 0x00000008u;
-static const DWORD V1720E_STATUS_EXTERNAL_CLOCK = 0x00000020u;
-static const DWORD V1720E_STATUS_PLL_OK = 0x00000080u;
-static const DWORD V1720E_STATUS_BOARD_READY = 0x00000100u;
 
 static v1720e_config::State gV1720State;
 /* Change this source constant to BLT32 for the hardware comparison run. */
@@ -485,14 +446,13 @@ static void set_v1720e_readback_valid(bool valid)
 
 static void update_v1720e_acquisition_status(DWORD status)
 {
+    const V1720E_ACQUISITION_STATE decoded = v1720e_decode_acquisition_status(status);
     gV1720State.runtime.value.acquisition_status = status;
-    gV1720State.runtime.value.running = (status & V1720E_ACQ_RUN) != 0;
-    gV1720State.runtime.value.event_ready =
-        (status & V1720E_STATUS_EVENT_READY) != 0;
-    gV1720State.runtime.value.external_clock =
-        (status & V1720E_STATUS_EXTERNAL_CLOCK) != 0;
-    gV1720State.runtime.value.pll_locked = (status & V1720E_STATUS_PLL_OK) != 0;
-    gV1720State.runtime.value.board_ready = (status & V1720E_STATUS_BOARD_READY) != 0;
+    gV1720State.runtime.value.running = decoded.running;
+    gV1720State.runtime.value.event_ready = decoded.event_ready;
+    gV1720State.runtime.value.external_clock = decoded.external_clock;
+    gV1720State.runtime.value.pll_locked = decoded.pll_locked;
+    gV1720State.runtime.value.board_ready = decoded.board_ready;
     gV1720State.runtime.value.dirty = true;
 }
 
@@ -559,11 +519,6 @@ struct VmeStatistics {
     bool run_counters_dirty = true;
     DWORD run_counters_last_publish = 0;
     std::atomic<unsigned> v1190_blt_diagnostics{0};
-    std::atomic<unsigned> v1720_blt_diagnostics{0};
-    std::atomic<unsigned> rpv130_timing_events{0};
-    std::atomic<uint64_t> rpv130_poll_ready_ns{0};
-    std::atomic<uint64_t> rpv130_last_poll_miss_ns{0};
-    std::atomic<uint64_t> rpv130_poll_previous_miss_ns{0};
 };
 static VmeStatistics gVmeStatistics;
 
@@ -594,30 +549,11 @@ static bool initialize_run_counters_odb()
 static v7xx_config::V775DiagnosticState gV775Diagnostic;
 #endif
 
-struct V792EventInfo {
-    size_t words;
-    DWORD event_counter;
-    unsigned expected_measurements;
-    unsigned measurements;
-    unsigned geo;
-    bool valid;
-};
+using V792EventInfo = v792_readout::EventInfo;
 
-struct V1190EventInfo {
-    size_t words;
-    DWORD event_counter;
-    unsigned trailer_word_count;
-    bool valid;
-};
+using V1190EventInfo = v1190_readout::EventInfo;
 
-struct V775EventInfo {
-    size_t words;
-    DWORD event_counter;
-    unsigned expected_measurements;
-    unsigned measurements;
-    unsigned geo;
-    bool valid;
-};
+using V775EventInfo = v775_readout::EventInfo;
 
 enum class V1720StopOutcome { Disabled, AlreadyStopped, StopVerified };
 
@@ -712,25 +648,55 @@ static bool stop_v1720e_and_publish_state(
 }
 
 /* Low-level VME access helpers. */
-static bool vme_read16(DWORD address, WORD &value, const char *description)
+static bool vme_read16_at(MVME_INTERFACE *vme, DWORD address, WORD &value, const char *description)
 {
     int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
+    if (mvme_get_dmode(vme, &saved_mode) != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name, "Cannot get VME data mode for %s", description);
         return false;
     }
     bool ok = false;
-    if (mvme_set_dmode(gVme, MVME_DMODE_D16) != MVME_SUCCESS) {
+    if (mvme_set_dmode(vme, MVME_DMODE_D16) != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name, "Cannot select D16 for %s", description);
     } else {
-        const int status = mvme_read(gVme, &value, address, sizeof(value));
+        const int status = mvme_read(vme, &value, address, sizeof(value));
         if (status == MVME_SUCCESS)
             ok = true;
         else
             cm_msg(MERROR, frontend_name, "%s read failed at 0x%08X: status %d",
                    description, address, status);
     }
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
+    if (mvme_set_dmode(vme, saved_mode) != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name, "Cannot restore VME data mode after %s", description);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool vme_read16(DWORD address, WORD &value, const char *description)
+{
+    return vme_read16_at(gVme, address, value, description);
+}
+
+static bool vme_read32_at(MVME_INTERFACE *vme, DWORD address, DWORD &value, const char *description)
+{
+    int saved_mode;
+    if (mvme_get_dmode(vme, &saved_mode) != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name, "Cannot get VME data mode for %s", description);
+        return false;
+    }
+    bool ok = false;
+    if (mvme_set_dmode(vme, MVME_DMODE_D32) != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name, "Cannot select D32 for %s", description);
+    } else {
+        const int status = mvme_read(vme, &value, address, sizeof(value));
+        if (status == MVME_SUCCESS)
+            ok = true;
+        else
+            cm_msg(MERROR, frontend_name, "%s read failed at 0x%08X: status %d",
+                   description, address, status);
+    }
+    if (mvme_set_dmode(vme, saved_mode) != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name, "Cannot restore VME data mode after %s", description);
         ok = false;
     }
@@ -739,23 +705,28 @@ static bool vme_read16(DWORD address, WORD &value, const char *description)
 
 static bool vme_read32(DWORD address, DWORD &value, const char *description)
 {
+    return vme_read32_at(gVme, address, value, description);
+}
+
+static bool vme_write16_at(MVME_INTERFACE *vme, DWORD address, WORD value, const char *description)
+{
     int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
+    if (mvme_get_dmode(vme, &saved_mode) != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name, "Cannot get VME data mode for %s", description);
         return false;
     }
     bool ok = false;
-    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot select D32 for %s", description);
+    if (mvme_set_dmode(vme, MVME_DMODE_D16) != MVME_SUCCESS) {
+        cm_msg(MERROR, frontend_name, "Cannot select D16 for %s", description);
     } else {
-        const int status = mvme_read(gVme, &value, address, sizeof(value));
+        const int status = mvme_write(vme, address, &value, sizeof(value));
         if (status == MVME_SUCCESS)
             ok = true;
         else
-            cm_msg(MERROR, frontend_name, "%s read failed at 0x%08X: status %d",
+            cm_msg(MERROR, frontend_name, "%s write failed at 0x%08X: status %d",
                    description, address, status);
     }
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
+    if (mvme_set_dmode(vme, saved_mode) != MVME_SUCCESS) {
         cm_msg(MERROR, frontend_name, "Cannot restore VME data mode after %s", description);
         ok = false;
     }
@@ -764,200 +735,43 @@ static bool vme_read32(DWORD address, DWORD &value, const char *description)
 
 static bool vme_write16(DWORD address, WORD value, const char *description)
 {
-    int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot get VME data mode for %s", description);
-        return false;
-    }
-    bool ok = false;
-    if (mvme_set_dmode(gVme, MVME_DMODE_D16) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot select D16 for %s", description);
-    } else {
-        const int status = mvme_write(gVme, address, &value, sizeof(value));
-        if (status == MVME_SUCCESS)
-            ok = true;
-        else
-            cm_msg(MERROR, frontend_name, "%s write failed at 0x%08X: status %d",
-                   description, address, status);
-    }
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot restore VME data mode after %s", description);
-        ok = false;
-    }
-    return ok;
+    return vme_write16_at(gVme, address, value, description);
 }
 
-static bool v1190_micro_wait(WORD ready_bit, const char *description)
+// Bind V792 configuration to the existing checked VME access functions.
+static v792_config::Access v792_configuration_access()
 {
-    WORD handshake = 0;
-    for (unsigned poll = 0; poll < V1190_MICRO_MAX_POLLS; ++poll) {
-        if (!vme_read16(V1190_BASE + V1190_MICRO_HANDSHAKE, handshake,
-                        "V1190 micro handshake"))
-            return false;
-        if (handshake & ready_bit)
-            return true;
-        ss_sleep(1);
-    }
-    cm_msg(MERROR, frontend_name, "V1190 micro %s timeout after %u polls (handshake 0x%04X)",
-           description, V1190_MICRO_MAX_POLLS, handshake);
-    return false;
+    return {gVme, V792_BASE, frontend_name, vme_read16_at, vme_write16_at, v792_ThresholdRead};
 }
 
-static bool v1190_micro_write_opcode(WORD opcode)
+// Bind V775 configuration to the existing checked VME access functions.
+static v775_config::Access v775_configuration_access()
 {
-    if (!v1190_micro_wait(V1190_MICRO_WRITE_OK, "write-ready"))
-        return false;
-    return vme_write16(V1190_BASE + V1190_MICRO_DATA, opcode,
-                       "V1190 micro opcode");
+    return {gVme, V775_BASE, frontend_name, vme_read16_at, vme_write16_at, v775_ThresholdRead};
 }
 
-static bool v1190_micro_write_command(WORD opcode,
-                                      const WORD *operands,
-                                      size_t operand_count)
+// Bind V1190 clear to the existing checked VME access functions.
+static v1190_clear::Access v1190_clear_access()
 {
-    if (!v1190_micro_write_opcode(opcode))
-        return false;
-    for (size_t i = 0; i < operand_count; ++i) {
-        if (!v1190_micro_wait(V1190_MICRO_WRITE_OK, "operand write-ready") ||
-            !vme_write16(V1190_BASE + V1190_MICRO_DATA, operands[i],
-                         "V1190 micro operand")) {
-            cm_msg(MERROR, frontend_name,
-                   "V1190 opcode 0x%04X operand %zu/%zu write failed",
-                   opcode, i + 1, operand_count);
-            return false;
-        }
-    }
-    return true;
+    return {gVme, V1190_BASE, vme_read16_at, vme_write16_at};
 }
 
-static bool v1190_micro_read_command(WORD opcode, WORD *words, size_t word_count)
-{
-    if (!v1190_micro_write_opcode(opcode))
-        return false;
-    for (size_t i = 0; i < word_count; ++i) {
-        if (!v1190_micro_wait(V1190_MICRO_READ_OK, "response read-ready") ||
-            !vme_read16(V1190_BASE + V1190_MICRO_DATA, words[i],
-                        "V1190 micro response")) {
-            cm_msg(MERROR, frontend_name,
-                   "V1190 opcode 0x%04X response word %zu/%zu read failed",
-                   opcode, i + 1, word_count);
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool v1190_read_acquisition_mode(WORD &mode)
-{
-    return v1190_micro_read_command(V1190_OPCODE_READ_ACQ_MODE, &mode, 1);
-}
-
-//************************************//
-// Bind V1190 configuration to the existing VME access functions
-//************************************//
+// Bind V1190 configuration to the existing VME access functions.
 static v1190_config::Access v1190_configuration_access()
 {
-    return {vme_read16, vme_write16, v1190_micro_write_opcode,
-            v1190_micro_write_command, v1190_micro_read_command,
-            v1190_read_acquisition_mode};
+    const v1190_micro::Access micro = {gVme, V1190_BASE, frontend_name, vme_read16_at, vme_write16_at};
+    return {vme_read16, vme_write16,
+            [micro](WORD opcode) { return v1190_micro::write_opcode(micro, opcode); },
+            [micro](WORD opcode, const WORD *words, size_t count) {
+                return v1190_micro::write_command(micro, opcode, words, count);
+            },
+            [micro](WORD opcode, WORD *words, size_t count) {
+                return v1190_micro::read_command(micro, opcode, words, count);
+            },
+            [micro](WORD &mode) { return v1190_micro::read_acquisition_mode(micro, mode); }};
 }
 
-using v1190_config::V1190Configuration;
-
-//************************************//
-// Read the V1190 configuration through the existing access functions
-//************************************//
-static bool read_v1190_configuration(V1190Configuration &configuration)
-{
-    const auto access = v1190_configuration_access();
-    return v1190_config::read_configuration(access, configuration);
-}
-
-/* Bounded module readers: read one hardware event and return raw words plus metadata. */
-/* Return a complete raw event, or zero on error. Never scan into another event. */
-static V792EventInfo read_v792_single_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
-{
-    V792EventInfo event = {};
-    int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot get VME data mode");
-        return event;
-    }
-
-    size_t result = 0;
-    unsigned expected = 0;
-    unsigned measurements = 0;
-    unsigned geo = 0;
-    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot select D32 for V792 readout");
-    } else {
-        for (size_t i = 0; i < V792_MAX_EVENT_WORDS; ++i) {
-            DWORD word = 0;
-            const int status = mvme_read(gVme, &word, V792_BASE, sizeof(word));
-            if (status != MVME_SUCCESS) {
-                cm_msg(MERROR, frontend_name, "V792 read failed at word %zu: status %d", i, status);
-                break;
-            }
-            const unsigned type = (word >> 24) & 0x7;
-            if (i == 0) {
-                if (type != 2) {
-                    cm_msg(MERROR, frontend_name, "V792 expected Header, got 0x%08X (type %u)", word, type);
-                    break;
-                }
-                expected = (word >> 8) & 0x3f;
-                geo = word >> 27;
-                event.expected_measurements = expected;
-                event.geo = geo;
-                if (expected > V792_MAX_CHANNELS || expected + 2 > V792_MAX_EVENT_WORDS) {
-                    cm_msg(MERROR, frontend_name, "V792 invalid Header count %u", expected);
-                    break;
-                }
-            } else {
-                if ((word >> 27) != geo || (type != 0 && type != 4)) {
-                    cm_msg(MERROR, frontend_name, "V792 invalid word %zu: 0x%08X (type %u, GEO %u, expected GEO %u)",
-                           i, word, type, word >> 27, geo);
-                    break;
-                }
-                if (type == 4) {
-                    if (measurements != expected) {
-                        cm_msg(MERROR, frontend_name, "V792 Footer count mismatch: Header %u, received %u", expected, measurements);
-                        break;
-                    }
-                    data[i] = word;
-                    result = i + 1;
-                    event.event_counter = word & V7XX_EVENT_COUNTER_MASK;
-                    event.measurements = measurements;
-                    event.valid = true;
-                    gVmeModuleState.v792.event_counter=event.event_counter;
-                    gVmeModuleState.v792.dirty=true;
-                    break;
-                }
-                if (measurements >= expected) {
-                    cm_msg(MERROR, frontend_name, "V792 expected Footer after %u measurements, got 0x%08X", measurements, word);
-                    break;
-                }
-                ++measurements;
-            }
-            data[i] = word;
-            if (i + 1 == V792_MAX_EVENT_WORDS)
-                cm_msg(MERROR, frontend_name, "V792 readout reached limit of %zu words without Footer", V792_MAX_EVENT_WORDS);
-        }
-    }
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot restore VME data mode");
-        result = 0;
-        event.valid = false;
-    }
-    event.words = result;
-    return event;
-}
-
-static int v792_blt_header_read(void *context, uint32_t address, uint32_t *word)
-{
-    return mvme_read(static_cast<MVME_INTERFACE *>(context), word, address,
-                     sizeof(*word)) == MVME_SUCCESS ? 0 : -1;
-}
-
+// Connect the existing VME BLT transfer to V792 and V1190 readers.
 static int v792_blt_transfer(void *context, uint32_t address, void *destination,
                              int requested_bytes, int *actual_bytes)
 {
@@ -966,184 +780,72 @@ static int v792_blt_transfer(void *context, uint32_t address, void *destination,
                                   requested_bytes, actual_bytes);
 }
 
-static V792EventInfo read_v792_blt32_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
+// Keep V792 run state and BLT failure handling in the frontend.
+static V792EventInfo read_v792_event(DWORD (&data)[V792_MAX_EVENT_WORDS])
 {
-    V792EventInfo event = {};
-    int saved_mode = 0;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "V792 BLT32 cannot get VME data mode");
-        return event;
-    }
-    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
-        mvme_set_dmode(gVme, saved_mode);
-        cm_msg(MERROR, frontend_name, "V792 BLT32 cannot select D32 header mode");
-        return event;
-    }
-    const V792_BLT_IO io = {v792_blt_header_read, v792_blt_transfer, gVme};
-    V792_BLT_RESULT result = {};
-    const V792_BLT_STATUS status = v792_read_blt32(
-        &io, V792_BASE, data, V792_MAX_EVENT_WORDS, &result);
-    const int restore_status = mvme_set_dmode(gVme, saved_mode);
-    static std::atomic<unsigned> diagnostic_count{0};
-    if (result.requested_bytes != 0 &&
-        diagnostic_count.fetch_add(1, std::memory_order_relaxed) < 10) {
-        cm_msg(MINFO, frontend_name,
-               "V792 BLT32: requested=%d actual=%d bytes CAEN status=%d validation=%d",
-               result.requested_bytes, result.actual_bytes,
-               result.caen_status, static_cast<int>(status));
-    }
-    if (status != V792_BLT_OK || restore_status != MVME_SUCCESS) {
-        gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
-        cm_msg(MERROR, frontend_name,
-               "V792 BLT32 readout failed: validation=%d CAEN status=%d requested=%d actual=%d restore=%d",
-               static_cast<int>(status), result.caen_status,
-               result.requested_bytes, result.actual_bytes, restore_status);
-        return event;
-    }
-    event.words = result.words;
-    event.event_counter = result.event_counter;
-    event.expected_measurements = result.measurements;
-    event.measurements = result.measurements;
-    event.geo = result.geo;
-    event.valid = true;
-    gVmeModuleState.v792.event_counter = event.event_counter;
-    gVmeModuleState.v792.dirty = true;
-    return event;
-}
-
-/* Read exactly one V1190 event through its Global Trailer using D32 cycles. */
-static V1190EventInfo read_v1190_single_event(DWORD (&data)[V1190_MAX_EVENT_WORDS])
-{
-    V1190EventInfo event = {};
-    int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot get VME data mode for V1190 readout");
-        return event;
-    }
-
-    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot select D32 for V1190 readout");
-    } else {
-        for (size_t i = 0; i < V1190_MAX_EVENT_WORDS; ++i) {
-            DWORD word = 0;
-            const int status = mvme_read(gVme, &word, V1190_BASE, sizeof(word));
-            if (status != MVME_SUCCESS) {
-                cm_msg(MERROR, frontend_name, "V1190 read failed at word %zu: status %d", i, status);
-                break;
-            }
-
-            data[i] = word;
-            const unsigned type = (word >> 27) & 0x1F;
-            if (i == 0) {
-                if (type != 0x08) {
-                    cm_msg(MERROR, frontend_name,
-                           "V1190 expected Global Header, got 0x%08X (type 0x%02X)",
-                           word, type);
-                    break;
-                }
-                event.event_counter = (word >> 5) & V1190_EVENT_COUNTER_MASK;
-                continue;
-            }
-
-            if (type == 0x10) {
-                const unsigned trailer_words = (word >> 5) & 0xFFFF;
-                const size_t actual_words = i + 1;
-                if (trailer_words != actual_words) {
-                    cm_msg(MERROR, frontend_name,
-                           "V1190 Global Trailer count mismatch: trailer %u, read %zu",
-                           trailer_words, actual_words);
-                    break;
-                }
-                event.trailer_word_count = trailer_words;
-                event.words = actual_words;
-                event.valid = true;
-                gVmeModuleState.v1190.event_counter=event.event_counter;
-                gVmeModuleState.v1190.dirty=true;
-                break; // Trailer consumed; never pre-read the next event.
-            }
-
-            bool invalid_type = false;
-            switch (type) {
-            case 0x00: // Measurement
-            case 0x01: // TDC Header
-            case 0x03: // TDC Trailer
-            case 0x04: // Error
-            case 0x11: // Extended Trigger Time Tag
-                break;
-            case 0x08:
-                cm_msg(MERROR, frontend_name,
-                       "V1190 unexpected Global Header at word %zu: 0x%08X", i, word);
-                invalid_type = true;
-                break;
-            case 0x18:
-                cm_msg(MERROR, frontend_name,
-                       "V1190 unexpected Filler at word %zu: 0x%08X", i, word);
-                invalid_type = true;
-                break;
-            default:
-                cm_msg(MERROR, frontend_name,
-                       "V1190 reserved word type 0x%02X at word %zu: 0x%08X",
-                       type, i, word);
-                invalid_type = true;
-                break;
-            }
-            if (invalid_type)
-                break;
-            if (i + 1 == V1190_MAX_EVENT_WORDS && event.words == 0)
-                cm_msg(MERROR, frontend_name,
-                       "V1190 readout reached limit of %zu words without Global Trailer",
-                       V1190_MAX_EVENT_WORDS);
+    const v792_readout::Access access = {gVme, V792_BASE, frontend_name,
+                                          mvme_get_dmode, mvme_set_dmode, mvme_read,
+                                          v792_blt_transfer, gVme};
+    if (V792_READOUT_MODE_SELECT == V792_BLT32) {
+        const auto result = v792_readout::read_blt32_event(access, data);
+        static std::atomic<unsigned> diagnostic_count{0};
+        if (result.details.requested_bytes != 0 &&
+            diagnostic_count.fetch_add(1, std::memory_order_relaxed) < 10) {
+            cm_msg(MINFO, frontend_name,
+                   "V792 BLT32: requested=%d actual=%d bytes CAEN status=%d validation=%d",
+                   result.details.requested_bytes, result.details.actual_bytes,
+                   result.details.caen_status, static_cast<int>(result.status));
         }
+        if (result.stop_required) {
+            gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
+            cm_msg(MERROR, frontend_name,
+                   "V792 BLT32 readout failed: validation=%d CAEN status=%d requested=%d actual=%d restore=%d",
+                   static_cast<int>(result.status), result.details.caen_status,
+                   result.details.requested_bytes, result.details.actual_bytes, result.restore_status);
+            return {};
+        }
+        if (result.event.valid) {
+            gVmeModuleState.v792.event_counter = result.event.event_counter;
+            gVmeModuleState.v792.dirty = true;
+        }
+        return result.event;
     }
 
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot restore VME data mode after V1190 readout");
-        event.words = 0;
-        event.valid = false;
+    const auto event = v792_readout::read_single_event(access, data);
+    if (event.footer_consumed) {
+        gVmeModuleState.v792.event_counter = event.event_counter;
+        gVmeModuleState.v792.dirty = true;
     }
     return event;
 }
 
-static int v1190_fifo_read16(void *, uint32_t address, uint16_t *value)
+// Keep V1190 run state and FIFO/BLT failure handling in the frontend.
+static V1190EventInfo read_v1190_event(DWORD (&data)[V1190_MAX_EVENT_WORDS])
 {
-    WORD readback = 0;
-    if (!vme_read16(address, readback, "V1190 Event FIFO D16 read")) return -1;
-    *value = readback;
-    return 0;
-}
+    const v1190_readout::Access access = {gVme, V1190_BASE, frontend_name,
+                                          mvme_get_dmode, mvme_set_dmode, mvme_read,
+                                          vme_read16_at, vme_read32_at, v792_blt_transfer, gVme};
+    if (V1190_READOUT_MODE_SELECT != V1190_EVENT_FIFO_BLT32) {
+        const auto event = v1190_readout::read_single_event(access, data);
+        if (event.trailer_consumed) {
+            gVmeModuleState.v1190.event_counter = event.event_counter;
+            gVmeModuleState.v1190.dirty = true;
+        }
+        return event;
+    }
 
-static int v1190_fifo_read32(void *, uint32_t address, uint32_t *value)
-{
-    DWORD readback = 0;
-    if (!vme_read32(address, readback, "V1190 Event FIFO entry read")) return -1;
-    *value = readback;
-    return 0;
-}
-
-static V1190EventInfo read_v1190_fifo_blt32_event(
-    DWORD (&data)[V1190_MAX_EVENT_WORDS], V1190_FIFO_BLT_TIMING &phases,
-    bool &diagnostic)
-{
-    V1190EventInfo event = {};
-    const V1190_FIFO_BLT_IO io = {v1190_fifo_read16, v1190_fifo_read32,
-                                  v792_blt_transfer, gVme};
-    V1190_FIFO_BLT_RESULT result = {};
-    const V1190_FIFO_BLT_STATUS status = v1190_fifo_read_blt32(
-        &io, V1190_BASE, data, V1190_MAX_EVENT_WORDS,
-        V1190_FIFO_STRICT_SYNC_CHECK, &gVmeState.v1190_fifo_blt, &result);
-    phases = result.timing;
-    diagnostic = gVmeStatistics.v1190_blt_diagnostics.fetch_add(
-        1, std::memory_order_relaxed) < 10;
+    const auto readout = v1190_readout::read_fifo_blt32_event(access, data, V1190_FIFO_STRICT_SYNC_CHECK,
+                                                               gVmeState.v1190_fifo_blt);
+    const auto &result = readout.details;
+    const auto status = readout.status;
+    const bool diagnostic = gVmeStatistics.v1190_blt_diagnostics.fetch_add(1, std::memory_order_relaxed) < 10;
     if (diagnostic && status != V1190_FIFO_BLT_OK) {
         cm_msg(MINFO, frontend_name,
                "V1190 BLT FIFO=%u stored=%d->%d req=%d got=%d CAEN=%d",
                static_cast<unsigned>(result.fifo_word_count),
-               result.timing.stored_before_checked ?
-                   static_cast<int>(result.stored_before) : -1,
-               result.timing.stored_after_checked ?
-                   static_cast<int>(result.stored_after) : -1,
-               result.requested_bytes, result.actual_bytes,
-               result.caen_status);
+               result.timing.stored_before_checked ? static_cast<int>(result.stored_before) : -1,
+               result.timing.stored_after_checked ? static_cast<int>(result.stored_after) : -1,
+               result.requested_bytes, result.actual_bytes, result.caen_status);
         cm_msg(MINFO, frontend_name,
                "V1190 BLT trailer=%u ctr=%04X/%06X match=%d status=%d",
                static_cast<unsigned>(result.trailer_word_count),
@@ -1151,29 +853,24 @@ static V1190EventInfo read_v1190_fifo_blt32_event(
                static_cast<unsigned>(result.event_counter),
                result.counter_consistent, static_cast<int>(status));
     }
-    if (status != V1190_FIFO_BLT_OK) {
+    if (readout.stop_required) {
         /* The FIFO entry and/or Output Buffer may have advanced. Never retry. */
         gVmeState.blt_stop_requested.store(true, std::memory_order_relaxed);
-        if (!V1190_FIFO_STRICT_SYNC_CHECK &&
-            status == V1190_FIFO_BLT_STORED_MISMATCH)
-            cm_msg(MERROR, frontend_name,
-                   "V1190 FIFO periodic sync failed: stored_after=%u expected=0",
+        if (!V1190_FIFO_STRICT_SYNC_CHECK && status == V1190_FIFO_BLT_STORED_MISMATCH)
+            cm_msg(MERROR, frontend_name, "V1190 FIFO periodic sync failed: stored_after=%u expected=0",
                    static_cast<unsigned>(result.stored_after));
         cm_msg(MERROR, frontend_name,
                "V1190 BLT error s=%d c=%d n=%u req=%d got=%d",
                static_cast<int>(status), result.caen_status,
                static_cast<unsigned>(result.fifo_word_count),
-               result.requested_bytes,
-               result.actual_bytes);
-        return event;
+               result.requested_bytes, result.actual_bytes);
+        return {};
     }
-    event.words = result.words;
-    event.event_counter = result.event_counter;
-    event.trailer_word_count = result.trailer_word_count;
-    event.valid = true;
-    gVmeModuleState.v1190.event_counter = event.event_counter;
-    gVmeModuleState.v1190.dirty = true;
-    return event;
+    if (readout.event.valid) {
+        gVmeModuleState.v1190.event_counter = readout.event.event_counter;
+        gVmeModuleState.v1190.dirty = true;
+    }
+    return readout.event;
 }
 
 static bool wait_for_v1190_data_ready()
@@ -1192,113 +889,6 @@ static bool wait_for_v1190_data_ready()
            "V1190 DataReady timeout after %u polls; V792 FIFO was not consumed",
            V1190_READY_MAX_POLLS);
     return false;
-}
-
-/* Read exactly one V775 event through its EOB using D32 single cycles. */
-static V775EventInfo read_v775_single_event(DWORD (&data)[V775_MAX_EVENT_WORDS])
-{
-    V775EventInfo event = {};
-    int saved_mode;
-    if (mvme_get_dmode(gVme, &saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot get VME data mode for V775 readout");
-        return event;
-    }
-
-    if (mvme_set_dmode(gVme, MVME_DMODE_D32) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name, "Cannot select D32 for V775 readout");
-    } else {
-        unsigned expected_measurements = 0;
-        unsigned measurements = 0;
-        unsigned geo = 0;
-        for (size_t i = 0; i < V775_MAX_EVENT_WORDS; ++i) {
-            DWORD word = 0;
-            const int status = mvme_read(gVme, &word, V775_BASE, sizeof(word));
-            if (status != MVME_SUCCESS) {
-                cm_msg(MERROR, frontend_name,
-                       "V775 read failed at word %zu: status %d", i, status);
-                break;
-            }
-
-            data[i] = word;
-            const unsigned type = (word >> 24) & 0x7;
-            if (i == 0) {
-                if (type != V775_DATA_TYPE_HEADER) {
-                    cm_msg(MERROR, frontend_name,
-                           "V775 expected Header, got 0x%08X (type %u)",
-                           word, type);
-                    break;
-                }
-                geo = word >> 27;
-                expected_measurements = (word >> 8) & 0x3F;
-                event.expected_measurements = expected_measurements;
-                event.geo = geo;
-                if (expected_measurements > V775_MAX_CHANNELS) {
-                    cm_msg(MERROR, frontend_name,
-                           "V775 invalid Header channel count %u",
-                           expected_measurements);
-                    break;
-                }
-                continue;
-            }
-
-            if ((word >> 27) != geo) {
-                cm_msg(MERROR, frontend_name,
-                       "V775 GEO mismatch at word %zu: got %u, expected %u",
-                       i, word >> 27, geo);
-                break;
-            }
-            if (type == V775_DATA_TYPE_EOB) {
-                if (measurements != expected_measurements) {
-                    cm_msg(MERROR, frontend_name,
-                           "V775 EOB count mismatch: Header %u, measurements %u",
-                           expected_measurements, measurements);
-                    break;
-                }
-                event.event_counter = word & V7XX_EVENT_COUNTER_MASK;
-                event.measurements = measurements;
-                event.words = i + 1;
-                event.valid = true;
-                gVmeModuleState.v775.event_counter=event.event_counter;
-                gVmeModuleState.v775.dirty=true;
-                break; // EOB consumed; never pre-read the next event.
-            }
-
-            switch (type) {
-            case V775_DATA_TYPE_MEASUREMENT:
-                ++measurements;
-                if (measurements > expected_measurements) {
-                    cm_msg(MERROR, frontend_name,
-                           "V775 received more measurements than Header count %u",
-                           expected_measurements);
-                    i = V775_MAX_EVENT_WORDS;
-                }
-                break;
-            case V775_DATA_TYPE_INVALID:
-                cm_msg(MERROR, frontend_name,
-                       "V775 invalid datum (type 6) at word %zu: 0x%08X", i, word);
-                i = V775_MAX_EVENT_WORDS;
-                break;
-            default:
-                cm_msg(MERROR, frontend_name,
-                       "V775 reserved word type %u at word %zu: 0x%08X",
-                       type, i, word);
-                i = V775_MAX_EVENT_WORDS;
-                break;
-            }
-            if (i + 1 == V775_MAX_EVENT_WORDS && event.words == 0)
-                cm_msg(MERROR, frontend_name,
-                       "V775 readout reached limit of %zu words without EOB",
-                       V775_MAX_EVENT_WORDS);
-        }
-    }
-
-    if (mvme_set_dmode(gVme, saved_mode) != MVME_SUCCESS) {
-        cm_msg(MERROR, frontend_name,
-               "Cannot restore VME data mode after V775 readout");
-        event.words = 0;
-        event.valid = false;
-    }
-    return event;
 }
 
 static bool wait_for_v775_data_ready()
@@ -1375,130 +965,98 @@ static bool setup_v1190_soft_trigger_test()
 #endif
 
 #if ENABLE_V775_SW_TRIGGER_TEST
+static v775_config::DiagnosticAccess v775_diagnostic_access()
+{
+    return {gVme, V775_BASE, vme_read16_at, vme_write16_at, v775_EvtCntRead, ss_sleep};
+}
+
 static bool restore_v775_diagnostic_settings()
 {
-    if (!gV775Diagnostic.saved)
-        return true;
-
-    if ((gV775Diagnostic.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) == 0 &&
-        gV775Diagnostic.empty_program_may_have_changed) {
-        WORD readback = 0;
-        if (!vme_write16(V775_BASE + V775_BIT_CLEAR2,
-                         V775_BIT2_EMPTY_PROGRAM,
-                         "V775 Empty Program restore clear") ||
-            !vme_read16(V775_BASE + V775_BIT_SET2, readback,
-                        "V775 Bit Set 2 restore verify")) {
-            return false;
-        }
-        if ((readback & V775_BIT2_EMPTY_PROGRAM) != 0) {
-            cm_msg(MERROR, frontend_name,
-                   "V775 Empty Program restoration verify failed: Bit Set 2=0x%04X",
-                   readback);
-            return false;
-        }
+    WORD readback = 0;
+    const auto result = v775_config::restore_diagnostic_settings(
+        v775_diagnostic_access(), gV775Diagnostic, readback);
+    if (result == v775_config::RestoreResult::AccessFailure) return false;
+    if (result == v775_config::RestoreResult::VerifyFailure) {
+        cm_msg(MERROR, frontend_name,
+               "V775 Empty Program restoration verify failed: Bit Set 2=0x%04X",
+               readback);
+        return false;
+    }
+    if (result == v775_config::RestoreResult::Restored)
         cm_msg(MINFO, frontend_name,
                "V775 Empty Program restored to disabled (Bit Set 2=0x%04X)",
                readback);
-        gV775Diagnostic.empty_program_may_have_changed = false;
-    } else {
+    else if (result == v775_config::RestoreResult::NoClearNeeded)
         cm_msg(MINFO, frontend_name,
                "V775 Empty Program restoration needs no clear; original state was %s",
                (gV775Diagnostic.saved_bit_set2 & V775_BIT2_EMPTY_PROGRAM) ? "enabled" : "disabled");
-    }
-
-    gV775Diagnostic.saved = false;
     return true;
 }
 
 static bool setup_v775_sw_trigger_test()
 {
-    WORD bitset2 = 0;
+    const auto access = v775_diagnostic_access();
     WORD readback = 0;
     WORD status1 = 0;
     WORD status2 = 0;
     DWORD counter = 0;
 
-    if (!vme_read16(V775_BASE + V775_BIT_SET2, bitset2,
-                    "V775 Bit Set 2 save"))
-        return false;
-    gV775Diagnostic.saved_bit_set2 = bitset2;
-    gV775Diagnostic.saved = true;
-    gV775Diagnostic.empty_program_may_have_changed = false;
+    if (!v775_config::save_diagnostic_settings(access, gV775Diagnostic)) return false;
+    const WORD bitset2 = gV775Diagnostic.saved_bit_set2;
     cm_msg(MINFO, frontend_name,
            "V775 diagnostic saved Bit Set 2=0x%04X; Empty Program=%s",
            bitset2,
            (bitset2 & V775_BIT2_EMPTY_PROGRAM) ? "enabled" : "disabled");
 
-    if ((bitset2 & V775_BIT2_EMPTY_PROGRAM) == 0) {
-        // From this write attempt onward, cleanup assumes the bit may be set.
-        gV775Diagnostic.empty_program_may_have_changed = true;
-        if (!vme_write16(V775_BASE + V775_BIT_SET2,
-                         V775_BIT2_EMPTY_PROGRAM,
-                         "V775 Empty Program enable") ||
-            !vme_read16(V775_BASE + V775_BIT_SET2, readback,
-                        "V775 Bit Set 2 enable verify") ||
-            (readback & V775_BIT2_EMPTY_PROGRAM) == 0) {
-            cm_msg(MERROR, frontend_name,
-                   "V775 Empty Program enable/readback failed");
-            restore_v775_diagnostic_settings();
-            return false;
-        }
-        cm_msg(MINFO, frontend_name,
-               "V775 Empty Program temporarily enabled (Bit Set 2=0x%04X)",
-               readback);
-    }
-
-    if (!vme_read16(V775_BASE + V775_STATUS1, status1,
-                    "V775 Status 1 before SW Comm") ||
-        !vme_read16(V775_BASE + V775_STATUS2, status2,
-                    "V775 Status 2 before SW Comm")) {
+    const auto enabled = v775_config::enable_empty_program(access, gV775Diagnostic, readback);
+    if (enabled == v775_config::EnableResult::AccessFailure ||
+        enabled == v775_config::EnableResult::VerifyFailure) {
+        cm_msg(MERROR, frontend_name, "V775 Empty Program enable/readback failed");
         restore_v775_diagnostic_settings();
         return false;
     }
-    v775_EvtCntRead(gVme, V775_BASE, &counter);
+    if (enabled == v775_config::EnableResult::Enabled)
+        cm_msg(MINFO, frontend_name,
+               "V775 Empty Program temporarily enabled (Bit Set 2=0x%04X)",
+               readback);
+
+    if (!v775_config::read_before_sw_comm(access, status1, status2, counter)) {
+        restore_v775_diagnostic_settings();
+        return false;
+    }
     printf("V775 SW trigger test enabled: issuing one SW Comm at begin of run.\n");
     printf("V775 before SW Comm: Status1=0x%04X Status2=0x%04X Event Counter=0x%06X\n",
            status1, status2, counter);
 
-    if (!vme_write16(V775_BASE + V775_SW_COMM, 0, "V775 SW Comm")) {
+    if (!v775_config::issue_sw_comm(access)) {
         restore_v775_diagnostic_settings();
         return false;
     }
 
-    bool ready = false;
     unsigned polls_done = 0;
-    for (unsigned poll = 1; poll <= V775_SW_TRIGGER_MAX_POLLS; ++poll) {
-        polls_done = poll;
-        if (!vme_read16(V775_BASE + V775_STATUS1, status1,
-                        "V775 Status 1 after SW Comm")) {
-            restore_v775_diagnostic_settings();
-            return false;
-        }
-        if (status1 & V775_STATUS1_DATA_READY) {
-            ready = true;
-            break;
-        }
-        if (poll < V775_SW_TRIGGER_MAX_POLLS)
-            ss_sleep(1);
-    }
-    if (!vme_read16(V775_BASE + V775_STATUS2, status2,
-                    "V775 Status 2 after SW Comm")) {
+    const auto poll = v775_config::poll_after_sw_comm(access, status1, polls_done);
+    if (poll == v775_config::PollResult::ReadFailure) {
         restore_v775_diagnostic_settings();
         return false;
     }
-    v775_EvtCntRead(gVme, V775_BASE, &counter);
+    if (!v775_config::read_after_sw_comm(access, status2, counter)) {
+        restore_v775_diagnostic_settings();
+        return false;
+    }
+    const bool ready = poll == v775_config::PollResult::Ready;
     printf("V775 after SW Comm poll %u/%u: DataReady=%s Status1=0x%04X Status2=0x%04X Event Counter=0x%06X\n",
-           polls_done, V775_SW_TRIGGER_MAX_POLLS, ready ? "Y" : "N",
+           polls_done, v775_config::kDiagnosticMaxPolls, ready ? "Y" : "N",
            status1, status2, counter);
     if (!ready) {
         cm_msg(MERROR, frontend_name,
                "V775 SW trigger test DataReady timeout after %u polls",
-               V775_SW_TRIGGER_MAX_POLLS);
+               v775_config::kDiagnosticMaxPolls);
         restore_v775_diagnostic_settings();
         return false;
     }
     return true;
 }
+
 #endif
 
 /* Frontend initialization checks. Keep the established read-only access order. */
@@ -1558,9 +1116,7 @@ static bool check_module_communication(bool check_v1720e)
     printf("Checking V1720E at 0x%08X...\n", V1720E_BASE);
     const int v1720_status = v1720e_probe(gVme, V1720E_BASE, &v1720);
     if (v1720_status != MVME_SUCCESS ||
-        (v1720.board_info & 0xFFu) != 0x03u ||
-        ((v1720.board_info >> 8) & 0xFFu) != 0x02u ||
-        ((v1720.board_info >> 16) & 0xFFu) != 8u) {
+        !v1720e_decode_board_info(v1720.board_info).supported) {
         cm_msg(MERROR, frontend_name,
                "V1720E identification failed at 0x%08X: status %d "
                "BoardInfo 0x%08X",
@@ -1687,64 +1243,10 @@ static bool validate_v792_event_source_dependency()
     return true;
 }
 
-[[maybe_unused]] static bool log_current_configuration(const char *phase)
-{
-    WORD vf = 0, vs1 = 0, vs2 = 0, vb = 0, iped = 0;
-    WORD tf = 0, ts1 = 0, ts2 = 0, tb = 0, fsr = 0;
-    WORD tth[V775_MAX_CHANNELS];
-    WORD vth[V792_MAX_CHANNELS];
-    V1190Configuration c = {};
-    if (!vme_read16(V792_BASE + V792_FIRM_REV, vf, "V792 Firmware") ||
-        !vme_read16(V792_BASE + V792_CSR1_RO, vs1, "V792 Status 1") ||
-        !vme_read16(V792_BASE + V792_CSR2_RO, vs2, "V792 Status 2") ||
-        !vme_read16(V792_BASE + V792_BIT_SET2_RW, vb, "V792 Bit Set 2") ||
-        !vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped") ||
-        !read_v1190_configuration(c)) return false;
-    if (gVmeConfig.v775.enabled &&
-        (!vme_read16(V775_BASE + V775_FIRMWARE_REVISION, tf, "V775 Firmware") ||
-         !vme_read16(V775_BASE + V775_STATUS1, ts1, "V775 Status 1") ||
-         !vme_read16(V775_BASE + V775_STATUS2, ts2, "V775 Status 2") ||
-         !vme_read16(V775_BASE + V775_BIT_SET2, tb, "V775 Bit Set 2") ||
-         !vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR") ||
-         v775_ThresholdRead(gVme, V775_BASE, tth) != V775_MAX_CHANNELS)) return false;
-    if (v792_ThresholdRead(gVme, V792_BASE, vth) != V792_MAX_CHANNELS) return false;
-    printf("BOR configuration snapshot (%s):\n", phase);
-    printf("  V792 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X Iped=0x%04X\n",
-           vf, vs1, vs2, vb, iped);
-    printf("  V1190: firmware=0x%04X status=0x%04X control=0x%04X mode=%u trigger=[%u,%d,%u,%u,%u] edge=%u res=%u dead=%u hits=%u header=%u error=0x%03X fifo=%u\n",
-           c.firmware, c.status, c.control, c.mode & 1, c.trigger[0],
-           static_cast<int16_t>(c.trigger[1]), c.trigger[2], c.trigger[3],
-           c.trigger[4] & 1, c.edge & 3, c.resolution & 3, c.dead_time & 3,
-           c.max_hits & 0xF, c.header & 1, c.error_mask & 0x7FF, c.fifo_size & 0xF);
-    printf("  V1190 channel mask:");
-    for (size_t i = 0; i < V1190_CHANNEL_MASK_WORDS; ++i) printf(" %04X", c.channels[i]);
-    if (gVmeConfig.v775.enabled) {
-        printf("\n  V775 : firmware=0x%04X status=[0x%04X,0x%04X] BitSet2=0x%04X FSR=0x%04X\n",
-               tf, ts1, ts2, tb, fsr);
-        printf("    VALID=0 datum write: %s (invalid datum %s buffer)\n",
-               tb & V775_BIT2_VALID_CONTROL ? "ENABLED" : "DISABLED",
-               tb & V775_BIT2_VALID_CONTROL ? "is written to" : "is not written to");
-    } else {
-        printf("\n  V775 : DISABLED (no access)\n");
-    }
-    printf("  V792 thresholds:");
-    for (unsigned i = 0; i < V792_MAX_CHANNELS; ++i) printf(" %03X", vth[i]);
-    if (gVmeConfig.v775.enabled) {
-        printf("\n  V775 thresholds:");
-        for (unsigned i = 0; i < V775_MAX_CHANNELS; ++i) printf(" %03X", tth[i]);
-    }
-    printf("\n");
-    return true;
-}
-
 static bool configure_v792_for_run()
 {
     if (!gVmeConfig.v792.enabled) return true;
-    const DWORD zsreg=gVmeConfig.v792.zero_suppression_enabled?V792_BIT_CLEAR2_WO:V792_BIT_SET2_RW;
-    const DWORD atreg=gVmeConfig.v792.all_trigger_enabled?V792_BIT_SET2_RW:V792_BIT_CLEAR2_WO;
-    return vme_write16(V792_BASE + V792_IPED_RW, gVmeConfig.v792.iped, "V792 Iped") &&
-           vme_write16(V792_BASE + zsreg,v7xx_config::kV792LowThreshold,"V792 zero suppression") &&
-           vme_write16(V792_BASE + atreg,v7xx_config::kV792AllTrigger,"V792 ALL TRG");
+    return v792_config::configure_for_run(v792_configuration_access(), gVmeConfig.v792);
 }
 
 
@@ -1765,14 +1267,7 @@ static bool configure_v1190_for_run()
 static bool configure_v775_for_run()
 {
     if (!gVmeConfig.v775.enabled) return true;
-    WORD set = 0, clear = 0;
-    v7xx_config::v775_run_bits(gVmeConfig.v775, set, clear);
-    return vme_write16(V775_BASE + V775_FULL_SCALE_RANGE, gVmeConfig.v775.full_scale_range,
-                       "V775 Full Scale Range") &&
-           vme_write16(V775_BASE + V775_BIT_SET2, set,
-                       "V775 run bits set") &&
-           vme_write16(V775_BASE + V775_BIT_CLEAR2, clear,
-                       "V775 run bits clear");
+    return v775_config::configure_for_run(v775_configuration_access(), gVmeConfig.v775);
 }
 //************************************//
 // Configure and verify V1720E using the captured run settings
@@ -1832,35 +1327,21 @@ static bool configure_v1720e_for_run()
     return true;
 }
 
-static bool verify_value(const char *module, const char *item,
-                         unsigned expected, unsigned actual)
-{
-    if (expected == actual) return true;
-    cm_msg(MERROR, frontend_name,
-           "%s configuration verify failed: %s expected 0x%X, read back 0x%X",
-           module, item, expected, actual);
-    return false;
-}
-
 //************************************//
 // Verify V792 registers and publish their readback
 //************************************//
 static bool verify_v792_configuration()
 {
     if(!gVmeConfig.v792.enabled) { set_module_readback_valid(V792_READBACK_PATH,false); return true; }
-    WORD iped=0,bits=0,firmware=0,thresholds[32]={};
-    if (!vme_read16(V792_BASE + V792_IPED_RW, iped, "V792 Iped verify") ||
-        !vme_read16(V792_BASE + V792_BIT_SET2_RW,bits,"V792 Bit Set 2 verify") ||
-        !vme_read16(V792_BASE + V792_FIRM_REV,firmware,"V792 Firmware verify") ||
-        v792_ThresholdRead(gVme,V792_BASE,thresholds)!=V792_MAX_CHANNELS) return false;
-    const BOOL zs=!(bits&v7xx_config::kV792LowThreshold), all=!!(bits&v7xx_config::kV792AllTrigger);
-    bool ok=verify_value("V792","Iped",gVmeConfig.v792.iped,iped&0xFF);
-    ok=verify_value("V792","ZeroSuppression",gVmeConfig.v792.zero_suppression_enabled,zs)&&ok;
-    ok=verify_value("V792","AllTrigger",gVmeConfig.v792.all_trigger_enabled,all)&&ok;
+    v792_config::Readback result;
+    const auto status = v792_config::verify_configuration(v792_configuration_access(), gVmeConfig.v792, result);
+    if (status == v792_config::VerifyStatus::ReadFailure) return false;
+    const bool ok = status == v792_config::VerifyStatus::Matched;
     v7xx_config::capture_v792_readback(
-        gVmeModuleState.snapshot.v792_readback, firmware, iped, bits,
-        zs, all, thresholds, ok);
-    vme_odb::publish_v792_readback(firmware, iped, zs, all, bits, thresholds, ok);
+        gVmeModuleState.snapshot.v792_readback, result.firmware, result.iped, result.bits,
+        result.zero_suppression, result.all_trigger, result.thresholds, ok);
+    vme_odb::publish_v792_readback(result.firmware, result.iped, result.zero_suppression,
+                                   result.all_trigger, result.bits, result.thresholds, ok);
     return ok;
 }
 
@@ -1884,17 +1365,15 @@ static bool verify_v1190_configuration()
 static bool verify_v775_configuration()
 {
     if(!gVmeConfig.v775.enabled) { set_module_readback_valid(V775_READBACK_PATH,false); return true; }
-    WORD fsr=0,bits=0,firmware=0,fclr=0,thresholds[32]={};
-    if (!vme_read16(V775_BASE + V775_FULL_SCALE_RANGE, fsr, "V775 FSR verify") ||
-        !vme_read16(V775_BASE+V775_BIT_SET2,bits,"V775 Bit Set 2 verify") || !vme_read16(V775_BASE+V775_FIRMWARE_REVISION,firmware,"V775 Firmware") || !vme_read16(V775_BASE+V775_FCLR_WINDOW,fclr,"V775 Fast Clear") || v775_ThresholdRead(gVme,V775_BASE,thresholds)!=V775_MAX_CHANNELS) return false;
-    bool ok=verify_value("V775","Full Scale Range",gVmeConfig.v775.full_scale_range,fsr&0xFF);
-#define VV775(name,member,bit) ok=verify_value("V775",name,gVmeConfig.v775.member,!!(bits&bit))&&ok
-    VV775("OverRange",over_range_enabled,V775_BIT2_OVER_RANGE); VV775("LowThreshold",low_threshold_enabled,V775_BIT2_LOW_THRESHOLD); VV775("CommonStop",common_stop,V775_BIT2_COMMON_STOP); VV775("EmptyProgram",empty_program_enabled,V775_BIT2_EMPTY_PROGRAM); VV775("ValidControl",valid_control_enabled,V775_BIT2_VALID_CONTROL); VV775("SlidingScale",sliding_scale_enabled,V775_BIT2_SLIDE_ENABLE); VV775("AllTrigger",all_trigger_enabled,V775_BIT2_ALL_TRIGGER);
-#undef VV775
+    v775_config::Readback result;
+    const auto status = v775_config::verify_configuration(v775_configuration_access(), gVmeConfig.v775, result);
+    if (status == v775_config::VerifyStatus::ReadFailure) return false;
+    const bool ok = status == v775_config::VerifyStatus::Matched;
     v7xx_config::capture_v775_readback(
-        gVmeModuleState.snapshot.v775_readback, firmware, fsr, fclr,
-        bits, thresholds, ok);
-    vme_odb::publish_v775_readback(firmware, fsr, fclr, bits, thresholds, ok);
+        gVmeModuleState.snapshot.v775_readback, result.firmware, result.full_scale, result.fast_clear,
+        result.bits, result.thresholds, ok);
+    vme_odb::publish_v775_readback(result.firmware, result.full_scale, result.fast_clear,
+                                   result.bits, result.thresholds, ok);
     return ok;
 }
 //************************************//
@@ -1902,17 +1381,17 @@ static bool verify_v775_configuration()
 //************************************//
 static bool clear_module_buffers()
 {
-    if (gVmeConfig.v792.enabled &&
-        (!vme_write16(V792_BASE + V792_BIT_SET2_RW,0x0004,"V792 Data Clear set") || !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO,0x0004,"V792 Data Clear clear"))) return false;
-    if (gV1190Config.run_settings.enabled && !vme_write16(V1190_BASE+V1190_SOFT_CLEAR,0,"V1190 Software Clear")) return false;
-    if (gVmeConfig.v775.enabled &&
-        (!vme_write16(V775_BASE + V775_BIT_SET2, V775_BIT2_CLEAR_DATA, "V775 Data Clear set") ||
-         !vme_write16(V775_BASE + V775_BIT_CLEAR2, V775_BIT2_CLEAR_DATA, "V775 Data Clear clear"))) return false;
-    WORD status = 0;
-    if (gV1190Config.run_settings.enabled && !vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 Status after clear")) return false;
-    if ((gVmeConfig.v792.enabled && v792_DataReady(gVme,V792_BASE)) || (gV1190Config.run_settings.enabled && (status&V1190_STATUS_DATA_READY))
-        || (gVmeConfig.v775.enabled && v775_DataReady(gVme,V775_BASE))
-        ) {
+    if (gVmeConfig.v792.enabled && !v792_config::clear_data(v792_configuration_access(), false)) return false;
+    if (gV1190Config.run_settings.enabled && !v1190_clear::software_clear(v1190_clear_access(), "V1190 Software Clear")) return false;
+    if (gVmeConfig.v775.enabled && !v775_config::clear_data(v775_configuration_access(), false)) return false;
+    v1190_clear::CheckResult v1190_check = v1190_clear::CheckResult::Empty;
+    if (gV1190Config.run_settings.enabled) {
+        v1190_check = v1190_clear::verify_clear(v1190_clear_access(), "V1190 Status after clear");
+        if (v1190_check == v1190_clear::CheckResult::ReadFailed) return false;
+    }
+    if ((gVmeConfig.v792.enabled && v792_DataReady(gVme,V792_BASE)) ||
+        (gV1190Config.run_settings.enabled && v1190_check == v1190_clear::CheckResult::DataReady) ||
+        (gVmeConfig.v775.enabled && v775_DataReady(gVme,V775_BASE))) {
         cm_msg(MERROR, frontend_name, "Buffer clear verify failed: DataReady remains asserted");
         return false;
     }
@@ -2038,10 +1517,7 @@ static void execute_manual_buffer_clear(const ManualBufferClearRequest &request,
 
     if (!v792.enabled) {
         gBufferClearResults.v792 = "Skipped: disabled in ODB";
-    } else if (!vme_write16(V792_BASE + V792_BIT_SET2_RW, 0x0004,
-                            "V792 manual Data Clear set") ||
-               !vme_write16(V792_BASE + V792_BIT_CLEAR2_WO, 0x0004,
-                            "V792 manual Data Clear clear")) {
+    } else if (!v792_config::clear_data(v792_configuration_access(), true)) {
         fail("V792", gBufferClearResults.v792, "Data Clear write failed");
     } else if (v792_DataReady(gVme, V792_BASE)) {
         fail("V792", gBufferClearResults.v792,
@@ -2050,32 +1526,23 @@ static void execute_manual_buffer_clear(const ManualBufferClearRequest &request,
         gBufferClearResults.v792 = "Succeeded: Data Clear";
     }
 
-    WORD v1190_status = 0;
     if (!v1190.enabled) {
         gBufferClearResults.v1190 = "Skipped: disabled in ODB";
-    } else if (!vme_write16(V1190_BASE + V1190_SOFT_CLEAR, 0,
-                            "V1190 manual Software Clear")) {
-        fail("V1190", gBufferClearResults.v1190,
-             "Software Clear write failed");
-    } else if (!vme_read16(V1190_BASE + V1190_STATUS, v1190_status,
-                           "V1190 Status after manual Software Clear")) {
-        fail("V1190", gBufferClearResults.v1190,
-             "status verification read failed");
-    } else if (v1190_status & V1190_STATUS_DATA_READY) {
-        fail("V1190", gBufferClearResults.v1190,
-             "DataReady remains asserted after Software Clear");
+    } else if (!v1190_clear::software_clear(v1190_clear_access(), "V1190 manual Software Clear")) {
+        fail("V1190", gBufferClearResults.v1190, "Software Clear write failed");
     } else {
-        gBufferClearResults.v1190 = "Succeeded: Software Clear";
+        const auto check = v1190_clear::verify_clear(v1190_clear_access(), "V1190 Status after manual Software Clear");
+        if (check == v1190_clear::CheckResult::ReadFailed)
+            fail("V1190", gBufferClearResults.v1190, "status verification read failed");
+        else if (check == v1190_clear::CheckResult::DataReady)
+            fail("V1190", gBufferClearResults.v1190, "DataReady remains asserted after Software Clear");
+        else
+            gBufferClearResults.v1190 = "Succeeded: Software Clear";
     }
 
     if (!v775.enabled) {
         gBufferClearResults.v775 = "Skipped: disabled in ODB";
-    } else if (!vme_write16(V775_BASE + V775_BIT_SET2,
-                            V775_BIT2_CLEAR_DATA,
-                            "V775 manual Data Clear set") ||
-               !vme_write16(V775_BASE + V775_BIT_CLEAR2,
-                            V775_BIT2_CLEAR_DATA,
-                            "V775 manual Data Clear clear")) {
+    } else if (!v775_config::clear_data(v775_configuration_access(), true)) {
         fail("V775", gBufferClearResults.v775, "Data Clear write failed");
     } else if (v775_DataReady(gVme, V775_BASE)) {
         fail("V775", gBufferClearResults.v775,
@@ -2148,17 +1615,6 @@ static void process_manual_buffer_clear_request()
     finish_manual_buffer_clear_request(request, result);
 }
 
-static bool reset_module_event_counters()
-{
-    /*
-     * No additional VME write is needed here. V792 (and enabled V775) Data
-     * Clear resets accepted-event counters because ALL TRG is configured zero.
-     * V1190 Software Clear resets both its Output Buffer and Event Counter.
-     * verify_run_start_state() reads and logs all enabled counters.
-     */
-    return true;
-}
-
 static bool verify_run_start_state()
 {
     WORD status = 0;
@@ -2210,8 +1666,7 @@ static bool prepare_modules_for_run()
     if (!verify_v792_configuration() || !verify_v1190_configuration()
         || !verify_v775_configuration()
         ) return false;
-    if (!clear_module_buffers() || !reset_module_event_counters() ||
-        !verify_run_start_state())
+    if (!clear_module_buffers() || !verify_run_start_state())
         return false;
     if (!gV1720State.run.settings.enabled) {
         gV1720State.lifecycle.start_attempted = false;
@@ -2326,18 +1781,33 @@ static void log_run_statistics()
 static void refresh_enabled_module_variables()
 {
     if(gVmeConfig.v792.enabled) {
-        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v792.event_counter;
-        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 final Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 final Status2")) { v792_EvtCntRead(gVme,V792_BASE,&counter); gVmeModuleState.v792.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v792,s1,s2,counter); } else gVmeModuleState.v792.communication_ok=FALSE;
+        module_status_snapshot::V7xxSnapshot snapshot = {0, 0, gVmeModuleState.v792.event_counter};
+        if (module_status_snapshot::read_v7xx(gVme, V792_BASE, V792_CSR1_RO, V792_CSR2_RO,
+                                               "V792 final Status1", "V792 final Status2", vme_read16_at,
+                                               v792_EvtCntRead, snapshot)) {
+            gVmeModuleState.v792.communication_ok=TRUE;
+            decode_v7xx_runtime(gVmeModuleState.v792,snapshot.status1,snapshot.status2,snapshot.counter);
+        } else gVmeModuleState.v792.communication_ok=FALSE;
         publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
     }
     if(gV1190Config.run_settings.enabled) {
-        WORD status=0,stored=0; DWORD counter=gVmeModuleState.v1190.event_counter;
-        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 final Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 final Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 final Event Counter")) { gVmeModuleState.v1190.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter); } else gVmeModuleState.v1190.communication_ok=FALSE;
+        module_status_snapshot::V1190Snapshot snapshot = {0, 0, gVmeModuleState.v1190.event_counter};
+        if (module_status_snapshot::read_v1190(gVme, V1190_BASE, V1190_STATUS, V1190_EVENT_STORED, V1190_EVENT_COUNTER,
+                                                "V1190 final Status", "V1190 final Event Stored", "V1190 final Event Counter",
+                                                vme_read16_at, vme_read32_at, snapshot)) {
+            gVmeModuleState.v1190.communication_ok=TRUE;
+            decode_v1190_runtime(snapshot.status,snapshot.stored,snapshot.counter);
+        } else gVmeModuleState.v1190.communication_ok=FALSE;
         publish_v1190_variables();
     }
     if(gVmeConfig.v775.enabled) {
-        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v775.event_counter;
-        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 final Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 final Status2")) { v775_EvtCntRead(gVme,V775_BASE,&counter); gVmeModuleState.v775.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v775,s1,s2,counter); } else gVmeModuleState.v775.communication_ok=FALSE;
+        module_status_snapshot::V7xxSnapshot snapshot = {0, 0, gVmeModuleState.v775.event_counter};
+        if (module_status_snapshot::read_v7xx(gVme, V775_BASE, V775_STATUS1, V775_STATUS2,
+                                               "V775 final Status1", "V775 final Status2", vme_read16_at,
+                                               v775_EvtCntRead, snapshot)) {
+            gVmeModuleState.v775.communication_ok=TRUE;
+            decode_v7xx_runtime(gVmeModuleState.v775,snapshot.status1,snapshot.status2,snapshot.counter);
+        } else gVmeModuleState.v775.communication_ok=FALSE;
         publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
     }
 }
@@ -2629,12 +2099,7 @@ INT begin_of_run(INT run_number, char *error)
     }
     reset_run_statistics();
     gVmeStatistics.v1190_blt_diagnostics.store(0, std::memory_order_relaxed);
-    gVmeStatistics.v1720_blt_diagnostics.store(0, std::memory_order_relaxed);
     v1190_fifo_blt_state_reset(&gVmeState.v1190_fifo_blt);
-    gVmeStatistics.rpv130_timing_events.store(0, std::memory_order_relaxed);
-    gVmeStatistics.rpv130_poll_ready_ns.store(0, std::memory_order_relaxed);
-    gVmeStatistics.rpv130_last_poll_miss_ns.store(0, std::memory_order_relaxed);
-    gVmeStatistics.rpv130_poll_previous_miss_ns.store(0, std::memory_order_relaxed);
     mark_run_counters_dirty();
     if (!publish_run_counters()) {
         cm_msg(MERROR, frontend_name,
@@ -2909,23 +2374,32 @@ INT frontend_loop()
         return SUCCESS;
     }
     if(gVmeConfig.v792.enabled && due(now,gVmeModuleState.v792_last_publish,gVmeModuleState.v792.dirty)) {
-        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v792.event_counter;
-        if(vme_read16(V792_BASE+V792_CSR1_RO,s1,"V792 runtime Status1")&&vme_read16(V792_BASE+V792_CSR2_RO,s2,"V792 runtime Status2")) {
-            v792_EvtCntRead(gVme,V792_BASE,&counter); gVmeModuleState.v792.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v792,s1,s2,counter);
+        module_status_snapshot::V7xxSnapshot snapshot = {0, 0, gVmeModuleState.v792.event_counter};
+        if (module_status_snapshot::read_v7xx(gVme, V792_BASE, V792_CSR1_RO, V792_CSR2_RO,
+                                               "V792 runtime Status1", "V792 runtime Status2", vme_read16_at,
+                                               v792_EvtCntRead, snapshot)) {
+            gVmeModuleState.v792.communication_ok=TRUE;
+            decode_v7xx_runtime(gVmeModuleState.v792,snapshot.status1,snapshot.status2,snapshot.counter);
         } else gVmeModuleState.v792.communication_ok=FALSE;
         publish_v7xx_variables(V792_VARIABLES_PATH,gVmeModuleState.v792,gVmeModuleState.v792_last_publish);
     }
     if(gV1190Config.run_settings.enabled && due(now,gVmeModuleState.v1190_last_publish,gVmeModuleState.v1190.dirty)) {
-        WORD status=0,stored=0; DWORD counter=gVmeModuleState.v1190.event_counter;
-        if(vme_read16(V1190_BASE+V1190_STATUS,status,"V1190 runtime Status")&&vme_read16(V1190_BASE+V1190_EVENT_STORED,stored,"V1190 runtime Event Stored")&&vme_read32(V1190_BASE+V1190_EVENT_COUNTER,counter,"V1190 runtime Event Counter")) {
-            gVmeModuleState.v1190.communication_ok=TRUE; decode_v1190_runtime(status,stored,counter);
+        module_status_snapshot::V1190Snapshot snapshot = {0, 0, gVmeModuleState.v1190.event_counter};
+        if (module_status_snapshot::read_v1190(gVme, V1190_BASE, V1190_STATUS, V1190_EVENT_STORED, V1190_EVENT_COUNTER,
+                                                "V1190 runtime Status", "V1190 runtime Event Stored", "V1190 runtime Event Counter",
+                                                vme_read16_at, vme_read32_at, snapshot)) {
+            gVmeModuleState.v1190.communication_ok=TRUE;
+            decode_v1190_runtime(snapshot.status,snapshot.stored,snapshot.counter);
         } else gVmeModuleState.v1190.communication_ok=FALSE;
         publish_v1190_variables();
     }
     if(gVmeConfig.v775.enabled && due(now,gVmeModuleState.v775_last_publish,gVmeModuleState.v775.dirty)) {
-        WORD s1=0,s2=0; DWORD counter=gVmeModuleState.v775.event_counter;
-        if(vme_read16(V775_BASE+V775_STATUS1,s1,"V775 runtime Status1")&&vme_read16(V775_BASE+V775_STATUS2,s2,"V775 runtime Status2")) {
-            v775_EvtCntRead(gVme,V775_BASE,&counter); gVmeModuleState.v775.communication_ok=TRUE; decode_v7xx_runtime(gVmeModuleState.v775,s1,s2,counter);
+        module_status_snapshot::V7xxSnapshot snapshot = {0, 0, gVmeModuleState.v775.event_counter};
+        if (module_status_snapshot::read_v7xx(gVme, V775_BASE, V775_STATUS1, V775_STATUS2,
+                                               "V775 runtime Status1", "V775 runtime Status2", vme_read16_at,
+                                               v775_EvtCntRead, snapshot)) {
+            gVmeModuleState.v775.communication_ok=TRUE;
+            decode_v7xx_runtime(gVmeModuleState.v775,snapshot.status1,snapshot.status2,snapshot.counter);
         } else gVmeModuleState.v775.communication_ok=FALSE;
         publish_v7xx_variables(V775_VARIABLES_PATH,gVmeModuleState.v775,gVmeModuleState.v775_last_publish);
     }
@@ -2961,24 +2435,9 @@ INT poll_event(INT source, INT count, BOOL test)
         return 0;
     for (INT i = 0; i < count; ++i) {
         if (v792_DataReady(gVme, V792_BASE) && !test) {
-            if (gVmeState.single_event_busy_enabled_for_run &&
-                gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
-                    RPV130_TIMING_EVENT_LIMIT) {
-                uint64_t empty = 0;
-                if (gVmeStatistics.rpv130_poll_ready_ns.compare_exchange_strong(
-                        empty, monotonic_ns(), std::memory_order_relaxed))
-                    gVmeStatistics.rpv130_poll_previous_miss_ns.store(
-                        gVmeStatistics.rpv130_last_poll_miss_ns.load(std::memory_order_relaxed),
-                        std::memory_order_relaxed);
-            }
             return 1;
         }
     }
-    if (!test && gVmeState.single_event_busy_enabled_for_run &&
-        gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
-            RPV130_TIMING_EVENT_LIMIT)
-        gVmeStatistics.rpv130_last_poll_miss_ns.store(monotonic_ns(),
-                                    std::memory_order_relaxed);
     return 0;
 }
 
@@ -3054,54 +2513,49 @@ static void log_event_counter_mismatch(const V792EventInfo &v792,
 static bool update_v1720e_integrity(const V1720E_EVENT_INFO &event,
                                     DWORD midas_serial)
 {
-    bool valid = true;
-    if (!event.size_valid) {
-        valid = false;
+    const auto &run = gVmeStatistics.run;
+    const v1720e_integrity::State previous = {
+        run.v1720_have_previous, run.v1720_first_counter, run.v1720_last_counter,
+        run.v1720_previous_counter, run.v1720_previous_ttt, run.v1720_ttt_count,
+        run.v1720_min_ttt_delta, run.v1720_max_ttt_delta};
+    const v1720e_integrity::Event current = {
+        event.event_size, event.channel_mask, event.event_counter, event.trigger_time_tag};
+    const auto result = v1720e_integrity::check(
+        current, gV1720State.run.expected_event_words,
+        gV1720State.run.expected_channel_mask, previous);
+
+    if (!result.size_valid) {
         ++gVmeStatistics.run.v1720_size_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Event Size error at MIDAS serial %u: got %u, expected %u",
                midas_serial, event.event_size, gV1720State.run.expected_event_words);
     }
-    if (!event.channel_mask_valid) {
-        valid = false;
+    if (!result.channel_mask_valid) {
         ++gVmeStatistics.run.v1720_mask_error_count;
         mark_run_counters_dirty();
         cm_msg(MERROR, frontend_name,
                "V1720E Channel Mask error at MIDAS serial %u: got 0x%02X, expected 0x%02X",
                midas_serial, event.channel_mask, gV1720State.run.expected_channel_mask);
     }
-    if (!gVmeStatistics.run.v1720_have_previous) {
-        gVmeStatistics.run.v1720_first_counter = event.event_counter;
-        gVmeStatistics.run.v1720_have_previous = true;
-    } else {
-        const DWORD counter_delta =
-            (event.event_counter - gVmeStatistics.run.v1720_previous_counter) &
-            V7XX_EVENT_COUNTER_MASK;
-        const DWORD ttt_delta =
-            (event.trigger_time_tag - gVmeStatistics.run.v1720_previous_ttt) &
-            0x7FFFFFFFu;
-        if (counter_delta != 1) {
-            valid = false;
-            ++gVmeStatistics.run.v1720_counter_discontinuity_count;
-            mark_run_counters_dirty();
-            cm_msg(MERROR, frontend_name,
-                   "V1720E counter discontinuity at MIDAS serial %u: "
-                   "previous=%u current=%u delta=%u",
-                   midas_serial, gVmeStatistics.run.v1720_previous_counter,
-                   event.event_counter, counter_delta);
-        }
-        if (gVmeStatistics.run.v1720_ttt_count == 0 ||
-            ttt_delta < gVmeStatistics.run.v1720_min_ttt_delta)
-            gVmeStatistics.run.v1720_min_ttt_delta = ttt_delta;
-        if (ttt_delta > gVmeStatistics.run.v1720_max_ttt_delta)
-            gVmeStatistics.run.v1720_max_ttt_delta = ttt_delta;
-        ++gVmeStatistics.run.v1720_ttt_count;
+    if (!result.counter_continuous) {
+        ++gVmeStatistics.run.v1720_counter_discontinuity_count;
+        mark_run_counters_dirty();
+        cm_msg(MERROR, frontend_name,
+               "V1720E counter discontinuity at MIDAS serial %u: "
+               "previous=%u current=%u delta=%u",
+               midas_serial, previous.previous_counter,
+               event.event_counter, result.counter_delta);
     }
-    gVmeStatistics.run.v1720_last_counter = event.event_counter;
-    gVmeStatistics.run.v1720_previous_counter = event.event_counter;
-    gVmeStatistics.run.v1720_previous_ttt = event.trigger_time_tag;
-    return valid;
+    gVmeStatistics.run.v1720_have_previous = result.next.have_previous;
+    gVmeStatistics.run.v1720_first_counter = result.next.first_counter;
+    gVmeStatistics.run.v1720_last_counter = result.next.last_counter;
+    gVmeStatistics.run.v1720_previous_counter = result.next.previous_counter;
+    gVmeStatistics.run.v1720_previous_ttt = result.next.previous_ttt;
+    gVmeStatistics.run.v1720_ttt_count = result.next.ttt_count;
+    gVmeStatistics.run.v1720_min_ttt_delta = result.next.min_ttt_delta;
+    gVmeStatistics.run.v1720_max_ttt_delta = result.next.max_ttt_delta;
+    return result.valid();
 }
 
 //************************************//
@@ -3139,35 +2593,15 @@ INT read_vme_event(char *pevent, INT off)
 {
     if (!gVmeState.frontend_enabled_for_run)
         return 0;
-    Rpv130EventTiming timing;
-    if (gVmeState.single_event_busy_enabled_for_run &&
-        gVmeStatistics.rpv130_timing_events.load(std::memory_order_relaxed) <
-            RPV130_TIMING_EVENT_LIMIT)
-        timing.read_start_ns = monotonic_ns();
     if (!global_busy::readout_allowed())
         return 0;
     if (!gVme || gVmeState.readout_failed)
         return 0;
-    if (gVmeState.single_event_busy_enabled_for_run && timing.read_start_ns) {
-        const unsigned index = gVmeStatistics.rpv130_timing_events.fetch_add(
-            1, std::memory_order_relaxed) + 1;
-        timing.active = index <= RPV130_TIMING_EVENT_LIMIT;
-        if (timing.active) {
-            timing.index = index;
-            timing.serial = SERIAL_NUMBER(pevent);
-            timing.poll_ready_ns = gVmeStatistics.rpv130_poll_ready_ns.exchange(
-                0, std::memory_order_relaxed);
-            timing.poll_previous_miss_ns = gVmeStatistics.rpv130_poll_previous_miss_ns.exchange(
-                0, std::memory_order_relaxed);
-        }
-    }
-
     if (gVmeState.single_event_busy_enabled_for_run) {
         bool busy1 = false;
         uint8_t csr1 = 0;
         const int busy_status = rpv130_read_busy1(
             gVme, RPV130_BASE_ADDRESS, &busy1, &csr1);
-        if (timing.active) timing.csr_confirm_ns = monotonic_ns();
         if (busy_status != MVME_SUCCESS ||
             !busy1 ||
             (csr1 & RPV130_CSR1_CHANNEL1_ARMED) !=
@@ -3182,24 +2616,16 @@ INT read_vme_event(char *pevent, INT off)
     }
 
     // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
-    if (timing.active) timing.peers_start_ns = monotonic_ns();
     bool peers_ready = true;
     if (gV1190Config.run_settings.enabled) {
-        if (timing.active) timing.v1190_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v1190_data_ready();
-        if (timing.active) timing.v1190_ready_end_ns = monotonic_ns();
     }
     if (peers_ready && gVmeConfig.v775.enabled) {
-        if (timing.active) timing.v775_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v775_data_ready();
-        if (timing.active) timing.v775_ready_end_ns = monotonic_ns();
     }
     if (peers_ready && gV1720State.run.settings.enabled) {
-        if (timing.active) timing.v1720_ready_start_ns = monotonic_ns();
         peers_ready = wait_for_v1720e_data_ready();
-        if (timing.active) timing.v1720_ready_end_ns = monotonic_ns();
     }
-    if (timing.active) timing.peers_end_ns = monotonic_ns();
     if (!peers_ready) {
         gVmeState.readout_failed = true;
         cm_msg(MERROR, frontend_name,
@@ -3215,11 +2641,7 @@ INT read_vme_event(char *pevent, INT off)
     DWORD v1720_data[V1720E_MAX_EVENT_WORDS];
     V792EventInfo v792 = {};
     if (gVmeConfig.v792.enabled) {
-        if (timing.active) timing.v792_start_ns = monotonic_ns();
-        v792 = V792_READOUT_MODE_SELECT == V792_BLT32 ?
-            read_v792_blt32_event(v792_data) :
-            read_v792_single_event(v792_data);
-        if (timing.active) timing.v792_end_ns = monotonic_ns();
+        v792 = read_v792_event(v792_data);
     }
     if (gVmeConfig.v792.enabled && (!v792.valid || v792.words == 0)) {
         gVmeState.readout_failed = true;
@@ -3230,20 +2652,8 @@ INT read_vme_event(char *pevent, INT off)
     }
 
     V1190EventInfo v1190 = {};
-    V1190_FIFO_BLT_TIMING v1190_phases = {};
-    bool v1190_diagnostic = false;
     if (gV1190Config.run_settings.enabled) {
-        if (timing.active ||
-            V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
-            timing.v1190_start_ns = monotonic_ns();
-        v1190 = V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32 ?
-            read_v1190_fifo_blt32_event(v1190_data, v1190_phases,
-                                         v1190_diagnostic) :
-            read_v1190_single_event(v1190_data);
-        if (timing.active ||
-            V1190_READOUT_MODE_SELECT == V1190_EVENT_FIFO_BLT32)
-            timing.v1190_end_ns = monotonic_ns();
-
+        v1190 = read_v1190_event(v1190_data);
     }
     if (gV1190Config.run_settings.enabled && (!v1190.valid || v1190.words == 0)) {
         gVmeState.readout_failed = true;
@@ -3255,9 +2665,13 @@ INT read_vme_event(char *pevent, INT off)
 
     V775EventInfo v775 = {};
     if (gVmeConfig.v775.enabled) {
-        if (timing.active) timing.v775_start_ns = monotonic_ns();
-        v775 = read_v775_single_event(v775_data);
-        if (timing.active) timing.v775_end_ns = monotonic_ns();
+        const v775_readout::Access access = {gVme, V775_BASE, frontend_name,
+                                             mvme_get_dmode, mvme_set_dmode, mvme_read};
+        v775 = v775_readout::read_single_event(access, v775_data);
+        if (v775.eob_consumed) {
+            gVmeModuleState.v775.event_counter = v775.event_counter;
+            gVmeModuleState.v775.dirty = true;
+        }
     }
     if (gVmeConfig.v775.enabled && (!v775.valid || v775.words == 0)) {
         gVmeState.readout_failed = true;
@@ -3270,16 +2684,12 @@ INT read_vme_event(char *pevent, INT off)
     V1720E_EVENT_INFO v1720 = {};
     V1720E_EVENT_INFO *v1720_event = NULL;
     if (gV1720State.run.settings.enabled) {
-        if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
-            timing.v1720_start_ns = monotonic_ns();
         const int v1720_status =
             v1720e_read_event_mode(gVme, V1720E_BASE, v1720_data,
                                    V1720E_MAX_EVENT_WORDS,
                                    gV1720State.run.expected_event_words,
                                    gV1720State.run.expected_channel_mask,
                                    V1720E_READOUT_MODE_SELECT, &v1720);
-        if (timing.active || V1720E_READOUT_MODE_SELECT == BLT32)
-            timing.v1720_end_ns = monotonic_ns();
         if (v1720_status != MVME_SUCCESS || !v1720.header_valid ||
             v1720.words < 4) {
             if (V1720E_READOUT_MODE_SELECT == BLT32 &&
@@ -3327,30 +2737,19 @@ INT read_vme_event(char *pevent, INT off)
         log_event_counter_mismatch(v792, v1190, v775, v1720_event,
                                    SERIAL_NUMBER(pevent));
     }
-    if (timing.active) {
-        timing.consistency_end_ns = monotonic_ns();
-        timing.build_start_ns = timing.consistency_end_ns;
-    }
-
     const INT event_size = build_midas_event(pevent,
                              v792_data, v792,
                              v1190_data, v1190,
                              v775_data, v775,
                              v1720_data, v1720_event);
-    if (timing.active) timing.build_end_ns = monotonic_ns();
     if (gVmeState.single_event_busy_enabled_for_run) {
         if (event_size <= 0) {
             fail_single_event_busy("MIDAS event construction failed");
             return 0;
         }
         uint8_t csr1 = 0;
-        if (timing.active) timing.clear_call_ns = monotonic_ns();
-        const int clear_status = timing.active ?
-            rpv130_clear_busy1_preserving_enable_state_timed(
-                gVme, RPV130_BASE_ADDRESS, &csr1, &timing.writes) :
-            rpv130_clear_busy1_preserving_enable_state(
-                gVme, RPV130_BASE_ADDRESS, &csr1);
-        if (timing.active) timing.clear_return_ns = monotonic_ns();
+        const int clear_status = rpv130_clear_busy1_preserving_enable_state(
+            gVme, RPV130_BASE_ADDRESS, &csr1);
         if (clear_status != MVME_SUCCESS) {
             fail_single_event_busy("CLR1 or CSR1 readback failed");
             return 0;
@@ -3361,7 +2760,6 @@ INT read_vme_event(char *pevent, INT off)
             return 0;
         }
     }
-    timing.outcome = "OK";
     return event_size;
 }
 

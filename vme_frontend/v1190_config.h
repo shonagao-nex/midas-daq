@@ -3,6 +3,7 @@
 
 #include "vme_odb.h"
 #include <cstddef>
+#include <functional>
 
 namespace v1190_config {
 
@@ -11,10 +12,10 @@ constexpr size_t kChannelMaskWords = 8;
 struct Access {
     bool (*read16)(DWORD, WORD &, const char *);
     bool (*write16)(DWORD, WORD, const char *);
-    bool (*micro_write_opcode)(WORD);
-    bool (*micro_write_command)(WORD, const WORD *, size_t);
-    bool (*micro_read_command)(WORD, WORD *, size_t);
-    bool (*read_acquisition_mode)(WORD &);
+    std::function<bool(WORD)> micro_write_opcode;
+    std::function<bool(WORD, const WORD *, size_t)> micro_write_command;
+    std::function<bool(WORD, WORD *, size_t)> micro_read_command;
+    std::function<bool(WORD &)> read_acquisition_mode;
 };
 
 struct V1190Configuration {

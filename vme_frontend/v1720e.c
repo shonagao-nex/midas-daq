@@ -28,6 +28,29 @@
 #define CHANNEL_CONFIG_ZS_MASK   0x000F0000u
 #define CHANNEL_CONFIG_PACK25    0x00000800u
 
+/* Decode raw acquisition status bits without reading registers. */
+V1720E_ACQUISITION_STATE v1720e_decode_acquisition_status(DWORD status)
+{
+    V1720E_ACQUISITION_STATE state;
+    state.running = (status & ACQUISITION_STATUS_RUN_ACTIVE) != 0;
+    state.event_ready = (status & STATUS_EVENT_READY) != 0;
+    state.external_clock = (status & STATUS_EXTERNAL_CLOCK) != 0;
+    state.pll_locked = (status & STATUS_PLL_OK) != 0;
+    state.board_ready = (status & STATUS_BOARD_READY) != 0;
+    return state;
+}
+
+/* Validate the three BoardInfo bytes used by this frontend. */
+V1720E_BOARD_ID v1720e_decode_board_info(DWORD board_info)
+{
+    V1720E_BOARD_ID id;
+    id.low_byte = board_info & 0xFFu;
+    id.model_byte = (board_info >> 8) & 0xFFu;
+    id.channels = (board_info >> 16) & 0xFFu;
+    id.supported = id.low_byte == 0x03u && id.model_byte == 0x02u && id.channels == 8u;
+    return id;
+}
+
 static uint64_t readout_monotonic_ns(void)
 {
     struct timespec ts = {0, 0};

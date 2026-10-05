@@ -53,6 +53,26 @@ typedef struct {
 } V1720E_BOARD_INFO;
 
 typedef struct {
+    int running;
+    int event_ready;
+    int external_clock;
+    int pll_locked;
+    int board_ready;
+} V1720E_ACQUISITION_STATE;
+
+typedef struct {
+    unsigned low_byte;
+    unsigned model_byte;
+    unsigned channels;
+    int supported;
+} V1720E_BOARD_ID;
+
+/* Decode raw acquisition status bits without reading registers. */
+V1720E_ACQUISITION_STATE v1720e_decode_acquisition_status(DWORD status);
+/* Validate the three BoardInfo bytes used by this frontend. */
+V1720E_BOARD_ID v1720e_decode_board_info(DWORD board_info);
+
+typedef struct {
     uint64_t header_read_ns[4];
     uint64_t header_decode_ns;
     uint64_t blt_ns;
