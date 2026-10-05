@@ -315,8 +315,8 @@ for _name, _command in ANALYZER_PROGRAMS.items():
 
 
 def same_value(actual, expected):
-    if isinstance(actual, str) and actual.startswith("0x") and isinstance(expected, int):
-        return int(actual, 16) == expected
+    if isinstance(actual, str) and isinstance(expected, int):
+        return int(actual, 16 if actual.lower().startswith("0x") else 10) == expected
     return actual == expected
 
 

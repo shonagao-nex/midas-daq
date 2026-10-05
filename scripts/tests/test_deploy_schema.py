@@ -63,6 +63,22 @@ class RunlogSlipSchemaTest(unittest.TestCase):
                 self.assertEqual(rpc.calls, ["db_delete", "db_create", "db_paste"])
                 self.assertTrue(schema.inspect_key(rpc, f"{schema.STATUS}/EventSlipCount", schema.INT64, 0))
 
+    def test_converted_signed_value_is_verified_as_decimal_string(self):
+        class DecimalSignedRpc(FakeRpc):
+            def value(self, path):
+                value = super().value(path)
+                if path == f"{schema.STATUS}/EventSlipCount" and self.tid == schema.INT64:
+                    return str(value)
+                return value
+
+        for value in (0, 17):
+            with self.subTest(value=value):
+                rpc = DecimalSignedRpc(schema.UINT64, f"0x{value:016x}")
+                schema.ensure_signed_slips(rpc)
+                self.assertEqual((rpc.tid, rpc.data), (schema.INT64, value))
+                self.assertEqual(rpc.value(f"{schema.STATUS}/EventSlipCount"), str(value))
+                self.assertEqual(rpc.calls, ["db_delete", "db_create", "db_paste"])
+
     def test_out_of_range_and_other_types_are_rejected_without_writes(self):
         for tid, value in ((schema.UINT64, "0x8000000000000000"), (schema.INT32, 5)):
             with self.subTest(tid=tid):
