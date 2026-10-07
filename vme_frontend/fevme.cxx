@@ -227,9 +227,16 @@ static bool initialize_buffer_clear_mailbox()
 // Initialize RPV130 ODB mapping and startup flags
 static bool initialize_rpv130_odb()
 {
-  return vme_odb::initialize_rpv130_odb(
+  if (!vme_odb::initialize_rpv130_odb(
     gVmeState.rpv130_enabled_for_run,
-    gVmeState.single_event_busy_enabled_for_run);
+    gVmeState.single_event_busy_enabled_for_run)) return false;
+  if (gVmeState.single_event_busy_enabled_for_run &&
+      !gVmeState.rpv130_enabled_for_run) {
+    cm_msg(MERROR, frontend_name,
+           "RPV130 SingleEventBusyEnabled requires Enabled at startup");
+    return false;
+  }
+  return true;
 }
 
 static void fail_single_event_busy(const char *reason);
@@ -332,6 +339,28 @@ static bool quiesce_rpv130_single_event_busy(const char *context)
          "RPV130 %s: CLR1/disable/readback failed: status %d CSR1=0x%02X",
          context, rc, csr1);
     vme_odb::publish_rpv130_armed(false);
+    return false;
+  }
+  gVmeState.rpv130_busy_configured = false;
+  return publish_rpv130_busy_state(false, false);
+}
+
+// Recover enabled RPV130 hardware from its registers, regardless of old run flags.
+static bool recover_rpv130_stopped_state(const char *context)
+{
+  if (!gVme || !global_busy::set_global_busy(true)) {
+    cm_msg(MERROR, frontend_name,
+           "RPV130 %s: cannot verify Global BUSY before hardware cleanup", context);
+    return false;
+  }
+  RPV130_STATUS before = {};
+  uint8_t csr1 = 0;
+  const int rc = rpv130_recover_stopped(
+    gVme, RPV130_BASE_ADDRESS, &before, &csr1);
+  if (rc != MVME_SUCCESS) {
+    cm_msg(MERROR, frontend_name,
+           "RPV130 %s: cleanup failed: status %d CSR1 0x%02X -> 0x%02X",
+           context, rc, before.csr1, csr1);
     return false;
   }
   gVmeState.rpv130_busy_configured = false;
@@ -1193,6 +1222,12 @@ static bool snapshot_rpv130_enabled_for_run()
                 sizeof(single_event_busy), TID_BOOL))
     return false;
   gVmeState.single_event_busy_enabled_for_run = single_event_busy != FALSE;
+  if (gVmeState.single_event_busy_enabled_for_run &&
+      !gVmeState.rpv130_enabled_for_run) {
+    cm_msg(MERROR, frontend_name,
+           "RPV130 SingleEventBusyEnabled requires Enabled at BOR");
+    return false;
+  }
   return true;
 }
 
@@ -1645,6 +1680,26 @@ static bool verify_run_start_state()
 static bool prepare_modules_for_run()
 {
   if (!check_module_communication(gV1720State.run.settings.enabled != FALSE)) return false;
+  if (gV1720State.run.settings.enabled) {
+    DWORD control = 0, acquisition_status = 0, stored = 0;
+    int stop_attempted = 0, stored_valid = 0;
+    const int stop_status = v1720e_stop_if_running(
+      gVme, V1720E_BASE, &control, &acquisition_status, &stop_attempted);
+    if (stop_status != MVME_SUCCESS) {
+      cm_msg(MERROR, frontend_name,
+             "V1720E BOR stop failed: status %d AcqControl=0x%08X AcqStatus=0x%08X",
+             stop_status, control, acquisition_status);
+      return false;
+    }
+    const int clear_status = v1720e_software_clear(
+      gVme, V1720E_BASE, &stored, &stored_valid);
+    if (clear_status != MVME_SUCCESS) {
+      cm_msg(MERROR, frontend_name,
+             "V1720E BOR Software Clear verification failed: status %d Event Stored=%s%u",
+             clear_status, stored_valid ? "" : "unavailable/", stored);
+      return false;
+    }
+  }
   if (!configure_v792_for_run() || !configure_v1190_for_run()
     || !configure_v775_for_run()
     || !configure_v1720e_for_run()) return false;
@@ -1669,10 +1724,10 @@ static bool prepare_modules_for_run()
   DWORD v1720_events = 0;
   int v1720_ready = 0;
   DWORD v1720_acquisition_status = 0;
-  const int ready_status = v1720e_data_ready(gVme, V1720E_BASE,
+  const int ready_status = v1720e_verify_empty_after_start(gVme, V1720E_BASE,
                          &v1720_ready, &v1720_events,
                          &v1720_acquisition_status);
-  if (ready_status != MVME_SUCCESS || v1720_events > 1) {
+  if (ready_status != MVME_SUCCESS) {
     cm_msg(MERROR, frontend_name,
          "V1720E post-start buffer verification failed: status %d "
          "ready=%d Event Stored=%u",
@@ -1937,7 +1992,8 @@ INT frontend_init()
     return FE_ERR_ODB;
   }
   if (current_run_state == STATE_STOPPED &&
-    !quiesce_rpv130_single_event_busy("STOPPED frontend startup")) {
+    gVmeState.rpv130_enabled_for_run &&
+    !recover_rpv130_stopped_state("STOPPED frontend startup")) {
     mvme_close(gVme);
     gVme = NULL;
     global_busy::attach(NULL);
@@ -2129,6 +2185,13 @@ INT begin_of_run(INT run_number, char *error)
   set_module_readback_valid(V1190_READBACK_PATH,false);
   set_module_readback_valid(V775_READBACK_PATH,false);
   set_v1720e_readback_valid(false);
+
+  if (gVmeState.rpv130_enabled_for_run &&
+      !recover_rpv130_stopped_state("BOR preparation")) {
+    snprintf(error, 256, "RPV130 hardware cleanup failed before BOR");
+    mark_configuration_failed(run_number);
+    return finish(FE_ERR_HW);
+  }
 
   if (!prepare_modules_for_run()) {
     stop_v1720e_and_publish_state("BOR failure");

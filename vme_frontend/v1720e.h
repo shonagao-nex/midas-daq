@@ -69,6 +69,10 @@ V1720E_BOARD_ID v1720e_decode_board_info(DWORD board_info);
 int v1720e_probe(MVME_INTERFACE *vme, DWORD base, V1720E_BOARD_INFO *info);
 int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
                       DWORD *event_stored, DWORD *acquisition_status);
+/* BOR gate: require the RUN-start memory reset to leave no stored event. */
+int v1720e_verify_empty_after_start(MVME_INTERFACE *vme, DWORD base,
+                                    int *ready, DWORD *event_stored,
+                                    DWORD *acquisition_status);
 int v1720e_start(MVME_INTERFACE *vme, DWORD base);
 int v1720e_stop(MVME_INTERFACE *vme, DWORD base);
 /* Read only: return the Acquisition Control and Status RUN bits with their

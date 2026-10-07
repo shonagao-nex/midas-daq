@@ -237,3 +237,17 @@ int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
 {
     return write_channel1_sequence(mvme, base, false, csr1);
 }
+
+int rpv130_recover_stopped(MVME_INTERFACE *mvme, mvme_addr_t base,
+                           RPV130_STATUS *before, uint8_t *csr1_after)
+{
+    if (!before || !csr1_after) return MVME_INVALID_PARAM;
+    int result = rpv130_read_status(mvme, base, before);
+    if (result != MVME_SUCCESS) return result;
+    result = rpv130_clear_busy1_and_disable(mvme, base, csr1_after);
+    if (result != MVME_SUCCESS) return result;
+    return ((*csr1_after & (RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED)) == 0 &&
+            (*csr1_after & RPV130_CSR1_ENABLE3) ==
+                (before->csr1 & RPV130_CSR1_ENABLE3))
+               ? MVME_SUCCESS : MVME_ACCESS_ERROR;
+}

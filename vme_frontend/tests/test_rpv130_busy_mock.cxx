@@ -12,12 +12,22 @@
 namespace {
 uint8_t csr1 = 0;
 int reads = 0;
+int read_calls = 0;
+int fail_read_call = 0;
+int fail_write_call = 0;
+bool keep_busy = false;
+bool drop_enable3 = false;
 std::vector<uint8_t> writes;
 std::vector<char> csr1_accesses;
 
 void reset(uint8_t value) {
     csr1 = value;
     reads = 0;
+    read_calls = 0;
+    fail_read_call = 0;
+    fail_write_call = 0;
+    keep_busy = false;
+    drop_enable3 = false;
     writes.clear();
     csr1_accesses.clear();
 }
@@ -41,10 +51,15 @@ extern "C" int mvme_set_dmode(MVME_INTERFACE *vme, int mode) {
 }
 extern "C" int mvme_read(MVME_INTERFACE *, void *dst,
                           mvme_addr_t address, mvme_size_t count) {
-    assert(address == RPV130_BASE_ADDRESS + 0x0C && count == 2);
-    ++reads;
-    csr1_accesses.push_back('R');
-    const uint16_t value = csr1;
+    assert(address >= RPV130_BASE_ADDRESS &&
+           address <= RPV130_BASE_ADDRESS + 0x0E && count == 2);
+    if (++read_calls == fail_read_call) return MVME_ACCESS_ERROR;
+    const bool is_csr1 = address == RPV130_BASE_ADDRESS + 0x0C;
+    if (is_csr1) {
+        ++reads;
+        csr1_accesses.push_back('R');
+    }
+    const uint16_t value = is_csr1 ? csr1 : 0;
     std::memcpy(dst, &value, sizeof(value));
     return MVME_SUCCESS;
 }
@@ -55,9 +70,13 @@ extern "C" int mvme_write(MVME_INTERFACE *, mvme_addr_t address,
     std::memcpy(&value, src, sizeof(value));
     writes.push_back(static_cast<uint8_t>(value));
     csr1_accesses.push_back('W');
-    if (value & RPV130_CSR1_CLR1) csr1 &= ~RPV130_CSR1_BUSY1;
+    if (static_cast<int>(writes.size()) == fail_write_call)
+        return MVME_ACCESS_ERROR;
+    if ((value & RPV130_CSR1_CLR1) && !keep_busy)
+        csr1 &= ~RPV130_CSR1_BUSY1;
     csr1 = (csr1 & RPV130_CSR1_BUSY1) |
            (value & (RPV130_CSR1_ENABLE3 | RPV130_CSR1_CHANNEL1_ARMED));
+    if (drop_enable3) csr1 &= ~RPV130_CSR1_ENABLE3;
     return MVME_SUCCESS;
 }
 
@@ -121,6 +140,54 @@ int main() {
     assert(writes == std::vector<uint8_t>({0x42, 0x40}));
     assert(raw == 0x40);
 
+    // Cleanup must also work when a new process has no record of the old arm.
+    reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED);
+    assert(rpv130_clear_busy1_and_disable(&vme, RPV130_BASE_ADDRESS, &raw)
+           == MVME_SUCCESS);
+    assert(writes == std::vector<uint8_t>({0x02, 0x00}));
+    assert(raw == 0);
+
+    RPV130_STATUS before = {};
+    reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_ENABLE3 |
+          RPV130_CSR1_CHANNEL1_ARMED);
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_SUCCESS);
+    assert(before.csr1 == 0x78 && raw == 0x40 &&
+           writes == std::vector<uint8_t>({0x42, 0x40}));
+
+    reset(0x38);
+    fail_read_call = 1;
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_ACCESS_ERROR && writes.empty());
+
+    reset(0x38);
+    fail_read_call = 7; // CSR1 read inside the two-write helper.
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_ACCESS_ERROR && writes.empty());
+
+    for (int failed_write = 1; failed_write <= 2; ++failed_write) {
+        reset(0x38);
+        fail_write_call = failed_write;
+        assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS,
+                                       &before, &raw) == MVME_ACCESS_ERROR);
+        assert(static_cast<int>(writes.size()) == failed_write);
+    }
+
+    reset(0x38);
+    fail_read_call = 8; // CSR1 readback after both writes.
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_ACCESS_ERROR && writes.size() == 2);
+
+    reset(0x38);
+    keep_busy = true;
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_ACCESS_ERROR && (csr1 & RPV130_CSR1_BUSY1));
+
+    reset(0x78);
+    drop_enable3 = true;
+    assert(rpv130_recover_stopped(&vme, RPV130_BASE_ADDRESS, &before, &raw)
+           == MVME_ACCESS_ERROR && !(csr1 & RPV130_CSR1_ENABLE3));
+
     // Frontend contract: the false setting exits before any CSR1 write path.
     std::ifstream input("fevme.cxx");
     const std::string source{std::istreambuf_iterator<char>(input), {}};
@@ -135,5 +202,21 @@ int main() {
     assert(event != std::string::npos && event_gate < event_write &&
            source.find("rpv130_clear_busy1_preserving_enable_state_timed(", event)
                == std::string::npos);
+    const auto recovery = source.find("static bool recover_rpv130_stopped_state(");
+    const auto recovery_end = source.find("\n}", recovery);
+    const auto recovery_body = source.substr(recovery, recovery_end - recovery);
+    assert(recovery != std::string::npos && recovery_end != std::string::npos);
+    assert(recovery_body.find("rpv130_recover_stopped(") != std::string::npos);
+    assert(recovery_body.find("single_event_busy_enabled_for_run") == std::string::npos);
+    const auto startup_recovery = source.find(
+        "recover_rpv130_stopped_state(\"STOPPED frontend startup\")");
+    const auto bor_recovery = source.find(
+        "recover_rpv130_stopped_state(\"BOR preparation\")");
+    assert(startup_recovery != std::string::npos &&
+           bor_recovery != std::string::npos);
+    assert(source.substr(startup_recovery - 90, 90).find(
+               "gVmeState.rpv130_enabled_for_run") != std::string::npos);
+    assert(source.substr(bor_recovery - 90, 90).find(
+               "gVmeState.rpv130_enabled_for_run") != std::string::npos);
     std::puts("test_rpv130_busy_mock: passed");
 }

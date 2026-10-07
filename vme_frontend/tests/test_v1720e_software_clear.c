@@ -13,6 +13,9 @@ static DWORD write_address;
 static DWORD write_value;
 static unsigned write_count;
 static int fail_event_stored_read;
+static int leave_event_ready_after_clear;
+static int leave_event_stored_after_clear;
+static int run_after_clear;
 static int current_am = MVME_AM_A24_ND;
 static int current_mode = MVME_DMODE_D16;
 
@@ -57,7 +60,11 @@ int mvme_write(MVME_INTERFACE *vme, mvme_addr_t address, void *src,
     memcpy(&write_value, src, sizeof(write_value));
     write_address = address;
     ++write_count;
-    if (address == BASE + 0xEF28u) event_stored = 0;
+    if (address == BASE + 0xEF28u) {
+        if (!leave_event_stored_after_clear) event_stored = 0;
+        if (!leave_event_ready_after_clear) acquisition_status &= ~0x8u;
+        if (run_after_clear) acquisition_status |= 0x4u;
+    }
     return MVME_SUCCESS;
 }
 
@@ -87,6 +94,50 @@ int main(void) {
     ok &= require(current_am == MVME_AM_A24_ND &&
                       current_mode == MVME_DMODE_D16,
                   "VME access mode was not restored");
+
+    /* RUN start may accept one event; the BOR gate must still reject it. */
+    {
+        int ready = -1;
+        DWORD post_start_stored = 99, post_start_status = 99;
+        acquisition_status = 0x184u;
+        event_stored = 1;
+        ok &= require(v1720e_verify_empty_after_start(
+                          mock, BASE, &ready, &post_start_stored,
+                          &post_start_status) == MVME_ACCESS_ERROR &&
+                          post_start_stored == 1 && ready == 0,
+                      "BOR accepted Event Stored=1 after RUN start");
+        event_stored = 0;
+        ok &= require(v1720e_verify_empty_after_start(
+                          mock, BASE, &ready, &post_start_stored,
+                          &post_start_status) == MVME_SUCCESS &&
+                          post_start_stored == 0 && post_start_status == 0x184u,
+                      "BOR rejected an empty RUN-start buffer");
+    }
+
+    acquisition_status = 0x8u;
+    event_stored = 2;
+    leave_event_ready_after_clear = 1;
+    ok &= require(v1720e_software_clear(mock, BASE, &stored, &stored_valid) ==
+                      MVME_ACCESS_ERROR,
+                  "EVENT READY surviving Software Clear was accepted");
+    ok &= require(stored_valid && stored == 0,
+                  "EVENT READY failure did not report Event Stored");
+    leave_event_ready_after_clear = 0;
+
+    acquisition_status = 0;
+    event_stored = 3;
+    leave_event_stored_after_clear = 1;
+    ok &= require(v1720e_software_clear(mock, BASE, &stored, &stored_valid) ==
+                      MVME_ACCESS_ERROR && stored_valid && stored == 3,
+                  "nonempty Event Stored after clear was accepted");
+    leave_event_stored_after_clear = 0;
+
+    acquisition_status = 0;
+    run_after_clear = 1;
+    ok &= require(v1720e_software_clear(mock, BASE, &stored, &stored_valid) ==
+                      MVME_ACCESS_ERROR,
+                  "RUN_ACTIVE after clear was accepted");
+    run_after_clear = 0;
 
     acquisition_control = 4;
     acquisition_status = 0;
@@ -123,6 +174,6 @@ int main(void) {
     ok &= require(stored == 99 && !stored_valid,
                   "failed Event Stored read reported a value");
     if (!ok) return 1;
-    puts("test_v1720e_software_clear: 11 checks passed");
+    puts("test_v1720e_software_clear: passed");
     return 0;
 }

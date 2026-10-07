@@ -66,6 +66,7 @@ MANUAL_CLEAR_CONTRACT_TEST = $(BIN_TEST_DIR)/test_manual_buffer_clear_contract
 START_ABORT_CONTRACT_TEST = $(BIN_TEST_DIR)/test_start_abort_contract
 READOUT_GATE_CONTRACT_TEST = $(BIN_TEST_DIR)/test_readout_gate_contract
 GLOBAL_BUSY_READINESS_TEST = $(BIN_TEST_DIR)/test_global_busy_readiness
+GLOBAL_BUSY_START_FAILURE_TEST = $(BIN_TEST_DIR)/test_global_busy_start_failure_mock
 V1720E_CLEAR_TEST = $(BIN_TEST_DIR)/test_v1720e_software_clear
 V1720E_STOP_TEST = $(BIN_TEST_DIR)/test_v1720e_stop_recovery
 V1720E_BLT_TEST = $(BIN_TEST_DIR)/test_v1720e_blt32
@@ -100,7 +101,7 @@ fevme: $(TARGET)
 
 check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	$(START_ABORT_CONTRACT_TEST) $(READOUT_GATE_CONTRACT_TEST) \
-	$(GLOBAL_BUSY_READINESS_TEST) \
+	$(GLOBAL_BUSY_READINESS_TEST) $(GLOBAL_BUSY_START_FAILURE_TEST) \
 	$(V1720E_CLEAR_TEST) $(V1720E_STOP_TEST) $(V1720E_BLT_TEST) $(V1720E_DECODE_TEST) $(V1720E_INTEGRITY_TEST) \
 	$(V792_V775_CONFIG_TEST) \
 	$(CAENVME_BLT_TEST) $(V792_BLT_TEST) $(V1190_FIFO_BLT_TEST) $(V1190_CLEAR_MOCK_TEST) $(V1190_MICRO_MOCK_TEST) $(V1190_READOUT_MOCK_TEST) $(MODULE_STATUS_MOCK_TEST) $(V792_CONFIG_MOCK_TEST) $(V775_CONFIG_MOCK_TEST) $(V775_DIAGNOSTIC_MOCK_TEST) $(V775_READOUT_MOCK_TEST) $(V792_READOUT_MOCK_TEST) $(RPV130_BUSY_MOCK_TEST)
@@ -111,6 +112,7 @@ check: $(IDLE_POLICY_TEST) $(MANUAL_CLEAR_TEST) $(MANUAL_CLEAR_CONTRACT_TEST) \
 	./$(START_ABORT_CONTRACT_TEST)
 	./$(READOUT_GATE_CONTRACT_TEST)
 	./$(GLOBAL_BUSY_READINESS_TEST)
+	./$(GLOBAL_BUSY_START_FAILURE_TEST)
 	./$(V1720E_CLEAR_TEST)
 	./$(V1720E_STOP_TEST)
 	./$(V1720E_BLT_TEST)
@@ -183,6 +185,11 @@ $(READOUT_GATE_CONTRACT_TEST): $(BUILD_DIR)/tests/test_readout_gate_contract.o
 	$(CXX) -o $@ $^
 
 $(GLOBAL_BUSY_READINESS_TEST): $(BUILD_DIR)/tests/test_global_busy_readiness.o
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^
+
+$(GLOBAL_BUSY_START_FAILURE_TEST): \
+	$(BUILD_DIR)/tests/test_global_busy_start_failure_mock.o $(BUILD_DIR)/global_busy.o
 	@mkdir -p $(dir $@)
 	$(CXX) -o $@ $^
 
@@ -404,6 +411,11 @@ $(BUILD_DIR)/tests/test_readout_gate_contract.o: \
 
 $(BUILD_DIR)/tests/test_global_busy_readiness.o: \
 	tests/test_global_busy_readiness.cxx global_busy.cxx global_busy_readiness.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tests/test_global_busy_start_failure_mock.o: \
+	tests/test_global_busy_start_failure_mock.cxx global_busy.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

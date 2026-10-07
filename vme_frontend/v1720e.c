@@ -130,6 +130,23 @@ int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
     return MVME_SUCCESS;
 }
 
+int v1720e_verify_empty_after_start(MVME_INTERFACE *vme, DWORD base,
+                                    int *ready, DWORD *event_stored,
+                                    DWORD *acquisition_status)
+{
+    DWORD stored = 0;
+    int is_ready = 0;
+    const int status = v1720e_data_ready(vme, base, &is_ready, &stored,
+                                          acquisition_status);
+    if (status != MVME_SUCCESS)
+        return status;
+    if (ready)
+        *ready = is_ready;
+    if (event_stored)
+        *event_stored = stored;
+    return stored == 0 && !is_ready ? MVME_SUCCESS : MVME_ACCESS_ERROR;
+}
+
 int v1720e_start(MVME_INTERFACE *vme, DWORD base)
 {
     DWORD control = 0, status_reg = 0, event_stored = 0;
@@ -248,5 +265,11 @@ int v1720e_software_clear(MVME_INTERFACE *vme, DWORD base,
         *event_stored_after = stored;
     if (event_stored_after_valid)
         *event_stored_after_valid = 1;
-    return stored == 0 ? MVME_SUCCESS : MVME_ACCESS_ERROR;
+    status = v1720e_read_run_state(vme, base, &control, &status_reg);
+    if (status != MVME_SUCCESS)
+        return status;
+    return stored == 0 &&
+           !(control & ACQUISITION_CONTROL_RUN_REQUEST) &&
+           !(status_reg & (ACQUISITION_STATUS_RUN_ACTIVE | STATUS_EVENT_READY))
+               ? MVME_SUCCESS : MVME_ACCESS_ERROR;
 }

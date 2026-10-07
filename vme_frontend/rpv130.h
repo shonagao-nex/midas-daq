@@ -54,6 +54,10 @@ int rpv130_clear_busy1_preserving_enable_state_timed(
 /* Call only while an independent trigger veto is already asserted. */
 int rpv130_clear_busy1_and_disable(MVME_INTERFACE *mvme, mvme_addr_t base,
                                     uint8_t *csr1);
+/* STOPPED recovery: inspect hardware, disable channel 1, verify BUSY1 and
+ * ENABLE1/MASK1 are clear and ENABLE3 is preserved. */
+int rpv130_recover_stopped(MVME_INTERFACE *mvme, mvme_addr_t base,
+                           RPV130_STATUS *before, uint8_t *csr1_after);
 
 #ifdef __cplusplus
 }
