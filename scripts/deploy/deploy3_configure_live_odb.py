@@ -333,7 +333,132 @@ def inspect_live_paths(rpc):
             raise RuntimeError(f"Unexpected live-specific ODB value: {path}")
 
 
+TID_NAMES = {4: "WORD", UINT32: "DWORD", INT32: "INT", BOOL: "BOOL",
+             DOUBLE: "DOUBLE", STRING: "STRING", KEY: "KEY"}
+
+
+def daq_settings_specs():
+    """Settings read by the frontends; (path, type, count, minimum bytes)."""
+    specs = []
+
+    def add(base, names, tid, count=1, minimum=0):
+        specs.extend((f"{base}/{name}", tid, count, minimum) for name in names)
+
+    vme = "/Equipment/VME/Settings"
+    add(f"{vme}/RPV130", ("Enabled", "SingleEventBusyEnabled"), BOOL)
+    add(f"{vme}/V792", ("Enabled", "ZeroSuppressionEnabled", "AllTriggerEnabled"), BOOL)
+    add(f"{vme}/V792", ("Iped",), 4)
+    add(f"{vme}/V1190", ("Enabled", "TriggerMatchingEnabled",
+        "TriggerSubtractionEnabled", "TdcHeaderEnabled", "EmptyEventEnabled",
+        "EventFifoEnabled", "ExtendedTriggerTimeEnabled"), BOOL)
+    add(f"{vme}/V1190", ("WindowWidth", "ExtraSearchMargin", "RejectMargin",
+        "EdgeMode", "ResolutionPs", "DeadTimeNs"), UINT32)
+    add(f"{vme}/V1190", ("WindowOffset", "MaxHitsPerEvent"), INT32)
+    add(f"{vme}/V1190", ("ChannelEnabled",), BOOL, 128)
+    add(f"{vme}/V775", ("Enabled", "OverRangeEnabled", "LowThresholdEnabled",
+        "CommonStop", "EmptyProgramEnabled", "ValidControlEnabled",
+        "SlidingScaleEnabled", "AllTriggerEnabled"), BOOL)
+    add(f"{vme}/V775", ("FullScaleRange",), 4)
+    add(f"{vme}/V1720E", ("Enabled", "SoftwareTriggerEnabled",
+        "ExternalTriggerEnabled"), BOOL)
+    add(f"{vme}/V1720E", ("BufferOrganization", "RecordLengthSamples",
+        "PostTrigger"), UINT32)
+    add(f"{vme}/V1720E", ("ChannelSelfTriggerEnabled", "ChannelEnabled"), BOOL, 8)
+    add(f"{vme}/V1720E", ("DCOffset",), 4, 8)
+
+    easiroc = "/Equipment/EASIROC/Settings"
+    add(easiroc, ("Enabled", "Acquisition/ADCEnabled",
+        "Acquisition/TDCEnabled", "Acquisition/ScalerEnabled",
+        "ASICSlowControl/ApplyAtBOR"), BOOL)
+    add(easiroc, ("Network/IPAddress",), STRING, minimum=64)
+    for asic in ("ASIC1", "ASIC2"):
+        base = f"{easiroc}/{asic}"
+        add(base, ("DiscriminatorDACCode", "DiscriminatorDACSlope",
+            "HGFeedbackCapacitance", "LGFeedbackCapacitance",
+            "HGShapingTime", "LGShapingTime"), INT32)
+        add(base, ("InputDAC",), INT32, 32)
+        add(base, ("ChannelEnabled",), BOOL, 32)
+    return specs
+
+
+def describe_daq_key(key):
+    if key is None:
+        return "missing"
+    tid = key.get("type")
+    name = TID_NAMES.get(tid, str(tid))
+    description = f"{name}[{key.get('num_values', '?')}]"
+    if tid == STRING:
+        description += f" item_size={key.get('item_size', '?')}"
+    return description
+
+
+def require_daq_key(rpc, path, tid, count=1, minimum=0):
+    key = rpc.key(path)
+    expected = f"{TID_NAMES[tid]}[{count}]"
+    if tid == STRING and minimum:
+        expected += f" item_size>={minimum}"
+    if (key is None or key.get("type") != tid or
+            key.get("num_values") != count or
+            (tid == STRING and key.get("item_size", 0) < minimum)):
+        raise RuntimeError(f"DAQ ODB schema {path}: expected {expected}, "
+                           f"actual {describe_daq_key(key)}")
+    return key
+
+
+def daq_children(rpc, path):
+    """Enumerate directory names without treating any stored values as policy."""
+    require_daq_key(rpc, path, KEY)
+    copied = rpc.copy(path)
+    if not isinstance(copied, dict):
+        raise RuntimeError(f"DAQ ODB schema {path}: expected KEY[1], "
+                           f"actual malformed directory {type(copied).__name__}")
+    return [name for name in copied if not name.endswith("/key")]
+
+
+def inspect_daq_settings_schema(rpc):
+    """Read-only validation, shared by deploy3 preflight and deploy4."""
+    for spec in daq_settings_specs():
+        require_daq_key(rpc, *spec)
+
+    analyzer = rpc.key("/Analyzer")
+    if analyzer is None:
+        return  # The analyzer supports in-memory defaults for an absent tree.
+    require_daq_key(rpc, "/Analyzer", KEY)
+
+    histograms = "/Analyzer/Histograms"
+    if rpc.key(histograms) is not None:
+        for group in daq_children(rpc, histograms):
+            base = f"{histograms}/{group}"
+            require_daq_key(rpc, base, KEY)
+            name = rpc.key(f"{base}/HistName")
+            if name is None or name.get("type") != STRING or not isinstance(
+                    name.get("num_values"), int) or name["num_values"] < 1:
+                raise RuntimeError(f"DAQ ODB schema {base}/HistName: expected "
+                                   f"STRING[N], N>=1, actual {describe_daq_key(name)}")
+            count = name["num_values"]
+            for field in ("HistName", "Title", "XTitle", "YTitle", "Type",
+                          "Expression", "Cut"):
+                require_daq_key(rpc, f"{base}/{field}", STRING, count, 1)
+            for field, tid in (("Bins", INT32), ("Min", DOUBLE),
+                               ("Max", DOUBLE), ("Enabled", BOOL)):
+                require_daq_key(rpc, f"{base}/{field}", tid, count)
+
+    pages = "/Analyzer/Pages"
+    if rpc.key(pages) is not None:
+        for page in daq_children(rpc, pages):
+            base = f"{pages}/{page}"
+            require_daq_key(rpc, base, KEY)
+            require_daq_key(rpc, f"{base}/Rows", INT32)
+            require_daq_key(rpc, f"{base}/Columns", INT32)
+            # Missing PadNN fields are deliberately empty pads in the loader.
+
+    if rpc.key("/Analyzer/OnlineHistogram") is not None:
+        require_daq_key(rpc, "/Analyzer/OnlineHistogram", KEY)
+        require_daq_key(rpc, "/Analyzer/OnlineHistogram/FillPrescale", INT32)
+
+
 def inspect_schema(rpc):
+    inspect_daq_settings_schema(rpc)
     for path, tid, minimum, _ in specs():
         if not inspect_key(rpc, path, tid, minimum):
             raise RuntimeError(f"Missing schema key: {path}")
@@ -347,6 +472,8 @@ def inspect_schema(rpc):
 
 def configure(rpc):
     require_live(rpc)
+    # Fail before changing deploy-owned keys if DAQ settings need intervention.
+    inspect_daq_settings_schema(rpc)
     # These are site/runtime prerequisites, not values that deployment rewrites.
     for path, expected in (("/Logger/Message dir", str(RUNTIME / "log")),
                            ("/Logger/Data dir", str(RUNTIME / "data")),

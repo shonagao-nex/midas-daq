@@ -11,6 +11,7 @@ documents for details:
 | NIM-EASIROC frontend | [easiroc_frontend/docs/easiroc_protocol.md](easiroc_frontend/docs/easiroc_protocol.md), [slow control](easiroc_frontend/docs/easiroc_slow_control.md) |
 | DAQ monitor and Custom pages | [daq_monitor/daq_monitor.cxx](daq_monitor/daq_monitor.cxx), [web/README.md](daq_monitor/web/README.md) |
 | Live deployment procedure | [scripts/deploy/README.md](scripts/deploy/README.md) |
+| Read-only ODB settings comparison | [scripts/README-odb-diff.md](scripts/README-odb-diff.md) |
 
 ## Development services
 

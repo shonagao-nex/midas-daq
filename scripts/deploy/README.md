@@ -71,9 +71,10 @@ as a way around a failed unit comparison.
   missing derived Runlog files, restores the original process state, and calls
   step 4. A completed deployment of the same commit and binaries does not
   restart processes again.
-- `deploy3_configure_live_odb.py` changes only its owned fixed schema,
-  Runlog BOR/EOR links and order, Programs, and Custom entries. It does not
-  load an entire ODB backup. Unexpected links, types, or paths stop deployment.
+- `deploy3_configure_live_odb.py` validates DAQ settings schema before changing
+  its owned fixed schema, Runlog BOR/EOR links and order, Programs, and Custom
+  entries. It does not load an entire ODB backup. Unexpected schema, links,
+  types, or paths stop deployment.
 - `deploy4_check_live.py` checks the Git commit, binaries, fixed ODB schema,
   Programs, Custom pages, Runlog/ELOG resources, service/frontend state, and
   port 8081 without writing ODB or starting a run. Its checks read live state,
@@ -117,3 +118,21 @@ Static syntax checks, which do not connect to ODB, are:
 bash -n scripts/deploy/deploy1_init.sh scripts/deploy/deploy2_impl.sh
 python3 -m py_compile scripts/deploy/deploy3_configure_live_odb.py scripts/deploy/deploy4_check_live.py
 ```
+
+## ODB settings scope and comparison
+
+Steps 3 and 4 validate the existence, type, scalar/array length, and required
+STRING capacity of VME/EASIROC Settings and existing Analyzer settings. A
+schema error stops deployment with the affected path and expected/actual
+schema. Deployment does not copy development setting values, create missing
+Settings, repair schema, or change existing setting values. New ODB
+initialization is a separate operation. Frontends and the analyzer validate
+the range, meaning, and combinations of values when they use them.
+
+Existing custom Analyzer Histogram groups and Pages are allowed; deployment
+does not require the default layout. An absent Analyzer tree retains the
+analyzer's in-memory fallback, and absent Pages retain default pages. Missing
+Pad fields remain empty pads. The deploy-owned `Programs`, Runlog JSON, and
+Custom values listed in `MANAGED_VALUES` retain their existing policy. Compare
+development and production setting values with the read-only
+[`odb_settings_diff.py`](../README-odb-diff.md) from the actual DAQ host shell.

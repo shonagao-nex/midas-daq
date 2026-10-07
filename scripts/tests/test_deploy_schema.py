@@ -99,5 +99,122 @@ class RunlogSlipSchemaTest(unittest.TestCase):
             schema.inspect_key(rpc, f"{schema.STATUS}/EventSlipCount", schema.INT64, 0)
 
 
+class DaqSettingsSchemaTest(unittest.TestCase):
+    class ReadOnlyRpc:
+        def __init__(self):
+            self.keys = {}
+            self.children = {}
+            for path, tid, count, minimum in schema.daq_settings_specs():
+                self.keys[path] = {"type": tid, "num_values": count,
+                                   "item_size": minimum or 16}
+
+        def key(self, path):
+            return self.keys.get(path)
+
+        def copy(self, path):
+            return {name: {} for name in self.children[path]}
+
+        def checked(self, *args):
+            raise AssertionError("schema validation attempted a write")
+
+        def add_dir(self, path, children=()):
+            self.keys[path] = {"type": schema.KEY, "num_values": 1}
+            self.children[path] = children
+
+        def add_histogram(self, group, count=3):
+            base = f"/Analyzer/Histograms/{group}"
+            self.add_dir(base)
+            for field in ("HistName", "Title", "XTitle", "YTitle", "Type",
+                          "Expression", "Cut"):
+                self.keys[f"{base}/{field}"] = {"type": schema.STRING,
+                    "num_values": count, "item_size": 8}
+            for field, tid in (("Bins", schema.INT32), ("Min", schema.DOUBLE),
+                               ("Max", schema.DOUBLE), ("Enabled", schema.BOOL)):
+                self.keys[f"{base}/{field}"] = {"type": tid, "num_values": count}
+
+    def test_all_frontend_specs_and_absent_analyzer_pass_without_writes(self):
+        rpc = self.ReadOnlyRpc()
+        schema.inspect_daq_settings_schema(rpc)
+
+    def test_frontend_errors_report_path_expected_and_actual(self):
+        path = "/Equipment/VME/Settings/V1190/ChannelEnabled"
+        for replacement, expected_actual in (
+                (None, "missing"),
+                ({"type": schema.INT32, "num_values": 128}, "INT[128]"),
+                ({"type": schema.BOOL, "num_values": 32}, "BOOL[32]")):
+            with self.subTest(actual=expected_actual):
+                rpc = self.ReadOnlyRpc()
+                if replacement is None:
+                    del rpc.keys[path]
+                else:
+                    rpc.keys[path] = replacement
+                with self.assertRaisesRegex(RuntimeError, path) as failure:
+                    schema.inspect_daq_settings_schema(rpc)
+                self.assertIn("BOOL[128]", str(failure.exception))
+                self.assertIn(expected_actual, str(failure.exception))
+
+    def test_string_capacity_is_required(self):
+        rpc = self.ReadOnlyRpc()
+        path = "/Equipment/EASIROC/Settings/Network/IPAddress"
+        rpc.keys[path]["item_size"] = 32
+        with self.assertRaisesRegex(RuntimeError, "item_size>=64.*item_size=32"):
+            schema.inspect_daq_settings_schema(rpc)
+
+    def test_custom_histogram_and_page_schema(self):
+        rpc = self.ReadOnlyRpc()
+        rpc.add_dir("/Analyzer")
+        rpc.add_dir("/Analyzer/Histograms", ("Custom",))
+        rpc.add_histogram("Custom", 3)
+        rpc.add_dir("/Analyzer/Pages", ("MyPage",))
+        rpc.add_dir("/Analyzer/Pages/MyPage")
+        for field in ("Rows", "Columns"):
+            rpc.keys[f"/Analyzer/Pages/MyPage/{field}"] = {
+                "type": schema.INT32, "num_values": 1}
+        schema.inspect_daq_settings_schema(rpc)  # Pad01 is optional.
+
+        path = "/Analyzer/Histograms/Custom/Enabled"
+        rpc.keys[path]["num_values"] = 2
+        with self.assertRaisesRegex(RuntimeError, "Enabled: expected BOOL\\[3\\], actual BOOL\\[2\\]"):
+            schema.inspect_daq_settings_schema(rpc)
+        rpc.keys[path]["num_values"] = 3
+        del rpc.keys["/Analyzer/Pages/MyPage/Columns"]
+        with self.assertRaisesRegex(RuntimeError, "Columns: expected INT\\[1\\], actual missing"):
+            schema.inspect_daq_settings_schema(rpc)
+
+    def test_histogram_count_and_analyzer_directory_are_checked(self):
+        rpc = self.ReadOnlyRpc()
+        rpc.keys["/Analyzer"] = {"type": schema.STRING, "num_values": 1,
+                                  "item_size": 8}
+        with self.assertRaisesRegex(RuntimeError, "/Analyzer: expected KEY\\[1\\]"):
+            schema.inspect_daq_settings_schema(rpc)
+        rpc.add_dir("/Analyzer")
+        rpc.add_dir("/Analyzer/Histograms", ("Custom",))
+        rpc.add_histogram("Custom", 0)
+        with self.assertRaisesRegex(RuntimeError, "HistName: expected STRING\\[N\\], N>=1"):
+            schema.inspect_daq_settings_schema(rpc)
+
+    def test_configure_rejects_bad_settings_before_owned_writes(self):
+        from unittest.mock import patch
+
+        rpc = self.ReadOnlyRpc()
+        del rpc.keys["/Equipment/VME/Settings/V775/FullScaleRange"]
+        with patch.object(schema, "require_live"):
+            with self.assertRaisesRegex(RuntimeError, "FullScaleRange"):
+                schema.configure(rpc)
+
+    def test_deploy4_schema_check_runs_same_daq_validation(self):
+        from unittest.mock import patch
+        from scripts.deploy import deploy4_check_live as deploy4
+
+        rpc = self.ReadOnlyRpc()
+        del rpc.keys["/Equipment/EASIROC/Settings/ASIC2/InputDAC"]
+        with patch.object(deploy4.schema, "specs", return_value=[]), \
+             patch.object(deploy4.schema, "inspect_links"), \
+             patch.object(deploy4.schema, "MANAGED_VALUES", {}), \
+             patch.object(deploy4.schema, "inspect_live_paths"):
+            with self.assertRaisesRegex(RuntimeError, "ASIC2/InputDAC"):
+                deploy4.schema.inspect_schema(rpc)
+
+
 if __name__ == "__main__":
     unittest.main()
