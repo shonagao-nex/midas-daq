@@ -69,18 +69,34 @@ int main() {
   const auto stop400 = section(busy, "INT before_stop(", "INT start_abort(");
   const auto busy_abort = section(busy, "INT start_abort(", "\n}\n}");
   const auto eor = section(frontend, "INT end_of_run(INT run_number, char *error)\n{",
-                           "static INT start_abort(INT run_number, char *error)\n{");
+                           "static INT stop_after_mfe_drain(INT run_number, char *error)\n{");
+  const auto finalization = section(frontend, "static INT finalize_stop(INT run_number, char *error, bool standard_drain_attempted)\n{",
+                                    "INT end_of_run(INT run_number, char *error)\n{");
+  const auto stop600 = section(frontend, "static INT stop_after_mfe_drain(INT run_number, char *error)\n{",
+                                "static INT start_abort(INT run_number, char *error)\n{");
   const auto frontend_abort = section(frontend, "static INT start_abort(INT run_number, char *error)\n{",
                                       "INT pause_run(INT run_number, char *error)");
   const auto init = section(frontend, "INT frontend_init()\n{", "INT frontend_exit()\n{");
-  require(stop400.find("disable_readout();") < stop400.find("set_global_busy(true)"),
-          "STOP 400 must disable readout first");
+  require(stop400.find("set_global_busy(true)") < stop400.find("disable_readout();"),
+          "STOP 400 must assert BUSY before disabling readout on failure");
+  require(stop400.find("physics_readout_allowed = true") == std::string::npos,
+          "STOP 400 must not reopen a closed readout gate");
   require(busy_abort.find("disable_readout();") < busy_abort.find("publish_ready("),
           "STARTABORT 400 must disable readout first");
   require(frontend_abort.find("disable_readout();") < frontend_abort.find("publish_ready("),
           "STARTABORT 500 must disable readout first");
-  require(eor.find("disable_readout();") < eor.find("stop_v1720e_and_publish_state"),
-          "EOR must disable readout before hardware work");
+  require(eor.find("finalize_stop(run_number, error, false)") != std::string::npos &&
+              eor.find("stop_v1720e_and_publish_state") == std::string::npos,
+          "STOP 500 must finalize only when the standard drain cannot run");
+  require(finalization.find("stop_finalization_attempted") <
+              finalization.find("quiesce_rpv130_single_event_busy") &&
+              finalization.find("disable_readout();") <
+              finalization.find("stop_v1720e_and_publish_state"),
+          "STOP finalization must guard duplicate callbacks and close the gate first");
+  require(stop600.find("finalize_stop(run_number, error, true)") != std::string::npos &&
+              frontend.find("cm_register_transition(TR_STOP, stop_after_mfe_drain, 600)") !=
+                  std::string::npos,
+          "STOP 600 must run the shared finalization after MFE 500");
   require(init.find("disable_readout();") != std::string::npos,
           "frontend_init must disable readout");
 

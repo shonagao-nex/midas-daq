@@ -106,6 +106,8 @@ static MVME_INTERFACE *gVme = NULL;              // MIDAS VME interface handle
 // Hold VME acquisition and readout state
 struct VmeState {
   bool readout_failed = false;
+  bool stop_finalization_attempted = false;
+  INT stop_finalization_status = SUCCESS;
   bool frontend_enabled_for_run = true;
   std::atomic<bool> blt_stop_requested{false};
   V1190_FIFO_BLT_STATE v1190_fifo_blt = {};
@@ -1785,6 +1787,8 @@ static void setup_v792_sw_trigger_test()
 static void reset_run_statistics()
 {
   gVmeState.readout_failed = false;
+  gVmeState.stop_finalization_attempted = false;
+  gVmeState.stop_finalization_status = SUCCESS;
   gVmeState.blt_stop_requested.store(false, std::memory_order_relaxed);
   gVmeStatistics.run = {};
   gVmeStatistics.run.v1720_min_ttt_delta = 0x7FFFFFFFu;
@@ -1852,8 +1856,61 @@ static void refresh_enabled_module_variables()
   }
 }
 
+// Report a non-consuming hardware snapshot after the MFE STOP 500 drain.
+// Empty hardware buffers do not prove that rpc_send_event reached the logger.
+static bool log_stop_recovery_snapshot(INT run_number, bool standard_drain_attempted)
+{
+  bool complete = standard_drain_attempted && gVme != NULL && !gVmeState.readout_failed &&
+                  gVmeStatistics.run.counter_mismatch_count == 0;
+  if (gVmeConfig.v792.enabled) {
+    const auto &state = gVmeModuleState.v792;
+    cm_msg(state.communication_ok && !state.data_ready ? MT_INFO : MT_ERROR,
+           __FILE__, __LINE__, frontend_name,
+           "STOP final run %d V792: ready=%d counter=%u status-valid=%d",
+           run_number, state.data_ready, state.event_counter, state.communication_ok);
+    complete &= state.communication_ok && !state.data_ready;
+  }
+  if (gV1190Config.run_settings.enabled) {
+    const auto &state = gVmeModuleState.v1190;
+    cm_msg(state.communication_ok && !state.data_ready && state.event_stored == 0 ? MT_INFO : MT_ERROR,
+           __FILE__, __LINE__, frontend_name,
+           "STOP final run %d V1190: ready=%d stored=%u counter=%u status-valid=%d",
+           run_number, state.data_ready, state.event_stored,
+           state.event_counter, state.communication_ok);
+    complete &= state.communication_ok && !state.data_ready && state.event_stored == 0;
+  }
+  if (gVmeConfig.v775.enabled) {
+    const auto &state = gVmeModuleState.v775;
+    cm_msg(state.communication_ok && !state.data_ready ? MT_INFO : MT_ERROR,
+           __FILE__, __LINE__, frontend_name,
+           "STOP final run %d V775: ready=%d counter=%u status-valid=%d",
+           run_number, state.data_ready, state.event_counter, state.communication_ok);
+    complete &= state.communication_ok && !state.data_ready;
+  }
+  if (gV1720State.run.settings.enabled) {
+    const auto &state = gV1720State.runtime.value;
+    cm_msg(state.communication_ok && !state.event_ready && state.event_stored == 0 ? MT_INFO : MT_ERROR,
+           __FILE__, __LINE__, frontend_name,
+           "STOP final run %d V1720E: ready=%d stored=%u counter=%u status-valid=%d",
+           run_number, state.event_ready, state.event_stored,
+           state.event_counter, state.communication_ok);
+    complete &= state.communication_ok && !state.event_ready && state.event_stored == 0;
+  }
+  if (!complete)
+    cm_msg(MERROR, frontend_name,
+           "STOP final run %d VME recovery incomplete: standard_drain_attempted=%d readout_failed=%d counter_mismatches=%llu",
+           run_number, standard_drain_attempted, gVmeState.readout_failed,
+           static_cast<unsigned long long>(gVmeStatistics.run.counter_mismatch_count));
+  else
+    cm_msg(MINFO, frontend_name,
+           "STOP final run %d no residual VME data observed; MIDAS/Logger delivery is not verified",
+           run_number);
+  return complete;
+}
+
 
 static INT start_abort(INT run_number, char *error);
+static INT stop_after_mfe_drain(INT run_number, char *error);
 
 // Verify the MIDAS run state before VME startup recovery
 static INT verify_startup_run_state(INT *current_run_state)
@@ -1914,6 +1971,7 @@ static INT register_frontend_transitions()
   if (cm_register_transition(TR_START, global_busy::before_start, 400) != CM_SUCCESS ||
     cm_register_transition(TR_START, global_busy::after_start, 600) != CM_SUCCESS ||
     cm_register_transition(TR_STOP, global_busy::before_stop, 400) != CM_SUCCESS ||
+    cm_register_transition(TR_STOP, stop_after_mfe_drain, 600) != CM_SUCCESS ||
     cm_register_transition(TR_STARTABORT, global_busy::start_abort, 400) != CM_SUCCESS)
     return FE_ERR_ODB;
   return SUCCESS;
@@ -2274,34 +2332,46 @@ INT begin_of_run(INT run_number, char *error)
   return finish(SUCCESS);
 }
 
-// Stop VME acquisition and publish final status
-INT end_of_run(INT run_number, char *error)
+// Finish a STOP once, either after the standard MFE drain or immediately if
+// STOP 400 could not preserve safe readout. Repeated callbacks do not stop twice.
+static INT finalize_stop(INT run_number, char *error, bool standard_drain_attempted)
 {
+  if (gVmeState.stop_finalization_attempted) {
+    if (gVmeState.stop_finalization_status != SUCCESS && error)
+      snprintf(error, 256, "Previous VME STOP finalization failed");
+    return gVmeState.stop_finalization_status;
+  }
+  gVmeState.stop_finalization_attempted = true;
+  gVmeState.stop_finalization_status = FE_ERR_HW;
   global_busy::disable_readout();
   if (!gVmeState.frontend_enabled_for_run) {
     global_busy::publish_ready(false, false, 0);
+    gVmeState.stop_finalization_status = SUCCESS;
     return SUCCESS;
   }
   global_busy::publish_ready(true, false, 0);
   bool restore_failed = false;
-  printf("End run %d\n", run_number);
-  const bool rpv130_stopped = quiesce_rpv130_single_event_busy("EOR");
-  const bool v1720_stopped = stop_v1720e_and_publish_state("EOR");
+  cm_msg(MINFO, frontend_name, "STOP finalization enter run %d", run_number);
+  const bool rpv130_stopped = quiesce_rpv130_single_event_busy("STOP finalization");
+  const bool v1720_stopped = stop_v1720e_and_publish_state("STOP finalization");
+  log_run_statistics();
+  if (gVme) refresh_enabled_module_variables();
+  log_stop_recovery_snapshot(run_number,
+                             standard_drain_attempted && rpv130_stopped && v1720_stopped);
   if (!rpv130_stopped || !v1720_stopped) {
     publish_run_counters();
-    snprintf(error, 256, "%s failed during EOR",
+    snprintf(error, 256, "%s failed during STOP finalization",
          !rpv130_stopped ? "RPV130 BUSY disable" :
                    "V1720E Acquisition Stop");
     return FE_ERR_HW;
   }
-  log_run_statistics();
   if (!publish_run_counters()) {
     cm_msg(MERROR, frontend_name,
-         "Cannot publish final VME RunCounters ODB values at EOR");
+         "Cannot publish final VME RunCounters ODB values at STOP");
     snprintf(error, 256, "Cannot publish final VME RunCounters");
+    gVmeState.stop_finalization_status = FE_ERR_ODB;
     return FE_ERR_ODB;
   }
-  refresh_enabled_module_variables();
 
 #if ENABLE_V1190_SOFT_TRIGGER_TEST
   if (gV1190Config.run_settings.enabled && !restore_v1190_diagnostic_settings())
@@ -2315,7 +2385,31 @@ INT end_of_run(INT run_number, char *error)
     snprintf(error, 256, "Diagnostic settings restoration failed");
     return FE_ERR_HW;
   }
+  gVmeState.stop_finalization_status = SUCCESS;
   return SUCCESS;
+}
+
+// MFE invokes this at STOP 500 before its normal EQ_POLLED final check.
+INT end_of_run(INT run_number, char *error)
+{
+  printf("End run %d\n", run_number);
+  if (!gVmeState.frontend_enabled_for_run) return SUCCESS;
+  if (!global_busy::readout_allowed() || gVmeState.readout_failed) {
+    cm_msg(MERROR, frontend_name,
+           "STOP 500 run %d: final VME event recovery incomplete; stopping hardware now",
+           run_number);
+    return finalize_stop(run_number, error, false);
+  }
+  cm_msg(MINFO, frontend_name,
+         "STOP 500 run %d: leaving VME acquisition active for MFE EQ_POLLED drain",
+         run_number);
+  return SUCCESS;
+}
+
+// MFE STOP 500 has returned and flushed its standard event buffer.
+static INT stop_after_mfe_drain(INT run_number, char *error)
+{
+  return finalize_stop(run_number, error, true);
 }
 
 
@@ -2389,7 +2483,9 @@ INT frontend_loop()
            "BLT32 failure: RUN stop requested");
     }
   }
-  global_busy::process_diagnostic_request(run_state == STATE_STOPPED);
+  global_busy::process_diagnostic_request(
+    run_state == STATE_STOPPED && !global_busy::readout_allowed() &&
+    !gV1720State.lifecycle.started && !gVmeState.rpv130_busy_configured);
   process_manual_buffer_clear_request();
   publish_rpv130_status(false);
   const DWORD now = ss_millitime();

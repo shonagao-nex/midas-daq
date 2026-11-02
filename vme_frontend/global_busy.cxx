@@ -283,9 +283,15 @@ INT after_start(INT run, char* error) {
 // Assert Global BUSY before stopping acquisition
 //************************************//
 INT before_stop(INT, char* error) {
-  disable_readout();
-  if (!set_global_busy(true))
-    cm_msg(MERROR, "global_busy", "Cannot assert Global BUSY before EOR");
+  if (!set_global_busy(true)) {
+    disable_readout();
+    cm_msg(MERROR, "global_busy",
+           "Cannot assert Global BUSY before EOR; final VME event recovery is incomplete");
+  } else {
+    cm_msg(MINFO, "global_busy",
+           "STOP 400 BUSY asserted; VME readout gate remains %s for MFE STOP 500",
+           readout_allowed() ? "enabled" : "disabled");
+  }
   if (error) error[0] = '\0';
   return SUCCESS;
 }

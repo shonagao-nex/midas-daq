@@ -73,12 +73,12 @@ int main() {
               abort.find("v1720e_software_clear") == std::string::npos,
           "STARTABORT performs forbidden clear or configuration work");
 
-  const std::string eor = functionBody(
-      source, "INT end_of_run(INT run_number, char *error)",
-      "static INT start_abort(INT run_number, char *error)\n{");
-  require(eor.find("stop_v1720e_and_publish_state(\"EOR\")") !=
+  const std::string stop_finalization = functionBody(
+      source, "static INT finalize_stop(INT run_number, char *error, bool standard_drain_attempted)",
+      "INT end_of_run(INT run_number, char *error)");
+  require(stop_finalization.find("stop_v1720e_and_publish_state(\"STOP finalization\")") !=
               std::string::npos,
-          "normal EOR no longer uses the common stop path");
+          "STOP finalization does not use the common V1720E stop path");
 
   const std::string init = functionBody(
       source, "INT frontend_init()\n{", "INT frontend_exit()\n{");
