@@ -516,6 +516,7 @@ static void initialize_v1720e_output_schema()
 {
   const V1720E_CONFIG_READBACK empty_readback = {};
   vme_odb::publish_v1720e_readback(empty_readback, false);
+  vme_odb::publish_v1720e_trg_out_readback(0, 0, false);
   gV1720State.runtime.value = {};
   gV1720State.runtime.value.dirty = true;
   publish_v1720e_variables();
@@ -1967,6 +1968,28 @@ INT frontend_init()
     gVme = NULL;
     global_busy::attach(NULL);
     return FE_ERR_HW;
+  }
+  if (gV1720State.lifecycle.startup_enabled) {
+    DWORD trigger_out_mask = 0, front_panel_io = 0;
+    const int trg_out_status = v1720e_configure_trg_out(
+      gVme, V1720E_BASE, &trigger_out_mask, &front_panel_io);
+    const bool trg_out_ok = trg_out_status == MVME_SUCCESS;
+    const bool odb_ok = vme_odb::publish_v1720e_trg_out_readback(
+      trigger_out_mask, front_panel_io, trg_out_ok);
+    if (!trg_out_ok || !odb_ok) {
+      cm_msg(MERROR, frontend_name,
+           "V1720E TRG-OUT startup configuration/readback failed: status %d, "
+           "mask 0x%08X, I/O 0x%08X, ODB %s",
+           trg_out_status, trigger_out_mask, front_panel_io,
+           odb_ok ? "OK" : "failed");
+      mvme_close(gVme);
+      gVme = NULL;
+      global_busy::attach(NULL);
+      return odb_ok ? FE_ERR_HW : FE_ERR_ODB;
+    }
+    cm_msg(MINFO, frontend_name,
+         "V1720E TRG-OUT external-only NIM: mask 0x%08X, I/O 0x%08X",
+         trigger_out_mask, front_panel_io);
   }
   // Recheck just before recovery so a run-state change during initialization
   // cannot use the earlier STOPPED snapshot to authorize a V1720E stop.

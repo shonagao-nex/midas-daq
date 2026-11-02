@@ -109,6 +109,38 @@ int v1720e_probe(MVME_INTERFACE *vme, DWORD base, V1720E_BOARD_INFO *info)
     return MVME_SUCCESS;
 }
 
+int v1720e_configure_trg_out(MVME_INTERFACE *vme, DWORD base,
+                            DWORD *mask_readback, DWORD *io_readback)
+{
+    const DWORD trigger_bits = 0xC00000FFu;
+    const DWORD io_bits = 0x00008003u;
+    DWORD mask = 0, io = 0, actual = 0;
+    int status;
+    if (!vme || !mask_readback || !io_readback)
+        return MVME_INVALID_PARAM;
+    *mask_readback = 0;
+    *io_readback = 0;
+    status = v1720e_read32(vme, base, REG_TRIGGER_OUT_MASK, &mask);
+    if (status != MVME_SUCCESS) return status;
+    status = v1720e_read32(vme, base, REG_FRONT_PANEL_IO_CONTROL, &io);
+    if (status != MVME_SUCCESS) return status;
+    /* Keep reserved and unrelated fields, including LVDS configuration. */
+    mask = (mask & ~trigger_bits) | 0x40000000u;
+    io &= ~io_bits;
+    status = v1720e_write32(vme, base, REG_TRIGGER_OUT_MASK, mask);
+    if (status != MVME_SUCCESS) return status;
+    status = v1720e_read32(vme, base, REG_TRIGGER_OUT_MASK, &actual);
+    if (status != MVME_SUCCESS) return status;
+    *mask_readback = actual;
+    if (actual != mask) return MVME_ACCESS_ERROR;
+    status = v1720e_write32(vme, base, REG_FRONT_PANEL_IO_CONTROL, io);
+    if (status != MVME_SUCCESS) return status;
+    status = v1720e_read32(vme, base, REG_FRONT_PANEL_IO_CONTROL, &actual);
+    if (status != MVME_SUCCESS) return status;
+    *io_readback = actual;
+    return actual == io ? MVME_SUCCESS : MVME_ACCESS_ERROR;
+}
+
 int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
                       DWORD *event_stored, DWORD *acquisition_status)
 {

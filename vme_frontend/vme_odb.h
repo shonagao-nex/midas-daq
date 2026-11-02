@@ -238,6 +238,7 @@ bool read_v1190_settings(V1190Settings &settings);
 bool read_v775_settings(V775Settings &settings);
 bool ensure_v1720e_settings_schema(const V1720ESettings &defaults);
 bool read_v1720e_settings(V1720ESettings &settings);
+bool publish_v1720e_trg_out_readback(DWORD mask, DWORD io_control, bool valid);
 bool publish_v1720e_info();
 void publish_rpv130_disabled_state();
 void publish_rpv130_status(const RPV130_STATUS &status, BOOL communication_ok,

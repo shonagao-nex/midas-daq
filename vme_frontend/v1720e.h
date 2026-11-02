@@ -67,6 +67,9 @@ V1720E_ACQUISITION_STATE v1720e_decode_acquisition_status(DWORD status);
 V1720E_BOARD_ID v1720e_decode_board_info(DWORD board_info);
 
 int v1720e_probe(MVME_INTERFACE *vme, DWORD base, V1720E_BOARD_INFO *info);
+/* Configure fixed external TRG-IN to NIM TRG-OUT routing at frontend startup. */
+int v1720e_configure_trg_out(MVME_INTERFACE *vme, DWORD base,
+                            DWORD *mask_readback, DWORD *io_readback);
 int v1720e_data_ready(MVME_INTERFACE *vme, DWORD base, int *ready,
                       DWORD *event_stored, DWORD *acquisition_status);
 /* BOR gate: require the RUN-start memory reset to leave no stored event. */

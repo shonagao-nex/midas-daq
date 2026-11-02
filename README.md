@@ -15,6 +15,30 @@ documents for details:
 
 ## Development services
 
+### V1720E TRG-OUT
+
+At `fevme` initialization, when V1720E is enabled in ODB, the frontend routes
+only External TRG-IN to TRG-OUT. Register `0x8110` enables bit 30 and clears
+software bit 31 and channel bits 7:0; other bits are preserved. Register
+`0x811C` clears bit 15 (normal operation), bit 1 (panel output enabled), and
+bit 0 (NIM); all other bits are preserved. Each D32 write is read back and a
+failure prevents frontend initialization. The raw values and verification flag
+are recorded under `/Equipment/VME/Readback/V1720E` as `TriggerOutMaskRaw`,
+`FrontPanelIoControlRaw`, and `TriggerOutValid`. This is fixed frontend behavior,
+so no adjustable ODB setting is added. The separate `0x810C` acquisition
+trigger source and V3718 OUT0 Global BUSY configuration are unaffected.
+BOR/EOR and STOP do not write either TRG-OUT register.
+
+The [CAEN V1720 register description (2013-04-22)](https://wwwusers.ts.infn.it/~rui/univ/Acquisizione_Dati/Manuals/CAEN%20V1720%20Registers%20Description.pdf)
+§2.22 and §2.25 define these fields; §2.27 defines ROC FPGA revision at
+`0x8124`, already read during board probing. CAEN warns that the document may
+not fully apply above ROC FPGA 3.8. The existing code was verified with 4.5,
+but TRG-OUT behavior with that firmware, especially while STOPPED, requires
+hardware measurement. With a suitable NIM scope and known TRG-IN pulse,
+measure TRG-OUT before RUN, during RUN, and after STOP; compare pulse presence,
+edge delay, and width. Also confirm software and channel self triggers produce
+no TRG-OUT pulse. This measurement has not been performed by the software tests.
+
 Work in `/home/nagao/midas/midas/online` with experiment `daq-dev` from
 `/home/nagao/midas/midas/exptab`. Build the clients before starting them:
 

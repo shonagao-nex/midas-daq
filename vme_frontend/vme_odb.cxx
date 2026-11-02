@@ -924,6 +924,17 @@ void set_v1720e_readback_valid(bool valid)
                       1, TID_BOOL);
 }
 
+bool publish_v1720e_trg_out_readback(DWORD mask, DWORD io_control, bool valid)
+{
+    const BOOL verified = valid ? TRUE : FALSE;
+    return set_v1720e_output(V1720E_READBACK_PATH, "TriggerOutMaskRaw",
+                             &mask, sizeof(mask), 1, TID_DWORD) &&
+           set_v1720e_output(V1720E_READBACK_PATH, "FrontPanelIoControlRaw",
+                             &io_control, sizeof(io_control), 1, TID_DWORD) &&
+           set_v1720e_output(V1720E_READBACK_PATH, "TriggerOutValid",
+                             &verified, sizeof(verified), 1, TID_BOOL);
+}
+
 //************************************//
 // Publish the acquired V1720E register readback to ODB
 //************************************//
