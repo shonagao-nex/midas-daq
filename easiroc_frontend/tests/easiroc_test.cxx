@@ -6,7 +6,7 @@
 #include <string>
 
 namespace {
-constexpr char kDefaultIpAddress[] = "192.168.10.26";
+constexpr char kDefaultIpAddress[] = "192.168.10.40";
 }  // namespace
 
 int main(int argc, char** argv) {

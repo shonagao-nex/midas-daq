@@ -14,7 +14,7 @@
 #include <string>
 
 namespace {
-constexpr char kHost[] = "192.168.10.26";
+constexpr char kHost[] = "192.168.10.40";
 constexpr std::uint16_t kTcpPort = 24;
 constexpr int kConnectTimeoutMs = 1000;
 constexpr int kEventTimeoutMs = 30000;

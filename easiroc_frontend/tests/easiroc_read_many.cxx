@@ -19,7 +19,7 @@
 #include <string>
 
 namespace {
-constexpr char kDefaultHost[] = "192.168.10.26";
+constexpr char kDefaultHost[] = "192.168.10.40";
 constexpr std::uint16_t kTcpPort = 24;
 constexpr std::size_t kDefaultEventCount = 100;
 constexpr int kConnectTimeoutMs = 1000;

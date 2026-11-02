@@ -27,7 +27,7 @@ The controller constructs `VmeEasiroc.new(ipaddr, 24, 4660)`
   (`RBCP.rb:119-136`).
 
 The legacy default IP is `192.168.10.16` (`Controller.rb:644` and
-`README:11-14`). The current frontend's ODB default is `192.168.10.26`
+`README:11-14`). The current frontend's ODB default is `192.168.10.40`
 (`easiroc_odb.cxx`); the configured ODB value determines the actual target.
 
 ## RBCP request packet

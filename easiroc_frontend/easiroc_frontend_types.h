@@ -14,7 +14,7 @@ namespace easiroc_frontend {
 
 struct FrontendSettings {
   bool enabled = true;
-  std::string ip_address = "192.168.10.26";
+  std::string ip_address = "192.168.10.40";
   easiroc::DaqEnables enables;
   easiroc::AsicSlowControlSettings asic_slow_control;
 };
