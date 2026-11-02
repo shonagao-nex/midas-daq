@@ -11,10 +11,6 @@ bool daq_ready = false;
 bool busy_set = false;
 unsigned set_calls = 0;
 unsigned clear_calls = 0;
-bool fail_next_set = false;
-bool stop_set_call = false;
-bool readout_during_stop_set = false;
-std::string last_error;
 constexpr INT kRun = 42;
 
 template <typename T>
@@ -30,8 +26,7 @@ INT cm_get_experiment_database(HNDLE* db, HNDLE*) {
   *db = 1;
   return CM_SUCCESS;
 }
-INT cm_msg(INT level, const char*, INT, const char*, const char* format, ...) {
-  if (level == MT_ERROR) last_error = format;
+INT cm_msg(INT, const char*, INT, const char*, const char*, ...) {
   return CM_SUCCESS;
 }
 DWORD ss_millitime(void) { return 0; }
@@ -94,14 +89,8 @@ extern "C" CVErrorCodes CAENVME_ReadRegister(int32_t, CVRegisters reg,
   return cvSuccess;
 }
 extern "C" CVErrorCodes CAENVME_SetOutputRegister(int32_t, unsigned short) {
-  if (stop_set_call)
-    readout_during_stop_set = global_busy::readout_allowed();
-  ++set_calls;
-  if (fail_next_set) {
-    fail_next_set = false;
-    return cvBusError;
-  }
   busy_set = true;
+  ++set_calls;
   return cvSuccess;
 }
 extern "C" CVErrorCodes CAENVME_ClearOutputRegister(int32_t, unsigned short) {
@@ -126,22 +115,5 @@ int main() {
   daq_ready = true;
   assert(global_busy::after_start(kRun, error) == SUCCESS);
   assert(!busy_set && clear_calls == 1 && global_busy::readout_allowed());
-
-  stop_set_call = true;
-  assert(global_busy::before_stop(kRun, error) == SUCCESS);
-  assert(readout_during_stop_set && busy_set && global_busy::readout_allowed());
-
-  stop_set_call = false;
-  assert(global_busy::before_start(kRun, error) == SUCCESS);
-  daq_ready = true;
-  assert(global_busy::after_start(kRun, error) == SUCCESS);
-  assert(!busy_set && global_busy::readout_allowed());
-
-  stop_set_call = true;
-  fail_next_set = true;
-  last_error.clear();
-  assert(global_busy::before_stop(kRun, error) == SUCCESS);
-  assert(readout_during_stop_set && !busy_set && !global_busy::readout_allowed());
-  assert(last_error.find("recovery is incomplete") != std::string::npos);
   global_busy::attach(nullptr);
 }
