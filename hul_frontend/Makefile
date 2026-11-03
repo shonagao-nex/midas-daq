@@ -13,7 +13,7 @@ OFFICIAL := $(BUILD)/UDPRBCP.o $(BUILD)/FPGAModule.o
 TESTS := $(BIN)/tests/hul_stream_test $(BIN)/tests/hul_snapshot_test \
 	$(BIN)/tests/hul_rbcp_test $(BIN)/tests/hul_load_test \
 	$(BIN)/tests/hul_run_guard_test
-TESTS += $(BIN)/tests/hul_bank_test
+TESTS += $(BIN)/tests/hul_bank_test $(BIN)/tests/hul_monitor_test
 
 .PHONY: all check clean
 all: $(BIN)/fehul $(TESTS)
