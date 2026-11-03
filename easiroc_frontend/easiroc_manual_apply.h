@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace easiroc {
 
@@ -36,12 +37,17 @@ struct ManualApplyStatus {
   bool last_attempt_succeeded = false;
   std::string last_apply_error;
   std::uint64_t last_apply_unix_time = 0;
+  bool rollback_attempted = false;
+  bool rollback_succeeded = false;
+  std::string rollback_error;
 };
 
 struct ManualApplyRequestContext {
   ManualApplyRunState run_state = ManualApplyRunState::kUnknown;
   bool frontend_enabled = false;
   bool another_apply_in_progress = false;
+  bool transition_clear = false;  // unknown is unsafe
+
 };
 
 struct ManualApplyTransition {
@@ -63,6 +69,10 @@ struct ManualApplyBackendResult {
 
 const char* manualApplyStateName(ManualApplyState state);
 
+// Failed/unavailable rollback inhibits START until a successful re-apply.
+bool slowControlPermitsDaqStart(bool hardware_state_indeterminate,
+                               bool apply_in_progress);
+
 // Claims one monotonic request and produces the state that must be published
 // before safety checks or hardware preparation begin.
 ManualApplyTransition beginManualApplyRequest(
@@ -73,7 +83,7 @@ ManualApplyStatus rejectManualApplyRequest(
     std::uint64_t unix_time);
 
 // Applies one immutable Settings snapshot. The only hardware operations are
-// the injected ASIC-only seven-transaction writer and delay callbacks.
+// injected writer and delay callbacks (legacy ASIC-only or complete SC plan).
 ManualApplyBackendResult executeManualApplyBackend(
     const ManualApplyStatus& pending,
     const ManualApplyRequestContext& context,
@@ -88,6 +98,27 @@ ManualApplyBackendResult executeManualApplyBackend(
 ManualApplyStatus acknowledgeStaleManualApplyRequest(
     const ManualApplyStatus& current, std::uint32_t request_id,
     std::uint64_t unix_time);
+
+struct SlowControlDevice {
+  std::string id;
+  std::string ip_address;
+  AsicSlowControlSettings settings;
+  AppliedAsicSlowControlSettings last_applied;
+  ManualApplyStatus status;
+  bool hardware_state_indeterminate = false;
+};
+
+// IDs are ODB-safe names, IPs are canonical dotted decimal (no aliases).
+bool isSlowControlDeviceId(const std::string& id);
+std::optional<std::string> validateSlowControlDevices(
+    const std::vector<SlowControlDevice>& devices);
+
+// Pure migration proposal: does not create/modify any ODB keys. The original
+// legacy DAQ subtree remains the acquisition owner after migration.
+SlowControlDevice proposeLegacySlowControlMigration(
+    const std::string& id, const std::string& ip,
+    const AsicSlowControlSettings& settings,
+    const AppliedAsicSlowControlSettings& last_applied);
 
 }  // namespace easiroc
 

@@ -35,6 +35,22 @@ std::optional<std::string> validateAsicSlowControlSettings(
       }
     }
   }
+  if (settings.extras) {
+    const auto& e = *settings.extras;
+    for (unsigned i = 0; i < 2; ++i) {
+      if (e.probe_channel[i] < 0 || e.probe_channel[i] > 31 ||
+          e.probe_signal[i] < 0 || e.probe_signal[i] > 4)
+        return "Probe Channel must be 0..31 and Signal 0..4";
+      for (int dac : settings.asic[i].input_dac)
+        if (dac < 256) return "InputDAC must be in range 256..511";
+    }
+    if (e.logic_pattern < 0 || e.logic_pattern > 9 || e.one_channel < 0 ||
+        e.one_channel > 63 || e.hit_num_threshold < 0 || e.hit_num_threshold > 64)
+      return "Invalid SelectableLogic settings";
+    if (e.trigger_width_ns != 0 && (e.trigger_width_ns < 46 ||
+        e.trigger_width_ns > 278 || (e.trigger_width_ns - 46) % 8 != 0))
+      return "TriggerWidth must be Raw or 46..278 ns in steps of 8";
+  }
   return std::nullopt;
 }
 

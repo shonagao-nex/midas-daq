@@ -173,6 +173,14 @@ class SlowControlPolicy {
   static std::vector<Transaction> buildAsicApplyPlan(
       const AsicSlowControlImages& images);
 
+  // Only requested ASIC/probe/logic/width registers. No pedestal, read-register,
+  // time-window, trigger-delay, clock, or HV writes.
+  static std::vector<Transaction> buildSlowControlApplyPlan(
+      const AsicSlowControlImages& images,
+      const std::array<ProbeSelection, 2>& probe,
+      const SelectableLogicConfig& logic,
+      const std::optional<std::uint16_t>& width_ns);
+
   // Copies the complete legacy-site production baseline for one ASIC,
   // overlays discriminator DAC code/slope, all 32 Input DAC values, and the
   // physical HG/LG feedback-capacitance and shaping-time selections, and the

@@ -23,6 +23,10 @@ struct AsicApplyResult {
   std::string error;
 };
 
+AsicApplyResult executeSlowControlPlan(
+    const std::vector<Transaction>& plan, const SlowControlWrite& write,
+    const SlowControlDelay& delay);
+
 AsicApplyResult executeAsicApplyPlan(
     const std::vector<Transaction>& plan, const SlowControlWrite& write,
     const SlowControlDelay& delay);

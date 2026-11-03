@@ -82,5 +82,22 @@ int main() {
               std::string::npos,
           "normal EOR no longer uses common acquisition cleanup");
 
-  std::cout << "easiroc_start_abort_contract_test: 9 checks passed\n";
+  const std::string bor = between(source, "INT begin_of_run(", "INT end_of_run(");
+  require(bor.find("executeManualApplyBackend") == std::string::npos &&
+              bor.find("applyAsicSlowControlAtBor") == std::string::npos &&
+              bor.find("buildSlowControlApplyPlan") == std::string::npos &&
+              bor.find("SlowControlEncoder") == std::string::npos,
+          "BOR automatically applies slow-control settings");
+  const auto inhibit = bor.find("slowControlPermitsDaqStart");
+  const auto first_hardware = bor.find("stop_acquisition(\"begin_of_run\"");
+  require(inhibit != std::string::npos && first_hardware != std::string::npos &&
+              inhibit < first_hardware && bor.find("device_start_inhibit_reason") < first_hardware,
+          "START inhibit is missing or occurs after BOR hardware access");
+  const auto manual = between(source, "void process_manual_apply_request() {",
+                             "std::optional<DWORD> accept_manual_buffer_clear_request()");
+  require(manual.find("ApplyOdbLock operation_lock") < manual.find("prepare_manual_apply(") &&
+              manual.find("record_manual_apply_result(") < manual.find("publish_manual_apply_result("),
+          "legacy Apply does not serialize state checks through result publication");
+
+  std::cout << "easiroc_start_abort_contract_test: 12 checks passed\n";
 }

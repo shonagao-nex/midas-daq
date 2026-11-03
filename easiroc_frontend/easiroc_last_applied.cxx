@@ -56,6 +56,8 @@ HardwareConfigurationComparison compareAsicSlowControlSettings(
                         std::to_string(channel) + "] differs");
     }
   }
+  if (settings.extras != last_applied.extras)
+    return mismatch("Probe/SelectableLogic/TriggerWidth differs");
   return {HardwareConfigurationStatus::kMatch, ""};
 }
 

@@ -8,11 +8,11 @@ namespace {
 
 constexpr std::size_t kAsicApplyTransactionCount = 7;
 
-std::string failureMessage(std::size_t transaction_index,
+std::string failureMessage(std::size_t transaction_index, std::size_t total,
                            const std::string& detail) {
   return "ASIC slow-control transaction " +
          std::to_string(transaction_index + 1) + "/" +
-         std::to_string(kAsicApplyTransactionCount) + " failed: " + detail +
+         std::to_string(total) + " failed: " + detail +
          "; ASIC slow-control hardware state may be indeterminate after "
          "partial apply failure";
 }
@@ -32,6 +32,14 @@ AsicApplyResult executeAsicApplyPlan(
     return result;
   }
 
+  return executeSlowControlPlan(plan, write, delay);
+}
+
+AsicApplyResult executeSlowControlPlan(
+    const std::vector<Transaction>& plan, const SlowControlWrite& write,
+    const SlowControlDelay& delay) {
+  AsicApplyResult result;
+  result.attempted = true;
   for (std::size_t index = 0; index < plan.size(); ++index) {
     const auto& transaction = plan[index];
     try {
@@ -45,10 +53,10 @@ AsicApplyResult executeAsicApplyPlan(
       }
       ++result.completed_transactions;
     } catch (const std::exception& error) {
-      result.error = failureMessage(index, error.what());
+      result.error = failureMessage(index, plan.size(), error.what());
       return result;
     } catch (...) {
-      result.error = failureMessage(index, "unknown exception");
+      result.error = failureMessage(index, plan.size(), "unknown exception");
       return result;
     }
   }

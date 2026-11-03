@@ -417,6 +417,23 @@ std::array<std::uint8_t, 3> SlowControlPolicy::encodeTriggerDelay(
           static_cast<std::uint8_t>(config.l1 == -1 ? 13 : config.l1)};
 }
 
+std::vector<Transaction> SlowControlPolicy::buildSlowControlApplyPlan(
+    const AsicSlowControlImages& images,
+    const std::array<ProbeSelection, 2>& probe,
+    const SelectableLogicConfig& logic,
+    const std::optional<std::uint16_t>& width_ns) {
+  // Encode everything before returning an executable plan.
+  const auto first = encodeProbe(probe[0], 0);
+  const auto second = encodeProbe(probe[1], 1);
+  const auto logic_image = encodeSelectableLogic(logic);
+  const auto width = encodeTriggerWidth(width_ns);
+  auto plan = buildAsicApplyPlan(images);
+  appendSerialApply(plan, false, asVector(first), asVector(second));
+  plan.push_back(Transaction::write(0x78, asVector(logic_image)));
+  plan.push_back(Transaction::write(0x88, {width}));
+  return plan;
+}
+
 std::vector<Transaction> SlowControlPolicy::buildApplyPlan(
     const SlowControlConfig& config) {
   const AsicSlowControlImages images{{

@@ -1,5 +1,6 @@
 #include "easiroc_odb.h"
 #include "mfe.h"
+#include "msystem.h"
 #include "easiroc_readout.h"
 #include "rbcp.h"
 
@@ -8,9 +9,16 @@
 #include <cstdio>
 #include <ctime>
 #include <vector>
+#include <map>
+#include <type_traits>
+#include <stdexcept>
 
 namespace easiroc_odb {
 namespace {
+bool transferExtras(const std::string& base,
+    std::optional<easiroc::SlowControlExtras>& extras, bool write);
+bool readSettingsExtras(const std::string& base,
+    std::optional<easiroc::SlowControlExtras>& extras);
 constexpr char kSettingsPath[] = "/Equipment/EASIROC/Settings";
 constexpr char kCommandsPath[] = "/Equipment/EASIROC/Commands";
 constexpr char kInfoPath[] = "/Equipment/EASIROC/Info";
@@ -491,6 +499,14 @@ bool publish_runtime_variables(const RuntimePublishView& view) {
   ok = set_odb_string(
            odb_path(asic_slow_control.c_str(), "LastApplyError"),
            view.asic_apply.last_apply_error, 256) && ok;
+  const BOOL rollback_attempted = view.asic_apply.rollback_attempted ? TRUE : FALSE;
+  const BOOL rollback_succeeded = view.asic_apply.rollback_succeeded ? TRUE : FALSE;
+  ok = set_odb_value(odb_path(asic_slow_control.c_str(), "RollbackAttempted"),
+                     &rollback_attempted, sizeof(rollback_attempted), 1, TID_BOOL) && ok;
+  ok = set_odb_value(odb_path(asic_slow_control.c_str(), "RollbackSucceeded"),
+                     &rollback_succeeded, sizeof(rollback_succeeded), 1, TID_BOOL) && ok;
+  ok = set_odb_string(odb_path(asic_slow_control.c_str(), "RollbackError"),
+                      view.asic_apply.rollback_error, 256) && ok;
   PUBLISH_QWORD(asic_slow_control.c_str(), "LastApplyUnixTime",
                 view.asic_apply.last_apply_unix_time);
   ok = set_odb_value(
@@ -929,6 +945,17 @@ bool read_last_applied_settings(
   bool indeterminate = false;
   path = odb_path(status.c_str(), "HardwareStateIndeterminate");
   if (read_bool_setting(path.c_str(), &indeterminate) != SUCCESS) return false;
+  HNDLE extended_key = 0;
+  const auto extended_status = db_find_key(hDB, 0, (last_applied_path + "/Extended").c_str(), &extended_key);
+  if (extended_status != DB_SUCCESS && extended_status != DB_NO_KEY) return false;
+  if (extended_status == DB_SUCCESS) {
+    bool extended = false;
+    if (read_bool_setting((last_applied_path + "/Extended").c_str(), &extended) != SUCCESS) return false;
+    if (extended) {
+      next.extras = easiroc::SlowControlExtras{};
+      if (!transferExtras(last_applied_path, next.extras, false)) return false;
+    }
+  }
   *result = next;
   *hardware_state_indeterminate = indeterminate;
   return true;
@@ -983,6 +1010,10 @@ bool publish_last_applied_settings(
                        channel_enabled.data(), sizeof(channel_enabled),
                        channel_enabled.size(), TID_BOOL) && ok;
   }
+  auto extras = last_applied.extras;
+  const BOOL extended = extras.has_value() ? TRUE : FALSE;
+  ok = set_odb_value(base + "/Extended", &extended, sizeof(extended), 1, TID_BOOL) && ok;
+  if (extras) ok = transferExtras(base, extras, true) && ok;
   if (ok)
     ok = set_odb_value(odb_path(base.c_str(), "Valid"), &valid,
                        sizeof(valid), 1, TID_BOOL);
@@ -1082,6 +1113,8 @@ INT read_settings(FrontendSettings* settings) {
     if (status != SUCCESS) return status;
   }
 
+  if (!readSettingsExtras(kSettingsPath, next.asic_slow_control.extras))
+    return FE_ERR_ODB;
   *settings = next;
   return SUCCESS;
 }
@@ -1188,6 +1221,286 @@ bool initialize_buffer_clear_mailbox_odb() {
     return false;
 
   return true;
+}
+
+namespace {
+// Retain an inhibit even if the ODB status write itself fails. Only a fully
+// persisted successful recovery may clear it in this process.
+std::map<std::string, bool> device_start_inhibits;
+
+// Exact type/length transfer. BOOL arrays use MIDAS BOOL storage, never C++
+// bool bytes. Reads fill a private snapshot; publication clears Valid first.
+template <typename T>
+bool deviceValue(const std::string& path, T& value, bool write) {
+  if constexpr (std::is_same_v<T, int>) {
+    INT size = sizeof(value);
+    if (write) return set_odb_value(path, &value, size, 1, TID_INT);
+    return db_get_value(hDB, 0, path.c_str(), &value, &size, TID_INT, FALSE) == DB_SUCCESS && size == sizeof(value);
+  } else if constexpr (std::is_same_v<T, bool>) {
+    BOOL wire = value ? TRUE : FALSE;
+    INT size = sizeof(wire);
+    if (write) return set_odb_value(path, &wire, size, 1, TID_BOOL);
+    if (db_get_value(hDB, 0, path.c_str(), &wire, &size, TID_BOOL, FALSE) != DB_SUCCESS || size != sizeof(wire)) return false;
+    value = wire != FALSE;
+    return true;
+  } else {
+    using Element = typename T::value_type;
+    using Wire = std::conditional_t<std::is_same_v<Element, bool>, BOOL, INT>;
+    std::array<Wire, std::tuple_size<T>::value> wire{};
+    for (unsigned i = 0; i < wire.size(); ++i) wire[i] = value[i];
+    INT size = sizeof(wire);
+    constexpr DWORD type = std::is_same_v<Element, bool> ? TID_BOOL : TID_INT;
+    if (write) return set_odb_value(path, wire.data(), size, wire.size(), type);
+    if (db_get_value(hDB, 0, path.c_str(), wire.data(), &size, type, FALSE) != DB_SUCCESS || size != sizeof(wire)) return false;
+    for (unsigned i = 0; i < wire.size(); ++i) value[i] = wire[i];
+    return true;
+  }
+}
+
+bool transferExtras(const std::string& base,
+    std::optional<easiroc::SlowControlExtras>& extras, bool write) {
+  easiroc::AsicSlowControlSettings payload;
+  payload.extras = extras;
+  if (!payload.extras) return false;
+  const bool ok = easiroc::visitSlowControlSettings(payload,
+      [&](const std::string& path, auto& value) {
+        if (path.rfind("ASIC", 0) == 0) return true;
+        return deviceValue(base + "/" + path, value, write);
+      });
+  if (ok) extras = payload.extras;
+  return ok;
+}
+
+bool readSettingsExtras(const std::string& base,
+    std::optional<easiroc::SlowControlExtras>& extras) {
+  bool found = false;
+  for (const char* name : {"Probe", "SelectableLogic", "TriggerWidth"}) {
+    HNDLE key = 0;
+    const auto status = db_find_key(hDB, 0, (base + "/" + name).c_str(), &key);
+    if (status == DB_SUCCESS) found = true;
+    else if (status != DB_NO_KEY) return false;
+  }
+  if (!found) { extras.reset(); return true; }
+  extras = easiroc::SlowControlExtras{};
+  return transferExtras(base, extras, false);
+}
+
+bool deviceSettings(const std::string& base, easiroc::AsicSlowControlSettings& settings, bool write) {
+  return easiroc::visitSlowControlSettings(settings,
+      [&](const std::string& path, auto& value) { return deviceValue(base + "/" + path, value, write); });
+}
+
+bool readDeviceLastApplied(const std::string& base, easiroc::AppliedAsicSlowControlSettings& result) {
+  bool extended = false;
+  if (!deviceValue(base + "/Valid", result.valid, false)) return false;
+  if (!result.valid) return true;
+  if (!deviceValue(base + "/Extended", extended, false) ||
+      !read_odb_dword(base + "/RequestId", &result.request_id) ||
+      !read_odb_qword(base + "/ApplyUnixTime", &result.apply_unix_time)) return false;
+  easiroc::AsicSlowControlSettings payload;
+  if (extended) payload.extras = easiroc::SlowControlExtras{};
+  if (!deviceSettings(base, payload, false)) return false;
+  result.asic = payload.asic;
+  result.extras = payload.extras;
+  return true;
+}
+
+bool publishDeviceLastApplied(const std::string& base, const easiroc::AppliedAsicSlowControlSettings& result) {
+  bool valid = false;
+  if (!deviceValue(base + "/Valid", valid, true)) return false;
+  bool extended = result.extras.has_value();
+  easiroc::AsicSlowControlSettings payload;
+  payload.asic = result.asic;
+  payload.extras = result.extras;
+  bool ok = deviceSettings(base, payload, true);
+  ok = deviceValue(base + "/Extended", extended, true) && ok;
+  ok = set_odb_value(base + "/RequestId", &result.request_id, sizeof(result.request_id), 1, TID_DWORD) && ok;
+  ok = set_odb_value(base + "/ApplyUnixTime", &result.apply_unix_time, sizeof(result.apply_unix_time), 1, TID_QWORD) && ok;
+  valid = result.valid;
+  return ok && deviceValue(base + "/Valid", valid, true);
+}
+}  // namespace
+
+ApplyOdbLock::ApplyOdbLock() {
+  // Exclusive ODB locking is meaningful only with the local shared-memory DB.
+  locked_ = !rpc_is_remote() && db_lock_database(hDB) == DB_SUCCESS;
+}
+ApplyOdbLock::~ApplyOdbLock() {
+  if (locked_) db_unlock_database(hDB);
+}
+
+// No automatic migration: absent Devices leaves the legacy subtree untouched.
+void process_device_apply_requests(std::uint64_t unix_time,
+    const DeviceSlowControlWrite& write, const easiroc::SlowControlDelay& delay) {
+  struct Mailbox {
+    easiroc::ManualApplyStatus status;
+    std::string ip;
+  };
+  static std::map<std::string, Mailbox> mailboxes;
+  constexpr const char* root = "/Equipment/EASIROC/Devices";
+  HNDLE directory = 0;
+  if (db_find_key(hDB, 0, root, &directory) != DB_SUCCESS) return;
+  ApplyOdbLock operation_lock;
+  if (!operation_lock.locked()) {
+    cm_msg(MERROR, "manual_apply", "Device Apply requires exclusive local ODB access");
+    return;
+  }
+  std::vector<easiroc::SlowControlDevice> devices;
+  bool registry_ok = true;
+  for (int i = 0;; ++i) {
+    HNDLE child = 0;
+    const auto status = db_enum_key(hDB, directory, i, &child);
+    if (status == DB_NO_MORE_SUBKEYS) break;
+    if (status != DB_SUCCESS) { registry_ok = false; break; }
+    KEY key{};
+    if (db_get_key(hDB, child, &key) != DB_SUCCESS || key.type != TID_KEY) {
+      registry_ok = false; break;
+    }
+    easiroc::SlowControlDevice device;
+    device.id = key.name;
+    char ip[64]{};
+    INT size = sizeof(ip);
+    const auto path = std::string(root) + "/" + device.id + "/IPAddress";
+    if (db_get_value(hDB, 0, path.c_str(), ip, &size, TID_STRING, FALSE) != DB_SUCCESS ||
+        size <= 0 || ip[sizeof(ip)-1] != '\0') registry_ok = false;
+    ip[sizeof(ip)-1] = '\0';
+    device.ip_address = ip;
+    devices.push_back(device);
+  }
+  std::string registry_error = registry_ok ? "" : "Cannot read device registry";
+  if (auto error = easiroc::validateSlowControlDevices(devices)) registry_error = *error;
+  // Legacy IP belongs to the existing single-device DAQ route, never to an
+  // additional SC mailbox. Migration needs an explicit ownership decision.
+  char legacy_ip[64]{};
+  INT legacy_size = sizeof(legacy_ip);
+  if (db_get_value(hDB, 0, "/Equipment/EASIROC/Settings/Network/IPAddress",
+                   legacy_ip, &legacy_size, TID_STRING, FALSE) != DB_SUCCESS ||
+      legacy_ip[sizeof(legacy_ip)-1] != '\0')
+    registry_error = "Cannot verify legacy IP ownership";
+  legacy_ip[sizeof(legacy_ip)-1] = '\0';
+  for (const auto& device : devices)
+    if (device.ip_address == legacy_ip) registry_error = "Duplicate legacy/device IP";
+  for (const auto& device : devices) {
+    if (!easiroc::isSlowControlDeviceId(device.id)) continue;
+    const auto base = std::string(root) + "/" + device.id;
+    const auto variables = base + "/Variables/ASICSlowControl/";
+    DWORD request = 0;
+    if (!read_odb_dword(base + "/Commands/ASICSlowControl/ApplyRequestId", &request)) continue;
+    auto found = mailboxes.find(device.id);
+    const bool startup = found == mailboxes.end() || found->second.ip != device.ip_address;
+    if (startup) {
+      Mailbox mailbox;
+      mailbox.ip = device.ip_address;
+      if (!read_odb_dword(variables + "LastHandledRequestId", &mailbox.status.last_handled_request_id) ||
+          !read_odb_dword(variables + "LastSuccessfulRequestId", &mailbox.status.last_successful_request_id))
+        continue;
+      found = mailboxes.insert_or_assign(device.id, mailbox).first;
+    }
+    auto& current = found->second.status;
+    if (request <= current.last_handled_request_id) continue;
+    std::optional<bool> hardware_state_update;
+    if (startup) {
+      current = easiroc::acknowledgeStaleManualApplyRequest(current, request, unix_time);
+      hardware_state_update = true;  // an interrupted request may have written
+    } else {
+      const auto pending = easiroc::beginManualApplyRequest(current, request);
+      easiroc::AsicSlowControlSettings snapshot;
+      snapshot.extras = easiroc::SlowControlExtras{};
+      easiroc::AppliedAsicSlowControlSettings last_applied;
+      bool enabled = false;
+      bool indeterminate = true;
+      if (!registry_error.empty()) {
+        current = easiroc::rejectManualApplyRequest(pending.pending, registry_error, unix_time);
+      } else if (!deviceSettings(base + "/Settings", snapshot, false) ||
+                 !deviceValue(base + "/Settings/Enabled", enabled, false) ||
+                 !readDeviceLastApplied(variables + "LastApplied", last_applied) ||
+                 !deviceValue(variables + "HardwareStateIndeterminate", indeterminate, false)) {
+        current = easiroc::rejectManualApplyRequest(pending.pending, "Cannot snapshot complete device Settings/LastApplied", unix_time);
+      } else {
+        // Run/transition snapshot and all writes/results remain inside the
+        // same ODB exclusion scope. HV is deliberately not an Apply input.
+        easiroc::ManualApplyRequestContext context;
+        context.frontend_enabled = enabled;
+        int run_state = 0, transition = -1;
+        if (deviceValue("/Runinfo/State", run_state, false)) {
+          if (run_state == STATE_STOPPED) context.run_state = easiroc::ManualApplyRunState::kStopped;
+          if (run_state == STATE_RUNNING) context.run_state = easiroc::ManualApplyRunState::kRunning;
+          if (run_state == STATE_PAUSED) context.run_state = easiroc::ManualApplyRunState::kPaused;
+        }
+        context.transition_clear = deviceValue("/Runinfo/Transition in progress", transition, false) && transition == 0;
+        indeterminate = indeterminate || device_start_inhibits[device.id];
+        const auto result = easiroc::executeManualApplyBackend(pending.pending,
+            context, snapshot, last_applied, indeterminate, unix_time, {},
+            [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
+              write(device.ip_address, address, data);
+            }, delay);
+        current = result.terminal;
+        hardware_state_update = result.hardware_state_indeterminate;
+        if (result.last_applied_changed &&
+            !publishDeviceLastApplied(variables + "LastApplied", result.last_applied)) {
+          hardware_state_update = true;
+          current.state = easiroc::ManualApplyState::kIndeterminate;
+          current.last_attempt_succeeded = false;
+          current.last_successful_request_id = pending.pending.last_successful_request_id;
+          current.last_apply_error = "Cannot persist device LastApplied; hardware state indeterminate";
+        }
+      }
+    }
+    // Settings remain desired values; only success updates LastApplied.
+    const DWORD zero = 0;
+    const BOOL no = FALSE;
+    const BOOL succeeded = current.last_attempt_succeeded ? TRUE : FALSE;
+    bool ok = set_odb_value(variables + "ActiveRequestId", &zero, sizeof(zero), 1, TID_DWORD);
+    ok = set_odb_value(variables + "ApplyInProgress", &no, sizeof(no), 1, TID_BOOL) && ok;
+    ok = set_odb_value(variables + "LastAttemptSucceeded", &succeeded, sizeof(succeeded), 1, TID_BOOL) && ok;
+    ok = set_odb_string(variables + "ApplyState", easiroc::manualApplyStateName(current.state), 32) && ok;
+    ok = set_odb_string(variables + "LastApplyError", current.last_apply_error, 256) && ok;
+    ok = set_odb_value(variables + "LastApplyUnixTime", &current.last_apply_unix_time,
+                       sizeof(current.last_apply_unix_time), 1, TID_QWORD) && ok;
+    ok = deviceValue(variables + "RollbackAttempted", current.rollback_attempted, true) && ok;
+    ok = deviceValue(variables + "RollbackSucceeded", current.rollback_succeeded, true) && ok;
+    ok = set_odb_string(variables + "RollbackError", current.rollback_error, 256) && ok;
+    ok = set_odb_value(variables + "LastSuccessfulRequestId", &current.last_successful_request_id,
+                       sizeof(DWORD), 1, TID_DWORD) && ok;
+    if (hardware_state_update)
+      ok = deviceValue(variables + "HardwareStateIndeterminate", *hardware_state_update, true) && ok;
+    // Acknowledgement last; retry publishing after an ODB failure, never execute.
+    if (ok) ok = set_odb_value(variables + "LastHandledRequestId",
+        &current.last_handled_request_id, sizeof(DWORD), 1, TID_DWORD);
+    if (!ok) {
+      device_start_inhibits[device.id] = true;
+      mailboxes.erase(device.id);
+    } else if (hardware_state_update) {
+      device_start_inhibits[device.id] = *hardware_state_update;
+    }
+  }
+}
+
+std::string device_start_inhibit_reason() {
+  for (const auto& inhibit : device_start_inhibits)
+    if (inhibit.second)
+      return "EASIROC " + inhibit.first + ": hardware/status persistence indeterminate; re-apply before START";
+  HNDLE directory = 0;
+  const char* root = "/Equipment/EASIROC/Devices";
+  const auto found = db_find_key(hDB, 0, root, &directory);
+  if (found == DB_NO_KEY) return {};
+  if (found != DB_SUCCESS) return "Cannot inspect EASIROC device apply status";
+  for (int i = 0;; ++i) {
+    HNDLE child = 0;
+    const auto status = db_enum_key(hDB, directory, i, &child);
+    if (status == DB_NO_MORE_SUBKEYS) return {};
+    KEY key{};
+    if (status != DB_SUCCESS || db_get_key(hDB, child, &key) != DB_SUCCESS ||
+        key.type != TID_KEY || !easiroc::isSlowControlDeviceId(key.name))
+      return "Invalid EASIROC device registry at START";
+    const std::string base = std::string(root) + "/" + key.name + "/Variables/ASICSlowControl/";
+    bool indeterminate = true, applying = true;
+    if (!deviceValue(base + "HardwareStateIndeterminate", indeterminate, false) ||
+        !deviceValue(base + "ApplyInProgress", applying, false))
+      return "Cannot verify EASIROC apply state: " + std::string(key.name);
+    if (!easiroc::slowControlPermitsDaqStart(indeterminate, applying))
+      return "EASIROC " + std::string(key.name) + ": HardwareStateIndeterminate or ApplyInProgress; re-apply before START";
+  }
 }
 
 }  // namespace easiroc_odb

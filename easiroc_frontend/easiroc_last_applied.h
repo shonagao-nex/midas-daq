@@ -16,6 +16,7 @@ struct AppliedAsicSlowControlSettings {
   std::uint32_t request_id = 0;
   std::uint64_t apply_unix_time = 0;
   std::array<AsicDiscriminatorSettings, 2> asic;
+  std::optional<SlowControlExtras> extras;
 };
 
 enum class HardwareConfigurationStatus {

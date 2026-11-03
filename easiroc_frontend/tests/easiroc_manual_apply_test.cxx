@@ -7,6 +7,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <variant>
+#include <map>
+#include <type_traits>
 
 namespace {
 int tests_run = 0;
@@ -118,7 +121,7 @@ int main() {
     std::vector<std::vector<std::uint8_t>> payloads;
     std::vector<easiroc::ManualApplyState> published_states;
     const easiroc::ManualApplyRequestContext stopped_enabled{
-        easiroc::ManualApplyRunState::kStopped, true, false};
+        easiroc::ManualApplyRunState::kStopped, true, false, true};
     const auto succeeded = easiroc::executeManualApplyBackend(
         request1.pending, stopped_enabled, settings, {}, false, 1001,
         [&](const easiroc::ManualApplyStatus& status) {
@@ -193,11 +196,11 @@ int main() {
         request2.pending, stopped_enabled, frozen_settings, previous, false,
         1002, {},
         [&](std::uint32_t, const std::vector<std::uint8_t>&) {
-          if (++failed_writes == 3)
+          if (++failed_writes >= 3)
             throw std::runtime_error("mock RBCP failure");
         },
         [&](unsigned) { ++failed_delays; });
-    check(failed_writes == 3 && failed_delays == 0 &&
+    check(failed_writes == 4 && failed_delays == 0 &&
               failed.apply_result.completed_transactions == 2,
           "executor did not stop at the failed write");
     check(failed.terminal.state == easiroc::ManualApplyState::kFailed &&
@@ -288,6 +291,199 @@ int main() {
               stale.active_request_id == 0 && !stale.apply_in_progress &&
               stale_hardware_calls == 0,
           "startup stale request was not acknowledged without hardware");
+
+    // Full slow-control path: pure mocks, no socket/ODB dependencies.
+    auto extended = frozen_settings;
+    extended.extras = easiroc::SlowControlExtras{};
+    extended.extras->probe_enabled = {true, true};
+    extended.extras->probe_channel = {31, 0};
+    extended.extras->and_channels[63] = true;
+    const auto pending = easiroc::beginManualApplyRequest({}, 1).pending;
+    std::vector<easiroc::Transaction> operations;
+    auto record_write = [&](std::uint32_t address, const std::vector<std::uint8_t>& data) {
+      operations.push_back(easiroc::Transaction::write(address, data));
+    };
+    auto record_delay = [&](unsigned ms) { operations.push_back(easiroc::Transaction::delay(ms)); };
+    const auto full = easiroc::executeManualApplyBackend(pending, stopped_enabled,
+        extended, {}, false, 4000, {}, record_write, record_delay);
+    check(full.terminal.last_attempt_succeeded && full.last_applied.extras == extended.extras,
+          "full apply did not record all settings");
+    check(operations.size() == 16, "full plan must contain exactly 16 operations");
+    const std::array<std::uint32_t, 16> full_addresses{
+        0,3,0x3d,0,0,0,0, 0,3,0x3d,0,0,0,0, 0x78,0x88};
+    for (unsigned i = 0; i < operations.size(); ++i) {
+      if (i == 4 || i == 11)
+        check(operations[i].type == easiroc::TransactionType::kDelay && operations[i].delay_ms == 100,
+              "serial delay order changed");
+      else check(operations[i].type == easiroc::TransactionType::kWrite && operations[i].address == full_addresses[i],
+                 "unexpected register or wrong apply order");
+    }
+    check(operations[1].data.size() == 57 && operations[8].data.size() == 20 &&
+          operations[14].data.size() == 11 && operations[14].data[2] == 1 &&
+          operations[14].data[3] == 0x80 && operations[15].data == std::vector<std::uint8_t>{10},
+          "encoded ASIC/probe/logic/width defaults differ");
+    for (unsigned chip = 0; chip < 2; ++chip) {
+      for (int signal = 0; signal < 5; ++signal) {
+        auto changed = extended;
+        changed.extras->probe_signal[chip] = signal;
+        operations.clear();
+        const auto encoded = easiroc::executeManualApplyBackend(pending, stopped_enabled,
+            changed, {}, false, 4000, {}, record_write, record_delay);
+        const auto expected = easiroc::SlowControlPolicy::encodeProbe(
+            {static_cast<easiroc::ProbeOutput>(signal), changed.extras->probe_channel[chip] + int(32*chip)}, chip);
+        check(encoded.last_applied_changed && operations[8+chip].data == std::vector<std::uint8_t>(expected.begin(), expected.end()),
+              "probe signal/channel translation differs");
+      }
+    }
+    for (int pattern = 0; pattern < 10; ++pattern) {
+      auto changed = extended;
+      changed.extras->logic_pattern = pattern;
+      changed.extras->one_channel = 63;
+      operations.clear();
+      easiroc::executeManualApplyBackend(pending, stopped_enabled, changed, {}, false, 4000, {}, record_write, record_delay);
+      check(operations[14].data[0] == pattern && operations[14].data[1] == (pattern == 0 ? 63 : 0),
+            "logic pattern/one channel differs");
+    }
+    for (int width = 0; width <= 278; width = width == 0 ? 46 : width+8) {
+      auto changed = extended; changed.extras->trigger_width_ns = width;
+      operations.clear();
+      easiroc::executeManualApplyBackend(pending, stopped_enabled, changed, {}, false, 4000, {}, record_write, record_delay);
+      check(operations[15].data[0] == (width == 0 ? 0 : (width-38)/8), "width encoding differs");
+    }
+    std::vector<easiroc::AsicSlowControlSettings> invalids;
+    for (int field = 0; field < 9; ++field) {
+      auto changed = extended;
+      switch (field) {
+        case 0: changed.extras->probe_channel[1] = 32; break;
+        case 1: changed.extras->probe_signal[0] = 5; break;
+        case 2: changed.extras->logic_pattern = 10; break;
+        case 3: changed.extras->one_channel = 64; break;
+        case 4: changed.extras->hit_num_threshold = 65; break;
+        case 5: changed.extras->trigger_width_ns = 47; break;
+        case 6: changed.extras->trigger_width_ns = 286; break;
+        case 7: changed.asic[1].input_dac[31] = 255; break;
+        case 8: changed.apply_at_bor = true; break;
+      }
+      invalids.push_back(changed);
+    }
+    for (const auto& invalid : invalids) {
+      operations.clear();
+      const auto rejected = easiroc::executeManualApplyBackend(pending, stopped_enabled,
+          invalid, full.last_applied, false, 4001, {}, record_write, record_delay);
+      check(operations.empty() && !rejected.last_applied_changed && !rejected.apply_result.attempted,
+            "invalid complete settings caused hardware access");
+    }
+    for (int gate = 0; gate < 5; ++gate) {
+      auto context = stopped_enabled;
+      if (gate == 0) context.run_state = easiroc::ManualApplyRunState::kRunning;
+      if (gate == 1) context.run_state = easiroc::ManualApplyRunState::kPaused;
+      if (gate == 2) context.run_state = easiroc::ManualApplyRunState::kUnknown;
+      if (gate == 3) context.transition_clear = false;
+      if (gate == 4) context.another_apply_in_progress = true;
+      operations.clear();
+      const auto rejected = easiroc::executeManualApplyBackend(pending, context,
+          extended, full.last_applied, false, 4001, {}, record_write, record_delay);
+      check(operations.empty() && rejected.terminal.state == easiroc::ManualApplyState::kRejected,
+            "unsafe state did not reject full apply");
+    }
+    for (int fail_at = 1; fail_at <= 14; ++fail_at) {
+      for (bool rollback_fails : {false, true}) {
+        int writes = 0;
+        auto changed = extended; changed.extras->trigger_width_ns = 126;
+        const auto failed_full = easiroc::executeManualApplyBackend(
+            easiroc::beginManualApplyRequest(full.terminal, 2).pending, stopped_enabled,
+            changed, full.last_applied, false, 4002, {},
+            [&](std::uint32_t, const std::vector<std::uint8_t>&) {
+              ++writes;
+              if (writes == fail_at || (rollback_fails && writes > fail_at)) throw std::runtime_error("injected failure");
+            }, [](unsigned) {});
+        check(failed_full.terminal.rollback_attempted &&
+              failed_full.terminal.rollback_succeeded == !rollback_fails &&
+              failed_full.hardware_state_indeterminate == rollback_fails &&
+              failed_full.terminal.last_handled_request_id == 2 &&
+              failed_full.terminal.last_successful_request_id == 1 &&
+              !failed_full.last_applied_changed && failed_full.last_applied.extras == full.last_applied.extras &&
+              writes == fail_at + (rollback_fails ? 1 : 14),
+              "rollback must retransmit exactly once and preserve LastApplied");
+        check(easiroc::slowControlPermitsDaqStart(failed_full.hardware_state_indeterminate,
+                  failed_full.terminal.apply_in_progress) == !rollback_fails,
+              "rollback failure did not inhibit DAQ START");
+      }
+    }
+    auto migrated = easiroc::proposeLegacySlowControlMigration("moduleA", "192.168.10.40", frozen_settings, previous);
+    check(migrated.settings.extras.has_value() && !migrated.last_applied.extras.has_value() &&
+          migrated.last_applied.request_id == previous.request_id, "migration invented applied extras");
+    auto other = migrated; other.id = "moduleB"; other.ip_address = "192.168.10.41";
+    other.settings.asic[0].dac_code = 700;
+    check(!easiroc::validateSlowControlDevices({migrated, other}) && migrated.settings.asic[0].dac_code != 700,
+          "device settings are not independent");
+    other.ip_address = migrated.ip_address;
+    check(easiroc::validateSlowControlDevices({migrated, other}).has_value(), "duplicate IP accepted");
+    other.ip_address = "192.168.010.41";
+    check(easiroc::validateSlowControlDevices({other}).has_value(), "IP alias accepted");
+    other.ip_address = "192.168.10.41"; other.id = "../unsafe";
+    check(easiroc::validateSlowControlDevices({other}).has_value(), "unsafe ID accepted");
+
+    migrated.settings.extras = extended.extras;
+    other.id = "moduleB";
+    std::vector<easiroc::SlowControlDevice> isolated{migrated, other};
+    isolated[0].status = easiroc::acknowledgeStaleManualApplyRequest({}, 8, 5000);
+    isolated[1].status = easiroc::acknowledgeStaleManualApplyRequest({}, 3, 5000);
+    check(!easiroc::beginManualApplyRequest(isolated[0].status, 8).handled &&
+          isolated[0].status.last_handled_request_id == 8 && isolated[1].status.last_handled_request_id == 3,
+          "per-device startup acknowledgements replay or leak across devices");
+    const auto device_request = easiroc::beginManualApplyRequest(isolated[1].status, 4);
+    operations.clear();
+    auto applied_device = easiroc::executeManualApplyBackend(device_request.pending, stopped_enabled,
+        isolated[1].settings, isolated[1].last_applied, false, 5001, {}, record_write, record_delay);
+    isolated[1].status = applied_device.terminal;
+    isolated[1].last_applied = applied_device.last_applied;
+    check(isolated[1].last_applied.request_id == 4 &&
+          isolated[0].last_applied.request_id == migrated.last_applied.request_id &&
+          isolated[0].status.last_handled_request_id == 8,
+          "device apply changed another device result or LastApplied");
+
+    for (const auto& unavailable : {easiroc::AppliedAsicSlowControlSettings{}, previous}) {
+      int attempts = 0;
+      const auto not_restored = easiroc::executeManualApplyBackend(pending, stopped_enabled,
+          extended, unavailable, false, 5002, {},
+          [&](std::uint32_t, const std::vector<std::uint8_t>&) { ++attempts; throw std::runtime_error("write failure"); },
+          [](unsigned) {});
+      check(attempts == 1 && !not_restored.terminal.rollback_attempted &&
+            not_restored.hardware_state_indeterminate && !not_restored.last_applied_changed &&
+            !not_restored.terminal.rollback_error.empty(), "missing/incompatible LastApplied used for rollback");
+    }
+
+    check(easiroc::slowControlPermitsDaqStart(false, false) &&
+          !easiroc::slowControlPermitsDaqStart(true, false) &&
+          !easiroc::slowControlPermitsDaqStart(false, true),
+          "START gate ignores indeterminate/in-progress state");
+
+    // Exercise the same typed schema traversal used by the device ODB codec.
+    using Value = std::variant<int, bool, std::array<int,32>, std::array<bool,32>, std::array<bool,64>>;
+    std::map<std::string, Value> mock_store;
+    auto payload = extended;
+    check(easiroc::visitSlowControlSettings(payload, [&](const std::string& path, auto& value) {
+      mock_store.insert_or_assign("moduleA/Settings/" + path, value); return true;
+    }) && mock_store.size() == 28, "device codec omitted a field");
+    auto decoded = easiroc::AsicSlowControlSettings{};
+    decoded.extras = easiroc::SlowControlExtras{};
+    auto read_mock = [&](const std::string& path, auto& value) {
+      using T = std::decay_t<decltype(value)>;
+      const auto found = mock_store.find("moduleA/Settings/" + path);
+      if (found == mock_store.end()) return false;
+      const auto* typed = std::get_if<T>(&found->second);
+      if (!typed) return false;
+      value = *typed;
+      return true;
+    };
+    check(easiroc::visitSlowControlSettings(decoded, read_mock) &&
+          decoded.extras == extended.extras && sameAsic(decoded.asic[0], extended.asic[0]) &&
+          sameAsic(decoded.asic[1], extended.asic[1]), "device Settings roundtrip changed fields");
+    mock_store["moduleA/Settings/SelectableLogic/AndChannels"] = std::array<bool,32>{};
+    check(!easiroc::visitSlowControlSettings(decoded, read_mock), "wrong BOOL array length accepted");
+    mock_store.erase("moduleA/Settings/Probe/ASIC2/Channel");
+    check(!easiroc::visitSlowControlSettings(decoded, read_mock), "missing probe field accepted");
 
     std::cout << "easiroc_manual_apply_test: " << tests_run
               << " checks passed\n";

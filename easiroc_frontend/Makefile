@@ -1,4 +1,5 @@
 CXX ?= c++
+NODE ?= node
 CPPFLAGS ?=
 CPPFLAGS += -I. -MMD -MP
 CXXFLAGS ?= -O2 -g
@@ -15,7 +16,7 @@ BIN_TEST_DIR := $(BIN_DIR)/tests
 PRODUCTION_TARGET := $(BIN_DIR)/feeasiroc
 TEST_NAMES := easiroc_test easiroc_event_test easiroc_stream_test \
 	easiroc_daq_control_test easiroc_diagnostic_log_test easiroc_slow_control_test \
-	easiroc_run_settings_test easiroc_asic_apply_test easiroc_manual_apply_test \
+	easiroc_run_settings_test easiroc_asic_apply_test easiroc_manual_apply_test easiroc_apply_odb_mock_test \
 	easiroc_last_applied_test \
 	manual_buffer_clear_test \
 	easiroc_buffer_clear_contract_test \
@@ -62,7 +63,7 @@ ALL_OBJECTS := $(OBJECTS) $(EVENT_TEST_OBJECTS) $(STREAM_TEST_OBJECTS) \
 	$(LAST_APPLIED_TEST_OBJECTS) \
 	$(READOUT_TEST_OBJECTS) \
 	$(FEEASIROC_OBJECTS) $(READ_ONE_OBJECTS) $(READ_MANY_OBJECTS)
-DEPS := $(filter $(BUILD_DIR)/%.d,$(ALL_OBJECTS:.o=.d))
+DEPS := $(BUILD_DIR)/tests/easiroc_odb_mock_adapter.d $(BUILD_DIR)/tests/easiroc_apply_odb_mock_test.d $(filter $(BUILD_DIR)/%.d,$(ALL_OBJECTS:.o=.d))
 
 .PHONY: all check clean feeasiroc $(TEST_NAMES)
 
@@ -72,7 +73,7 @@ feeasiroc: $(PRODUCTION_TARGET)
 
 $(TEST_NAMES): %: $(BIN_TEST_DIR)/%
 
-check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
+check: $(BIN_TEST_DIR)/easiroc_apply_odb_mock_test $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	$(BIN_TEST_DIR)/easiroc_daq_control_test $(BIN_TEST_DIR)/easiroc_slow_control_test \
 	$(BIN_TEST_DIR)/easiroc_diagnostic_log_test \
 	$(BIN_TEST_DIR)/easiroc_run_settings_test \
@@ -91,6 +92,7 @@ check: $(BIN_TEST_DIR)/easiroc_event_test $(BIN_TEST_DIR)/easiroc_stream_test \
 	./$(BIN_TEST_DIR)/easiroc_slow_control_test
 	./$(BIN_TEST_DIR)/easiroc_run_settings_test
 	./$(BIN_TEST_DIR)/easiroc_asic_apply_test
+	./$(BIN_TEST_DIR)/easiroc_apply_odb_mock_test
 	./$(BIN_TEST_DIR)/easiroc_manual_apply_test
 	./$(BIN_TEST_DIR)/easiroc_last_applied_test
 	./$(BIN_TEST_DIR)/manual_buffer_clear_test
@@ -242,3 +244,21 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR)
 
 -include $(DEPS)
+
+# Optional offline DOM/RPC mocks. NODE may point to a standalone Node binary.
+.PHONY: check-web
+check-web:
+	$(NODE) --check ../daq_monitor/web/easiroc.js
+	$(NODE) tests/easiroc_web_mock_test.js
+
+# Only live adapter sections are retained, with every MIDAS API supplied by
+# the in-memory test. No MIDAS library, experiment, or transport is linked.
+$(BUILD_DIR)/tests/easiroc_odb_mock_adapter.o: easiroc_odb.cxx easiroc_odb.h easiroc_run_settings.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(MIDAS_CPPFLAGS) $(CXXFLAGS) -ffunction-sections -fdata-sections -c -o $@ $<
+$(BUILD_DIR)/tests/easiroc_apply_odb_mock_test.o: tests/easiroc_apply_odb_mock_test.cxx easiroc_odb.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(MIDAS_CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+$(BIN_TEST_DIR)/easiroc_apply_odb_mock_test: $(BUILD_DIR)/tests/easiroc_apply_odb_mock_test.o $(BUILD_DIR)/tests/easiroc_odb_mock_adapter.o $(call obj,easiroc_manual_apply.cxx easiroc_asic_apply.cxx easiroc_last_applied.cxx easiroc_run_settings.cxx easiroc_slow_control.cxx)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -Wl,--gc-sections -pthread -o $@ $^

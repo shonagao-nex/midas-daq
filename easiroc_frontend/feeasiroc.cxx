@@ -194,6 +194,8 @@ bool initialize_manual_apply_mailbox() {
         now < 0 ? 0 : static_cast<std::uint64_t>(now);
     g_state.asic_apply = easiroc::acknowledgeStaleManualApplyRequest(
         g_state.asic_apply, request_id, unix_time);
+    // The request could have been interrupted after a partial hardware write.
+    g_state.hardware_state_indeterminate = true;
     cm_msg(MINFO, "frontend_init", "WARNING: %s (request %u)",
            g_state.asic_apply.last_apply_error.c_str(),
            static_cast<unsigned>(request_id));
@@ -242,8 +244,13 @@ bool initialize_odb() {
       !initialize_hardware_info_odb() ||
       !initialize_firmware_readback_odb())
     return false;
-  if (!initialize_manual_apply_mailbox() ||
-      !initialize_buffer_clear_mailbox() || !initialize_last_applied_odb())
+  // Restore persistent uncertainty before the first runtime publication;
+  // publishing defaults first would erase an earlier failed-apply record.
+  if (!initialize_last_applied_odb() ||
+      !easiroc_odb::read_last_applied_settings(
+          &g_state.last_applied, &g_state.hardware_state_indeterminate) ||
+      !initialize_manual_apply_mailbox() ||
+      !initialize_buffer_clear_mailbox())
     return false;
   reset_run_snapshot(0);
   return publish_configuration_status(false, 0) &&
@@ -346,8 +353,15 @@ std::optional<ManualApplyPreparation> prepare_manual_apply(
   // image nor LastApplied is populated from live ODB after this point.
   g_state.settings = apply_settings;
 
+  INT transition = -1;
+  INT size = sizeof(transition);
+  const bool transition_clear = db_get_value(hDB, 0,
+      "/Runinfo/Transition in progress", &transition, &size, TID_INT, FALSE) == DB_SUCCESS &&
+      size == sizeof(transition) && transition == 0;
+  // Caller holds ApplyOdbLock through result publication: START cannot set
+  // its transition flag between this check and the final hardware write.
   const easiroc::ManualApplyRequestContext context{
-      run_state, apply_settings.enabled, another_apply_in_progress};
+      run_state, apply_settings.enabled, another_apply_in_progress, transition_clear};
   return ManualApplyPreparation{std::move(apply_settings), context};
 }
 
@@ -371,6 +385,7 @@ void record_manual_apply_result(const easiroc::ManualApplyBackendResult& result,
           "ASIC slow-control sequence succeeded, but LastApplied could not "
           "be saved to ODB";
       load_last_applied_settings();
+      g_state.hardware_state_indeterminate = true;
     }
   }
 }
@@ -382,7 +397,7 @@ void publish_manual_apply_result(DWORD request_id) {
   publish_runtime_variables();
   if (g_state.asic_apply.state == easiroc::ManualApplyState::kSucceeded) {
     cm_msg(MINFO, "manual_apply",
-           "Request %u ASIC slow-control seven-transaction sequence "
+           "Request %u slow-control sequence "
            "succeeded; LastApplied records transmitted settings, not ASIC "
            "readback",
            static_cast<unsigned>(request_id));
@@ -409,6 +424,13 @@ void process_manual_apply_request() {
   const std::time_t now = std::time(nullptr);
   const std::uint64_t unix_time =
       now < 0 ? 0 : static_cast<std::uint64_t>(now);
+  easiroc_odb::ApplyOdbLock operation_lock;
+  if (!operation_lock.locked()) {
+    g_state.asic_apply = easiroc::rejectManualApplyRequest(g_state.asic_apply,
+        "Apply requires exclusive local ODB access", unix_time);
+    publish_runtime_variables();
+    return;
+  }
   const auto preparation =
       prepare_manual_apply(request->another_apply_in_progress, unix_time);
   if (!preparation) return;
@@ -1003,6 +1025,21 @@ INT begin_of_run(INT run_number, char* error) {
   g_state.run_snapshot.consistency = easiroc::snapshotAsicSlowControlConsistency(
       run_settings.asic_slow_control, bor_last_applied,
       bor_hardware_state_indeterminate);
+  const std::string device_inhibit = easiroc_odb::device_start_inhibit_reason();
+  if (!easiroc::slowControlPermitsDaqStart(
+          bor_hardware_state_indeterminate || g_state.hardware_state_indeterminate,
+          g_state.asic_apply.apply_in_progress) ||
+      !device_inhibit.empty()) {
+    const std::string reason = device_inhibit.empty() ?
+        "EASIROC HardwareStateIndeterminate or ApplyInProgress; re-apply before START" : device_inhibit;
+    if (error != nullptr) std::snprintf(error, 256, "%s", reason.c_str());
+    g_state.hardware_state_indeterminate =
+        bor_hardware_state_indeterminate || g_state.hardware_state_indeterminate;
+    publish_failed_run_snapshot(run_settings);
+    publish_runtime_variables();
+    mark_configuration_failed(run_number);
+    return FE_ERR_HW;
+  }
   if (easiroc::shouldWarnForAsicSlowControlConsistency(
           g_state.frontend_enabled_for_run && run_settings.enabled,
           g_state.run_snapshot.consistency)) {
@@ -1387,6 +1424,23 @@ INT read_physics_event(char* pevent, INT) {
 INT read_status_event(char*, INT) {
   publish_completed_diagnostic();
   process_manual_buffer_clear_request();
+  std::unique_ptr<RbcpClient> device_rbcp;
+  std::string device_ip;
+  easiroc_odb::process_device_apply_requests(
+      static_cast<std::uint64_t>(std::time(nullptr)),
+      [&](const std::string& ip, std::uint32_t address,
+          const std::vector<std::uint8_t>& data) {
+        // Worker only returns a local result and never accesses ODB, so it can
+        // safely be joined here while the Apply ODB exclusion scope is held.
+        if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
+        if (!device_rbcp || device_ip != ip) {
+          device_rbcp = std::make_unique<RbcpClient>(ip, kRbcpPort);
+          device_ip = ip;
+        }
+        device_rbcp->write(address, data);
+      }, [](unsigned ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      });
   process_manual_apply_request();
   publish_runtime_variables();
 

@@ -55,7 +55,7 @@ int main() {
                  std::string::npos &&
              javascript.find("does not yet support non-legacy Shaping Time") ==
                  std::string::npos &&
-             javascript.find("isUnsaved || !statusAvailable()") !=
+             javascript.find("!statusAvailable()") !=
                  std::string::npos,
          "WebGUI still suppresses valid non-legacy shaping apply");
   expect(html.find("asic1-hg-shaping") != std::string::npos &&

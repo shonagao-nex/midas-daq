@@ -43,6 +43,25 @@ bool initialize_acquisition_settings_odb();
 bool initialize_asic_settings_odb();
 bool initialize_hardware_info_odb();
 bool initialize_firmware_readback_odb();
+// Hold the existing local ODB semaphore from state checks through result
+// publication, excluding START's update of /Runinfo/Transition in progress.
+// No cm_yield/callback dispatch is allowed inside this scope.
+class ApplyOdbLock {
+ public:
+  ApplyOdbLock();
+  ~ApplyOdbLock();
+  ApplyOdbLock(const ApplyOdbLock&) = delete;
+  ApplyOdbLock& operator=(const ApplyOdbLock&) = delete;
+  bool locked() const { return locked_; }
+ private:
+  bool locked_ = false;
+};
+using DeviceSlowControlWrite = std::function<void(
+    const std::string&, std::uint32_t, const std::vector<std::uint8_t>&)>;
+void process_device_apply_requests(std::uint64_t unix_time,
+    const DeviceSlowControlWrite& write, const easiroc::SlowControlDelay& delay);
+// Empty means START is permitted. Missing/malformed status is an error.
+std::string device_start_inhibit_reason();
 bool read_last_applied_settings(
     easiroc::AppliedAsicSlowControlSettings* result,
     bool* hardware_state_indeterminate);

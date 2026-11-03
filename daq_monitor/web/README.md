@@ -186,39 +186,145 @@ still active.
 
 ## EASIROC slow-control page
 
-`easiroc.html` is linked from the dashboard and provides a STOPPED-only
-staging view for discriminator thresholds, HG/LG feedback capacitance, and both
-32-channel Input DAC arrays. Feedback is selected in physical fF (with the
-legacy ASIC code shown); the finite options are 0 fF/NoC and 100--1500 fF in
-100 fF steps. Editing does not write ODB or hardware. `Save to ODB` writes all
-Settings values and requires an ODB readback of every value before accepting
-the save. It checks STOPPED before and during the sequential writes. If a write
-fails or the run state changes, the page warns that a partial save is possible
-and reloads the actual ODB settings. It does not automatically apply them.
-`Apply to hardware` is disabled until the staged values equal ODB,
-the run is STOPPED, EASIROC is enabled, and the frontend mailbox is idle.
+`easiroc.html` reuses the existing page with this order: IP Address and READ,
+selected device IP/status, Desired Settings, then `Save to ODB → Apply to
+hardware`. Detailed status/LastApplied panels are removed; concise result and
+error messages remain. READ performs ODB reads only. Unknown/duplicate IPs
+preserve the current selection and Desired Settings.
 
-Valid saved HG/LG feedback settings are included in the manual ASIC image.
-They follow the same Save/readback and unsaved-change rules as threshold and
-Input DAC settings; any confirmed finite feedback selection can be applied
-while the normal STOPPED/manual-mailbox conditions are satisfied.
+Extra devices are read from `/Equipment/EASIROC/Devices/<id>/IPAddress` and
+have independent `Settings`, `Commands/ASICSlowControl` and
+`Variables/ASICSlowControl` subtrees. The existing single-device settings are
+still accessible through the implicit `legacy` ID using its existing network
+IP. Duplicate IPs, including collisions with that legacy address, are rejected.
+READ never registers an IP or creates a schema. Legacy ASIC Save is retained;
+extended controls become available if a complete extended schema has been
+explicitly provisioned. Partial extended schemas are rejected; an old
+ASIC-only ODB remains usable without migration.
 
-The two 32-channel mask grids store operator-facing `ChannelEnabled` values.
-Checked means enabled/unmasked and unchecked means masked. Valid saved masks
-are included in the manual 57-byte ASIC images and may be applied under the
-same STOPPED/manual-mailbox conditions.
+Desired Settings include existing ASIC threshold/slope/feedback/shaping/mask
+and InputDAC fields, plus per-ASIC Probe Enable/Channel/Signal, ten-pattern
+SelectableLogic with OneChannel/HitNumThreshold/BOOL[64] AndChannels, and Raw
+or 46--278 ns TriggerWidth in steps of 8 (default 118 ns). InputDAC UI values
+are 256--511 (default 350); discriminator DAC is 0--1023 (default 600).
+Physical meaning is explained beside the ASIC inputs without inventing a
+calibrated voltage/charge conversion.
 
-Apply writes one new monotonic `ApplyRequestId` to the existing command
-mailbox and waits for the frontend terminal acknowledgement; it never writes
-hardware directly. Since the frontend compares request IDs using ordinary
-ordered DWORD values, the page refuses to wrap at `0xffffffff` rather than
-replaying an old token. LastApplied is explicitly labelled as the last
-successfully transmitted configuration, not ASIC readback. `ApplyAtBOR` is
-read-only in an Advanced/Deprecated panel and is never writable from this UI.
+Save writes Settings only and verifies every field with ODB readback. It
+checks STOPPED during sequential writes, warns about partial saves and retains
+Desired Settings after failure. Polling does not replace staged settings.
+Unsaved changes or remote ODB edits prevent Apply. The existing monotonic
+ApplyRequestId mailbox is retained; request IDs cannot wrap.
 
-Open `easiroc.html?mock=1` for offline preview. Its scenario buttons cover
-Match, Mismatch, Unknown, Indeterminate, Applying, Succeeded, Failed,
-Rejected, and Unsaved changes without contacting MIDAS.
+Hardware Apply requires STOPPED and a known zero transition flag. The existing
+Enabled, valid/saved settings and idle-mailbox checks remain. HV ON/OFF,
+unknown HV and missing HV monitoring do not restrict Apply. HV Enable,
+SetVoltage and CurrentLimit are outside this Apply, and no extra InputDAC
+confirmation is shown. Registered-device and legacy requests use the existing
+frontend RBCP backend. All configured ASIC, Probe, SelectableLogic and
+TriggerWidth fields are included together; BOR never automatically applies.
+
+The frontend's local ODB semaphore excludes START from the fresh permission
+check through Apply/rollback/result persistence. Web rechecks run/transition
+state before posting, while the backend enforces the authoritative gate. Other
+ODB clients can wait during the synchronous write/latch sequence or finite
+RBCP timeouts. Remote ODB Apply is rejected because this exclusion requires
+the local ODB. Failed rollback sets HardwareStateIndeterminate; BOR rejects
+START until successful re-Apply clears it. LastApplied remains a successful
+transmission record rather than hardware readback.
+
+The 2026-11-04 lock-shortening task stopped at its required precondition:
+source inspection cannot guarantee that every START reaches the monitor's
+sequence-400 callback, and live development registration was not queried.
+The long-lock implementation above is unchanged. Standard MIDAS Web, odbedit,
+mtransition, sequencer, automatic restart and direct SDK calls dispatch to
+currently registered clients; monitor absence is not a hard-coded SDK error.
+A standard deferred START handler in feeasiroc is the documented alternative,
+not an implemented replacement. See the precondition audit in
+`easiroc_frontend/docs/easiroc_slow_control.md` for evidence, unresolved
+registration/lifecycle requirements and test limitations.
+
+The subsequent read-only Deferred START audit identifies blockers in the
+reference MIDAS 2.1 revision `624b94843`: run-number re-increment on automatic
+resume, inconsistent STARTABORT handling for TR_DEFERRED/CM_DEFERRED_TRANSITION,
+and a cancellation/resume race requiring verification at the SDK layer.
+Synchronous Apply can remain synchronous (START is received by the initiating
+client through ODB; the frontend resumes only after returning to its scheduler),
+but adding a deferred registration alone is not ready for adoption. Required
+frontend policy, registration lifetime and stale/canceled requests also need
+resolution. The custom dashboard would need Requested Transition and deferred
+status/error/cancel polling; immediate JSON-RPC success is not run completion.
+The full findings, source line references and offline test plan are in the
+existing slow-control design document. No Web or runtime code was changed.
+
+Open `easiroc.html?mock=match` for a two-device offline preview; no MIDAS or
+hardware access occurs. Mock scenarios retain the existing status cases.
+Run `make -C easiroc_frontend check-web NODE=/path/to/node` from the repository
+root for DOM/RPC mocks. On 2026-11-04, read-only HTTP checks confirmed that
+port 8181 reports experiment `daq-dev`, `/Custom/Path` points to
+`/home/nagao/midas/midas/online/daq_monitor/web`, and
+`/Custom/EASI Slow Control` is `easiroc.html`. The page URL is
+`http://127.0.0.1:8181/?cmd=custom&page=EASI%20Slow%20Control` (the ODB key
+is not a `/Custom/...` page URL). The registered page, direct HTML, JS, CSS
+and mock data returned HTTP 200 and matched the development files byte for byte,
+including after the layout fix. A hard reload is needed for cached assets.
+
+The layout now places IP/READ first, selection and DAQ state next, Desired
+Settings next, then the horizontal Save → Apply buttons and result/error.
+The hidden mock toolbar has an explicit CSS rule so its flex layout does not
+make it visible on the normal page. Firefox headless verified this behavior,
+layout at 1440 and 450 CSS-pixel viewports, unsaved edit disabling Apply,
+unknown-IP preservation, second-IP READ and the generated option counts/defaults
+using the served mock page. The standard MIDAS resize listener reports a
+missing `mheader_message` on mock pages, which omit MIDAS header initialization;
+the inspected controls still work. MIDAS itself was not changed.
+
+The actual page READ logic was also exercised with a DOM harness permitting
+only read-only `db_get_values` HTTP requests to 8181: legacy IP
+`192.168.10.40` loaded code 600 and InputDAC 350, and an unknown IP preserved
+that selection/settings. The current ODB has no Devices directory or complete
+extended schema; extended inputs stay disabled without provisioning. Multiple
+IPs, extended settings, RUNNING/PAUSED guards and Save/Apply behavior were
+tested with offline mocks, without changing the real DAQ state or invoking
+real Save/Apply. The complete normal MIDAS header/menu rendering and actual
+Save/Apply/rollback remain untested. No ODB writes, service changes, hardware
+communication or production `/home/daq`/8081 operations were performed.
+Migration design and enablement limitations are in
+`easiroc_frontend/docs/easiroc_slow_control.md`.
+
+### Editing lock and pending-request follow-up (2026-11-04)
+
+A later read-only check found no `feeasiroc` registration in development
+`/System/Clients`. ApplyRequestId was 3, ActiveRequestId 0,
+LastHandledRequestId 1, ApplyInProgress false, ApplyState Idle and
+LastApplyError empty. Idle alone did not mean the mailbox was acknowledged.
+The host process state cannot be established from sandbox-local `ps`.
+
+Previously the 45-second acknowledgement deadline was checked only before
+awaiting an ODB read. An unresolved read/write promise could keep
+`applyPending` true indefinitely, preventing its `finally` block from
+unlocking the editor. ODB reads and writes now have a 10-second client-side
+limit; acknowledgement polling retains its 45-second deadline, including
+time spent awaiting reads. These limits do not cancel a submitted ODB write
+or a hardware operation. Preparation has several bounded ODB reads, so the
+45-second deadline is specifically the acknowledgement phase.
+
+Editing/READ unlock on success, failure or timeout while STOPPED, preserving
+Desired Settings. Re-Apply separately requires known status, an acknowledged
+mailbox, no active request and a registered frontend. Registration alone is
+not a liveness guarantee. An ambiguous submission is remembered per device
+for the page lifetime until its request ID is acknowledged; an idle snapshot
+with the old IDs cannot authorize retry. ODB pending IDs also block retries
+after page reload. A page reload loses the browser-only ambiguous-submission
+marker, so it is not a way to establish completion of a timed-out write.
+Save/reread failures also used to skip UI cleanup when the saved snapshot
+became unavailable. UI cleanup now retains editable Desired Settings and
+re-enables READ, while Apply stays blocked until saved settings are confirmed.
+Errors, rollback details and HardwareStateIndeterminate/START inhibition
+remain visible. No backend safety gate, lock or transition design changed.
+Offline tests exercise terminal outcomes, absent/disconnected frontend,
+unresolved preflight/submission/acknowledgement promises, deadline expiry,
+late acknowledgement and per-IP retry isolation, alongside old/new schemas.
 
 ## Manual buffer-clear page
 
