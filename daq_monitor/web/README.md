@@ -394,3 +394,206 @@ non-participant is shown as `Not participating` and is not alarmed. An absent,
 invalid, or mismatched run-participation record falls back to monitoring both
 frontends. Configuration and RunSnapshot records remain diagnostic BOR output
 and are not used to infer participation from a previous run.
+
+### EASIROC HV panel (development sources, 2026-11-04)
+
+The bottom of `easiroc.html` now contains an independent HV Control panel.
+It reads device-specific `Variables/HV`, `Commands/HV/TargetVoltage_V` and
+`Settings/HV/CurrentLimit_uA` through existing ODB reads. It never accesses a
+module directly or submits ASIC Apply. Missing/invalid/stale data is Unknown;
+current over a configured limit is red. Protection state is displayed
+separately from the threshold comparison. All HV controls remain disabled:
+Enable/re-enable/readback semantics, per-device calibration and near-zero
+voltage tolerance have not been established. Programmatic handler invocation
+also cannot submit an operation; OK/Cancel wording and guards are mock-tested.
+See `easiroc_frontend/docs/easiroc_slow_control.md` for register evidence,
+software policy tests and the intentionally blocked hardware integration.
+
+The local Node DOM/RPC mock passes 94 checks using the repository's existing
+Node binary (command in the frontend Makefile `check-web` target). No real ODB,
+service, hardware, HTTP request or browser session was used in this task.
+Historical development 8181 `/Custom/Path`/served-asset observations above are
+not revalidated here. Source changes do not establish live deployment on 8081
+or served development deployment on 8181.
+
+### Revised HV integration (2026-11-04)
+
+This supersedes the preceding all-controls-disabled HV stage. The bottom panel
+supports a staged 0--62 V target, independent HV request/result tracking and
+separate confirmed Enable, normal stop/Disable and emergency shutdown actions.
+It preserves edited targets across refresh, displays residual voltage/validity/
+last update/errors and colors current above the independent ODB CurrentLimit
+red. New missing-key default CurrentLimit is 10 µA; existing values are retained.
+Capabilities are supplied per registered device by the frontend. Normal stop
+ramps at 2 V/s and verifies ≤1 V before shutdown; emergency shutdown skips that
+voltage wait. Both are STOPPED-only, including for emergency requests.
+
+The requested rtl/HVControl.vhd was not available in the searched development
+sources. Production Enable is separately gated false pending matching RTL
+review; the panel reports that reason. This is not an ODB/browser unlock.
+The frontend now contains actual MADC/shutdown callbacks and scheduling, so
+launching it requires separate authorization for real hardware communication.
+No such launch, ODB/service access or deployment occurred in this task.
+Port 8181 served paths/assets were not queried; port 8081 and /home/daq were
+not accessed. Local DOM/RPC mocks pass 110 checks; no real-browser layout or
+served-file validation is claimed.
+
+Mock-only previews: `easiroc.html?mock=hv_disabled`, `hv_settling`,
+`hv_overcurrent`, `hv_stale`, `hv_error`. Their simulated capabilities and
+acknowledgements do not enable hardware. Details and remaining hardware checks
+are in the latest HV integration section of
+`easiroc_frontend/docs/easiroc_slow_control.md`.
+
+### Supplied RTL follow-up (2026-11-04)
+
+`reference/firmware_20150923/rtl/HVControl.vhd` is now available and reviewed.
+It clears shutdown on the first DAC byte write, before the zero-DAC sequence
+has finished. Production Enable capability therefore additionally requires a
+known previous DAC setpoint of exactly zero and an acknowledged shutdown;
+low measured residual voltage alone is insufficient. The old missing-RTL
+reason is replaced by this explicit recovery condition. Normal-stop/re-Enable
+from a known zero state is supported; fresh startup and recovery from a
+nonzero/unknown DAC remain blocked until a safe initialization procedure is
+established. This is explained in the latest frontend design-document section.
+The Web mock's OFF/Enable-capable fixture represents an already known zero DAC,
+not a supported bootstrap from Unknown. Web mock still passes 110 checks;
+no real ODB, served GUI, service or hardware was accessed.
+
+### Legacy-compatible initial Enable (2026-11-04)
+
+This supersedes the preceding known-zero-DAC/prior-shutdown requirement. The
+backend now admits explicit zero-target Enable from Unknown (including after
+frontend restart) and after emergency shutdown without requiring a known
+retained DAC or prior shutdown. Other guards remain, including ASIC/InputDAC,
+STOPPED/no transition, no ASIC Apply, fresh voltage ≤1 V/current within limit,
+valid CurrentLimit, no active ramp or latched fault, and no known-ON duplicate
+Enable. Backend capabilities drive the existing page; product JS/layout did
+not need changes for this correction.
+
+Unknown remains Unknown on screen and no measurement validity is synthesized
+by submitting Enable. It enters command-derived ON/zero and final settling
+only after frontend callbacks succeed. The Web DOM/RPC suite passes 114 checks,
+including submission from an Unknown snapshot without writing ASIC request IDs.
+Hardware can briefly resume its previous DAC output on the first DAC byte
+before zero is transferred. This compatibility change does not guarantee
+physical safety; see the latest frontend design section for retained RTL and
+analog risks. No ODB/service/hardware access or served-file deployment occurred.
+
+### 通常HV画面への統合（2026-11-04、現行）
+
+開発8181の通常 `easiroc.html` を使用する。専用試験画面・backend・起動経路は撤去した。
+通信なしの `?mock=` プレビューと通常mockテストは引き続き使用できる。
+
+通常 `feeasiroc` は装置別HV schema/capabilityを生成する。
+Settings/HV/HardwareAccessEnabled（新規false）は実機アクセスの明示的な許可であり、
+falseではHV要求はRejected、周期測定なし、全HVボタン無効、理由を枠内に表示する。
+現在の192.168.10.40はfalse、CurrentLimit=10 µA、HV状態と測定値はUnknownである。
+許可trueは実機監視が開始し得るため、実機試験の許可後に設定する。
+初回Enableの既知DAC=0 V、shutdown済み、Unknown禁止条件は追加していない。
+通常停止・緊急停止・確認ダイアログ・独立HV要求とASIC排他は維持する。
+
+InputDACの新規初期値・Web説明・mock値は両ASIC全64chとも480。
+開発既存Settingsも各32個の350→480へ変更した。LastAppliedは350のままで、
+実機Applyは実行していない。設定不一致表示はこの未適用変更を正しく示す。
+
+通常frontendをSTOPPED/遷移なし/取得なしで再起動し、Firefoxで通常ページのREAD、
+64ch=480、Unknown、禁止理由を確認した。配信4ファイルは開発ソースと一致する。
+HV操作は実行していない。Web mock115 checks、frontend make all check成功。
+変更・バックアップ・残存DACリスクの詳細は既存frontend設計文書の最新節を参照。
+本番8081と `/home/daq` は変更していない。
+
+
+### increaseHV ramp revision (development sources, 2026-11-04)
+
+This supersedes the earlier 2 V upward steps and voltage-arrival settling gate.
+Enable starts at zero; upward DAC steps are at most 4 V, each followed by at
+least one second from write completion and a successful MADC current check.
+The final step is also checked before Steady. Default CurrentLimit remains
+10 µA (strictly greater is an exceedance); overcurrent ramps down at 10 V/step
+without automatic restart. Normal descent remains 2 V/step; Normal Stop retains
+the measured ≤1 V check before Disable. Measurement/communication failure
+blocks further steps, and STOPPED/ASIC exclusion remains unchanged.
+
+The panel now shows the DAC setpoint separately from measured voltage.
+`Variables/HV/MonitoringStatus` displays current monitoring warnings separately
+from the last operation result. Voltage mismatch above 1 V is advisory;
+HardwareAccessEnabled=false preserves completed result history.
+
+Offline validation: `make all check` passed (HV 216, ODB adapter 2630 checks;
+other existing tests passed); Web syntax and DOM/RPC mock passed 119 checks.
+No hardware communication, ODB changes, frontend restart or 8181 served-path
+verification was performed. Production 8081 and /home/daq were not accessed.
+See `easiroc_frontend/docs/easiroc_slow_control.md` for the legacy comparison
+and unverified hardware behavior.
+
+
+### Normal HV descent revision (2026-11-04, development sources and offline mocks)
+
+This supersedes the 2 V downward steps and 60-second final settling timeout.
+Normal descent now writes at most 10 V per step, measures through the existing
+MADC procedure about once a second, and holds that exact DAC setting until
+measured voltage is within ±1 V. At the final zero setting it waits for a valid
+measurement ≤1 V, then sends shutdown; Stop succeeds only after acknowledgement.
+A partial nonzero Voltage reduction ends at its requested target; a reduction
+to zero also disables after the measured-zero check. Healthy settling has no
+deadline and produces no voltage-tracking warning. Communication, invalid
+measurements, invalid CurrentLimit and access-condition failures still fault.
+
+Emergency remains available during settling and discards the old descent.
+Overcurrent protection bypasses all normal voltage-arrival gates and retains
+10 V steps to zero. Upward 4 V steps and the 10 µA default are unchanged.
+The panel continues displaying setting, measured voltage/current and RampStatus.
+An acknowledged Pending operation with fresh samples remains Pending beyond the
+local 120-second ACK timeout; unavailable/stale status still reports uncertainty.
+The existing hv_settling preview shows DAC 52 V / measured 60 V / target zero.
+
+Validation: make all check passed (HV284, ODB adapter9354 checks plus all existing
+tests); Web syntax and DOM/RPC mock125 checks passed. Real HV/communication,
+ODB changes, frontend restart and served-page verification were not performed.
+This revision changes development sources only; production8081, /home/daq,
+Firmware, MIDAS core and START exclusion were not changed.
+
+### Compact EASI HV controls (development GUI, 2026-11-04)
+
+The IP field offers 192.168.10.40–43 through a native datalist and accepts
+other canonical IPv4 addresses. Suggestions do not register devices. READ still
+loads the existing registered device's ODB settings; invalid input is rejected
+before RPC and unregistered addresses remain rejected. Editing/selecting an IP
+only updates local presentation. Until the input matches a successfully READ
+selection, all HV facts display Unknown and HV actions are disabled. READ in
+progress also hides the previous device's HV facts. ASIC Save/Apply is unchanged.
+
+The HV panel keeps Enabled, set/measured voltage, measured current, Monitoring,
+RampStatus, Current Limit and Last update in a compact grid. Valid measurement
+status and idle operation text are hidden; invalid/stale measurements, backend
+blocking reasons, warnings, pending results and communication errors remain
+visible. Target Voltage and Set Voltage are grouped, with Emergency in red.
+The confirmation dialogs, capability checks and frontend algorithms are unchanged.
+
+The explanatory text removed from the panel still applies: Enabled reflects
+acknowledged commands, not hardware readback, and shutdown acknowledgement does
+not establish zero residual voltage or independent physical shutdown. Current
+is DC-DC converter current. HV uses a separate mailbox from ASIC Save/Apply.
+The existing frontend ramps upward at 4 V/step; normal descent uses 10 V steps,
+waits for measured ±1 V at each step and checks ≤1 V at zero before shutdown.
+Emergency uses the immediate shutdown path. See the existing
+`easiroc_frontend/docs/easiroc_slow_control.md` for the detailed safety model.
+
+Validation: `make -C easiroc_frontend check-web
+NODE=build/tools/node-v22.16.0-linux-x64/bin/node` (144 checks plus JS syntax),
+existing GUI contract check (16), and offline Firefox mock layout/selection
+checks. Browser captures and results are under `build/easiroc-gui-compact/`.
+Only development port 8181 static assets and ODB identity/path were read to
+verify the served source; no hardware action or ODB write was used.
+
+### HV parameter revision pending cadence decision (2026-11-04)
+
+Development sources now use a 20 µA default for newly created CurrentLimit keys;
+existing ODB values are retained. Enable still starts at 0 V and keeps the ≤1 V
+residual admission. Disable now uses ±5 V at normal descending steps and ≤5 V
+before shutdown at zero: up to about 5 V residual may remain. Labels are Enable
+and Disable; Emergency, current protection and failure handling are unchanged.
+Ramp measurement cadence is still 1 second pending clarification: a 3-second
+MADC cadence would also slow the existing current protection detection. No
+frontend restart or ODB change was performed. See the latest slow-control document
+section for the outstanding cadence choice and validation results.

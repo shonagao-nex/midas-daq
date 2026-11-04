@@ -34,7 +34,6 @@
 #include <vector>
 
 namespace {
-
 constexpr char kCommandsPath[] = "/Equipment/EASIROC/Commands";
 constexpr char kVariablesPath[] = "/Equipment/EASIROC/Variables";
 constexpr char kRunSnapshotPath[] = "/Equipment/EASIROC/RunSnapshot";
@@ -857,7 +856,7 @@ bool configuration_ready(const FrontendSettings& settings) {
 
 const char* frontend_name = "feeasiroc";
 const char* frontend_file_name = __FILE__;
-BOOL frontend_call_loop = FALSE;
+BOOL frontend_call_loop = TRUE;
 INT display_period = 0;
 INT max_event_size = 1024 * 1024;
 INT max_event_size_frag = 0;
@@ -899,6 +898,9 @@ EQUIPMENT equipment[] = {
 //************************************//
 INT frontend_init() {
   if (!initialize_odb()) return FE_ERR_ODB;
+  easiroc_odb::reset_hv_runtime();
+  const std::string build=std::string(__DATE__)+" "+__TIME__;
+  if (db_set_value(hDB,0,"/Equipment/EASIROC/Info/FrontendBuild",build.c_str(),build.size()+1,1,TID_STRING)!=DB_SUCCESS) return FE_ERR_ODB;
 
   const INT transition_status =
       cm_register_transition(TR_STARTABORT, start_abort, 500);
@@ -1315,7 +1317,42 @@ INT resume_run(INT, char* error) {
   return SUCCESS;
 }
 
-INT frontend_loop() { return SUCCESS; }
+INT frontend_loop() {
+  const auto monotonic_ms=[]() -> std::uint64_t {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  static std::uint64_t last_service=0;
+  const auto now=monotonic_ms();
+  if (now-last_service<1000) return SUCCESS;
+  last_service=now;
+  easiroc_odb::process_hv_requests(static_cast<std::uint64_t>(std::time(nullptr)),now,
+      [&](const std::string& ip) {
+        // Single frontend thread + existing exclusion scope. The diagnostic
+        // worker never touches ODB and is joined before any HV transaction.
+        auto client=std::make_shared<RbcpClient>(ip,kRbcpPort,1);
+        const auto join_diagnostic=[]() {
+          if (g_diagnostic.thread.joinable()) g_diagnostic.thread.join();
+        };
+        easiroc::hv::Io io{
+          [client,join_diagnostic](auto address,auto value) {join_diagnostic();client->write(address,value);},
+          [client,join_diagnostic](auto address) {join_diagnostic();return client->read(address,1).at(0);},
+          [](unsigned ms) {std::this_thread::sleep_for(std::chrono::milliseconds(ms));}
+        };
+        easiroc::hv::Backend backend;
+        backend.measure=[io]() {return easiroc::hv::measure(io);};
+        backend.set=[io](double value) {easiroc::hv::setVoltage(io,value);};
+        backend.shutdown=[io]() {easiroc::hv::shutdown(io);};
+        backend.now=monotonic_ms;
+        backend.unix_time=[]() {return static_cast<std::uint64_t>(std::time(nullptr));};
+        backend.unix_time_ms=[]() -> std::uint64_t {
+          return std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+        };
+        return backend;
+      });
+  return SUCCESS;
+}
 
 //************************************//
 // Detect a complete EASIROC event

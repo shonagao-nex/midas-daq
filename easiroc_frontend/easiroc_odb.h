@@ -3,6 +3,7 @@
 
 #include "easiroc_frontend_types.h"
 #include "easiroc_manual_apply.h"
+#include "easiroc_hv.h"
 #include "../common/manual_buffer_clear.h"
 
 #include <cstddef>
@@ -36,6 +37,11 @@ bool publish_global_busy_ready(bool participates, bool ready, INT run_number);
 bool publish_configuration_status(bool configuration_ok, INT run_number);
 bool publish_run_snapshot(const EasirocRunSnapshot& snapshot);
 bool publish_runtime_variables(const RuntimePublishView& view);
+using HvBackendFactory = std::function<easiroc::hv::Backend(const std::string&)>;
+void reset_hv_runtime();
+void process_hv_requests(std::uint64_t unix_time, std::uint64_t monotonic_ms,
+    const HvBackendFactory& backend,
+    bool enable_protocol_verified = easiroc::hv::kEnableProtocolVerified);
 bool initialize_manual_apply_mailbox_odb();
 bool initialize_buffer_clear_mailbox_odb();
 bool initialize_last_applied_odb();

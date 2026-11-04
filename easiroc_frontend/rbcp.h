@@ -10,7 +10,8 @@ constexpr std::uint16_t kRbcpPort = 4660;
 
 class RbcpClient {
  public:
-  explicit RbcpClient(std::string host, std::uint16_t port = kRbcpPort);
+  explicit RbcpClient(std::string host, std::uint16_t port = kRbcpPort,
+                      unsigned maximum_attempts = 3);
   std::vector<std::uint8_t> read(std::uint32_t address, std::size_t length);
   void write(std::uint32_t address, const std::vector<std::uint8_t>& data);
   void write(std::uint32_t address, std::uint8_t value);
@@ -23,6 +24,7 @@ class RbcpClient {
   std::string host_;
   std::uint16_t port_;
   std::uint8_t packet_id_ = 0;
+  unsigned maximum_attempts_;
 };
 
 #endif

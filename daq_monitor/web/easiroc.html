@@ -5,11 +5,11 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>EASI Slow Control</title>
     <link rel="stylesheet" href="midas.css">
-    <link rel="stylesheet" href="easiroc.css">
+    <link rel="stylesheet" href="easiroc.css?v=hv-parameters-20261104">
     <script src="midas.js"></script>
     <script src="mhttpd.js"></script>
     <script src="easiroc-mock-data.js"></script>
-    <script src="easiroc.js" defer></script>
+    <script src="easiroc.js?v=hv-parameters-20261104" defer></script>
   </head>
 
   <body class="mcss" onload="initializeEasirocPage()">
@@ -33,8 +33,17 @@
       </section>
 
       <section class="panel">
-        <label>IP Address <input id="ip-address" type="text" placeholder="192.168.10.40" autocomplete="off"></label>
-        <button id="read-button" type="button">READ</button>
+        <div class="device-picker">
+          <label for="ip-address">IP Address</label>
+          <input id="ip-address" type="text" list="ip-candidates" placeholder="192.168.10.40" autocomplete="off" spellcheck="false">
+          <datalist id="ip-candidates">
+            <option value="192.168.10.40"></option>
+            <option value="192.168.10.41"></option>
+            <option value="192.168.10.42"></option>
+            <option value="192.168.10.43"></option>
+          </datalist>
+          <button id="read-button" type="button">READ</button>
+        </div>
         <p id="selected-device">No device selected</p>
         <p id="selected-status">READ loads registered ODB settings without hardware access.</p>
         <div class="run-state">
@@ -65,7 +74,7 @@
               <label>LG Shaping Time <select id="asic1-lg-shaping" disabled></select></label>
             </div>
             <h4>Input DAC</h4>
-            <p>Per-channel input bias trim DAC raw code (256–511), default 350. No calibrated voltage conversion is assumed.</p>
+            <p>Per-channel input bias trim DAC raw code (256–511), default 480. No calibrated voltage conversion is assumed.</p>
             <div id="asic1-input-dac" class="input-dac-grid" aria-label="ASIC1 Input DAC channels"></div>
             <h4>Channel Mask</h4>
             <p>Checked means enabled; unchecked channels are masked.</p>
@@ -83,7 +92,7 @@
               <label>LG Shaping Time <select id="asic2-lg-shaping" disabled></select></label>
             </div>
             <h4>Input DAC</h4>
-            <p>Per-channel input bias trim DAC raw code (256–511), default 350. No calibrated voltage conversion is assumed.</p>
+            <p>Per-channel input bias trim DAC raw code (256–511), default 480. No calibrated voltage conversion is assumed.</p>
             <div id="asic2-input-dac" class="input-dac-grid" aria-label="ASIC2 Input DAC channels"></div>
             <h4>Channel Mask</h4>
             <p>Checked means enabled; unchecked channels are masked.</p>
@@ -118,6 +127,36 @@
         <a href="/?cmd=odb&amp;odb_path=%2FEquipment%2FEASIROC">EASI ODB</a>
         <a href="/?cmd=Messages">MIDAS Messages</a>
       </nav>
+      <hr class="hv-divider">
+      <section class="panel hv-panel" aria-labelledby="hv-title">
+        <div class="section-title">
+          <h2 id="hv-title">HV Control</h2>
+          <span id="hv-device"></span>
+        </div>
+        <p id="hv-blocked" class="hv-notice" role="status" hidden></p>
+        <dl class="hv-status">
+          <div><dt>HV Enabled</dt><dd id="hv-enabled">Unknown</dd></div>
+          <div><dt>Set Voltage</dt><dd id="hv-set">Unknown</dd></div>
+          <div><dt>Measured Voltage</dt><dd id="hv-voltage">Unknown</dd></div>
+          <div><dt>Measured Current</dt><dd id="hv-current">Unknown</dd></div>
+          <div><dt>Monitoring</dt><dd id="hv-monitoring">Unknown</dd></div>
+          <div><dt>RampStatus</dt><dd id="hv-ramp">Unknown</dd></div>
+          <div><dt>Current Limit</dt><dd id="hv-limit">Unknown</dd></div>
+          <div><dt>Last update</dt><dd id="hv-updated">Unknown</dd></div>
+        </dl>
+        <p id="hv-validity" class="hv-notice" role="status">Measurement unavailable or stale</p>
+        <div class="hv-actions">
+          <button id="hv-enable-button" type="button" disabled>Enable</button>
+          <div class="hv-target-controls">
+            <label for="hv-target">Target Voltage (V)</label>
+            <input id="hv-target" type="number" min="0" max="62" step="0.1" disabled>
+            <button id="hv-voltage-button" type="button" disabled>Set Voltage</button>
+          </div>
+          <button id="hv-stop-button" type="button" disabled>Disable</button>
+          <button id="hv-emergency-button" class="hv-emergency" type="button" disabled>Emergency shutdown</button>
+        </div>
+        <p id="hv-result" role="status" hidden></p>
+      </section>
     </main>
   </body>
 </html>

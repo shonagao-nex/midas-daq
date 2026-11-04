@@ -3,6 +3,7 @@
 #include "msystem.h"
 #include "easiroc_readout.h"
 #include "rbcp.h"
+#include "easiroc_hv.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <map>
 #include <type_traits>
 #include <stdexcept>
+#include <sstream>
 
 namespace easiroc_odb {
 namespace {
@@ -1500,6 +1502,224 @@ std::string device_start_inhibit_reason() {
       return "Cannot verify EASIROC apply state: " + std::string(key.name);
     if (!easiroc::slowControlPermitsDaqStart(indeterminate, applying))
       return "EASIROC " + std::string(key.name) + ": HardwareStateIndeterminate or ApplyInProgress; re-apply before START";
+  }
+}
+
+namespace {
+struct HvMailbox {
+  std::string ip;
+  easiroc::hv::State state;
+  DWORD seen = 0, handled = 0, active = 0, result_request = 0;
+  std::uint64_t updated_unix = 0, updated_unix_ms = 0, result_unix = 0;
+};
+std::map<std::string, HvMailbox> hv_mailboxes;
+bool hvDouble(const std::string& path, double& value) {
+  INT size=sizeof(value);
+  return db_get_value(hDB,0,path.c_str(),&value,&size,TID_DOUBLE,FALSE)==DB_SUCCESS && size==sizeof(value);
+}
+bool hvString(const std::string& path, std::string& value) {
+  char buffer[256]{}; INT size=sizeof(buffer);
+  if (db_get_value(hDB,0,path.c_str(),buffer,&size,TID_STRING,FALSE)!=DB_SUCCESS ||
+      size<=0 || size>static_cast<INT>(sizeof(buffer)) || buffer[size-1]!='\0') return false;
+  value=buffer; return true;
+}
+}
+void reset_hv_runtime() { hv_mailboxes.clear(); }
+
+void process_hv_requests(std::uint64_t unix_time, std::uint64_t monotonic_ms,
+    const HvBackendFactory& backend_factory, bool enable_protocol_verified) {
+  const std::string service_root="/Equipment/EASIROC";
+  // Reuse the existing local exclusion contract without changing its code.
+  // No sleep across ticks, cm_yield or callback dispatch occurs in this scope.
+  ApplyOdbLock operation_lock;
+  if (!operation_lock.locked()) return;
+  struct Entry { std::string base, ip; };
+  std::vector<Entry> entries;
+  std::vector<easiroc::SlowControlDevice> registry;
+  auto add = [&](const std::string& base, const std::string& ip_path,
+                 const std::string& validation_id) {
+    std::string ip;
+    if (!hvString(ip_path,ip)) return false;
+    easiroc::SlowControlDevice d; d.id=validation_id; d.ip_address=ip;
+    registry.push_back(d); entries.push_back({base,ip}); return true;
+  };
+  bool registry_ok=add(service_root,service_root+"/Settings/Network/IPAddress", "hv_legacy_route");
+  HNDLE root=0;
+  const auto found=db_find_key(hDB,0,(service_root+"/Devices").c_str(),&root);
+  if (found==DB_SUCCESS) {
+    for (int i=0;;++i) {
+      HNDLE child=0; const auto status=db_enum_key(hDB,root,i,&child);
+      if (status==DB_NO_MORE_SUBKEYS) break;
+      KEY key{};
+      if (status!=DB_SUCCESS || db_get_key(hDB,child,&key)!=DB_SUCCESS || key.type!=TID_KEY) { registry_ok=false; break; }
+      if (!easiroc::isSlowControlDeviceId(key.name)) { registry_ok=false; continue; }
+      const auto base=service_root+"/Devices/"+key.name;
+      registry_ok=add(base,base+"/IPAddress",key.name) && registry_ok;
+    }
+  } else if (found!=DB_NO_KEY) registry_ok=false;
+  if (easiroc::validateSlowControlDevices(registry)) registry_ok=false;
+  for (auto it=hv_mailboxes.begin();it!=hv_mailboxes.end();) {
+    const bool present=std::any_of(entries.begin(),entries.end(),[&](const Entry& e){return e.base==it->first;});
+    if (!present) it=hv_mailboxes.erase(it); else ++it;
+  }
+  for (const auto& entry:entries) {
+    const auto v=entry.base+"/Variables/HV/", c=entry.base+"/Commands/HV/";
+    const auto settings=entry.base+"/Settings/HV/";
+    const DWORD zero=0; const BOOL no=FALSE; const double unset=0, default_limit=easiroc::hv::kDefaultCurrentLimitUa;
+    auto ensure = [&](const std::string& path, const auto& value, DWORD type) {
+      return ensure_odb_value(path,&value,sizeof(value),1,type);
+    };
+    bool ok=ensure(settings+"CurrentLimit_uA",default_limit,TID_DOUBLE);
+    // Explicit operational permission, fail closed for new devices. Merely
+    // starting the normal frontend must not start HV MADC traffic.
+    ok=ensure(settings+"HardwareAccessEnabled",no,TID_BOOL) && ok;
+    ok=ensure(c+"TargetVoltage_V",unset,TID_DOUBLE) && ok;
+    ok=ensure(c+"Enable",no,TID_BOOL) && ok;
+    const char operation[]="";
+    ok=ensure_odb_value(c+"RequestPayload",operation,sizeof(operation),1,TID_STRING) && ok;
+    ok=ensure_odb_value(c+"Operation",operation,sizeof(operation),1,TID_STRING) && ok;
+    ok=ensure(c+"RequestId",zero,TID_DWORD) && ok;
+    ok=ensure(v+"LastHandledRequestId",zero,TID_DWORD) && ok;
+    DWORD request=0, handled=0;
+    if (!ok || !read_odb_dword(c+"RequestId",&request) || !read_odb_dword(v+"LastHandledRequestId",&handled)) {
+      auto old=hv_mailboxes.find(entry.base);
+      if (old!=hv_mailboxes.end()) easiroc::hv::fault(old->second.state,"Cannot read HV mailbox");
+      continue;
+    }
+    auto item=hv_mailboxes.find(entry.base);
+    const bool startup=item==hv_mailboxes.end() || item->second.ip!=entry.ip;
+    if (startup) {
+      HvMailbox box;box.ip=entry.ip;box.seen=std::max(request,handled);box.handled=box.seen;
+      box.state.last_tick=monotonic_ms;
+      if (request>handled) {
+        box.state.result="Indeterminate";box.state.error="Startup/IP change: old HV request discarded without execution";
+        box.result_request=request;box.result_unix=unix_time;
+      }
+      item=hv_mailboxes.insert_or_assign(entry.base,box).first;
+    }
+    auto& mailbox=item->second;
+    auto& state=mailbox.state;
+    easiroc::hv::Context context;
+    context.registered=registry_ok;
+    int run_state=0, transition=-1;
+    context.stopped=deviceValue("/Runinfo/State",run_state,false) && run_state==STATE_STOPPED;
+    context.transition_clear=deviceValue("/Runinfo/Transition in progress",transition,false) && transition==0;
+    context.enable_verified=enable_protocol_verified;
+    deviceValue(entry.base+"/Settings/Enabled",context.frontend_enabled,false);
+    const auto asic=entry.base+"/Variables/ASICSlowControl/";
+    bool applying=true, indeterminate=true, applied=false;
+    DWORD asic_request=0, asic_handled=0;
+    context.asic_busy= !deviceValue(asic+"ApplyInProgress",applying,false) || applying ||
+        !read_odb_dword(entry.base+"/Commands/ASICSlowControl/ApplyRequestId",&asic_request) ||
+        !read_odb_dword(asic+"LastHandledRequestId",&asic_handled) || asic_request>asic_handled;
+    context.asic_applied=deviceValue(asic+"HardwareStateIndeterminate",indeterminate,false) && !indeterminate &&
+        deviceValue(asic+"LastApplied/Valid",applied,false) && applied;
+    context.input_dac_enabled=context.asic_applied;
+    for (const char* chip:{"ASIC1","ASIC2"}) {
+      std::array<int,32> codes{};
+      if (!deviceValue(asic+"LastApplied/"+chip+"/InputDAC",codes,false) ||
+          !std::all_of(codes.begin(),codes.end(),[](int code){return code>=256 && code<=511;}))
+        context.input_dac_enabled=false;
+    }
+    double limit=0;
+    const bool limit_ok=hvDouble(settings+"CurrentLimit_uA",limit) && easiroc::hv::validLimit(limit);
+    // backend_factory creates callbacks only, never implicit hardware traffic.
+    easiroc::hv::Backend backend;
+    if (backend_factory) backend=backend_factory(entry.ip);
+    bool hardware_access=false;
+    deviceValue(settings+"HardwareAccessEnabled",hardware_access,false);
+    const bool transport=hardware_access && bool(backend.measure) && bool(backend.set) && bool(backend.shutdown);
+    if (!hardware_access && (state.ramping || state.valid || state.enabled_known || state.set_known)) {
+      const auto result=state.result, error=state.error;
+      const bool active=mailbox.active!=0;
+      easiroc::hv::fault(state,"HV hardware access revoked; state unknown, no automatic hardware action");
+      // Revoking monitoring permission cannot rewrite a completed operation.
+      if (!active) {state.result=result;state.error=error;}
+    }
+    const auto previous_update=state.updated;
+    if (!startup && request>mailbox.seen) {
+      mailbox.seen=request;
+      std::string op;double target=0;
+      bool accepted=false, dispatched=false;
+      if (!registry_ok) state.error="Invalid/duplicate device registry";
+      else if (!transport) state.error=hardware_access?"HV transport unavailable":"HV hardware access inhibited by Settings/HV/HardwareAccessEnabled";
+      else if (!hvString(c+"RequestPayload",op)) state.error="Malformed HV request payload";
+      else {
+        std::istringstream payload(op);
+        std::uint64_t payload_id=0;std::string extra;
+        const bool payload_ok=bool(payload>>payload_id>>op>>target) && !(payload>>extra) && payload_id==request;
+        std::optional<easiroc::hv::Operation> action;
+        if(payload_ok && op=="Enable") action=easiroc::hv::Operation::Enable;
+        if(payload_ok && op=="Voltage") action=easiroc::hv::Operation::Voltage;
+        if(payload_ok && (op=="Stop" || op=="Disable")) action=easiroc::hv::Operation::Stop;
+        if(payload_ok && op=="Emergency") action=easiroc::hv::Operation::Emergency;
+        if (!action) state.error="Malformed/mismatched HV request envelope or unknown operation";
+        else {dispatched=true;accepted=easiroc::hv::request(state,context,*action,target,limit,monotonic_ms,backend);}
+      }
+      mailbox.result_request=request;mailbox.result_unix=unix_time;
+      if (accepted && state.ramping) mailbox.active=request;
+      else {
+        if (!accepted && (!dispatched || !state.faulted)) state.result="Rejected";
+        mailbox.handled=std::max(mailbox.handled,request);
+        if (accepted || state.faulted) mailbox.active=0;
+      }
+    }
+    if (!startup && transport) easiroc::hv::tick(state,context,limit,backend.now?backend.now():monotonic_ms,backend);
+    if (!state.ramping && mailbox.active) {
+      mailbox.result_request=mailbox.active;mailbox.result_unix=unix_time;
+      mailbox.handled=std::max(mailbox.handled,mailbox.active);mailbox.active=0;
+    }
+    if (state.updated!=previous_update) {
+      // Capture the sample's clock, not a later DAC/publication completion.
+      mailbox.updated_unix_ms=state.sampled_unix_ms?state.sampled_unix_ms:unix_time*1000;
+      mailbox.updated_unix=mailbox.updated_unix_ms/1000;
+    }
+    auto publish=[&](const std::string& key,const auto& value,DWORD type){
+      ok=set_odb_value(v+key,&value,sizeof(value),1,type) && ok;
+    };
+    auto boolean=[&](const std::string& key,bool value){const BOOL wire=value?TRUE:FALSE;publish(key,wire,TID_BOOL);};
+    auto text=[&](const std::string& key,const std::string& value){ok=set_odb_string(v+key,value,256) && ok;};
+    const bool available=context.registered && context.stopped && context.transition_clear && context.frontend_enabled && !context.asic_busy && transport;
+    // Invalidate first; publish Valid last only after the entire snapshot.
+    boolean("MeasurementValid",false);
+    boolean("OperationsAvailable",available);
+    boolean("EnableAvailable",available && limit_ok && context.enable_verified && context.asic_applied && context.input_dac_enabled &&
+        !state.faulted && !state.ramping && !(state.enabled_known && state.enabled));
+    boolean("VoltageAvailable",available && limit_ok && !state.faulted && !state.ramping && state.enabled_known && state.enabled && state.set_known);
+    boolean("StopAvailable",available && limit_ok && !state.faulted);
+    boolean("EmergencyAvailable",available);
+    boolean("ProtectionActive",available && limit_ok && !state.faulted && state.enabled_known && state.enabled);
+    boolean("InProgress",state.ramping);
+    text("EnabledState",state.enabled_known?(state.enabled?"ON":"OFF"):"Unknown");
+    text("BackendMode",hardware_access?"Hardware":"Hardware (inhibited)");
+    publish("HeartbeatUnixTime",unix_time,TID_QWORD);
+    text("StateSource","Acknowledged commands; not hardware readback");
+    text("SetVoltageState",state.set_known?"Known":"Unknown");
+    publish("SetVoltage_V",state.set,TID_DOUBLE);publish("TargetVoltage_V",state.target,TID_DOUBLE);
+    text("RampStatus",state.ramp_status);
+    text("Result",state.result);text("Error",state.error);
+    text("MonitoringStatus",state.monitoring);
+    text("BlockedReason",!registry_ok?"Invalid/duplicate device registry":!hardware_access?"HV hardware access inhibited by Settings/HV/HardwareAccessEnabled":!transport?"HV transport unavailable":
+        !context.stopped?"HV requires STOPPED":!context.transition_clear?"DAQ transition active/unknown":
+        !context.frontend_enabled?"Device Settings/Enabled is false or missing":context.asic_busy?"ASIC Apply pending/active or status missing":
+        !context.asic_applied?"ASIC LastApplied invalid/indeterminate":!context.input_dac_enabled?"Applied InputDAC is not enabled on every channel":
+        state.faulted?"HV fault latched; explicit emergency shutdown required":state.ramping?"HV ramp/settling active":
+        !context.enable_verified?easiroc::hv::kBlockedReason:!limit_ok?"Invalid CurrentLimit":
+        state.enabled_known && state.enabled?easiroc::hv::kAlreadyEnabledReason:"");
+    publish("MeasuredVoltage_V",state.measured.voltage,TID_DOUBLE);
+    publish("MeasuredCurrent_uA",state.measured.current,TID_DOUBLE);
+    publish("LastUpdateUnixTime",mailbox.updated_unix,TID_QWORD);
+    publish("LastUpdateUnixTimeMs",mailbox.updated_unix_ms,TID_QWORD);
+    publish("ActiveRequestId",mailbox.active,TID_DWORD);
+    publish("ResultRequestId",mailbox.result_request,TID_DWORD);
+    publish("ResultUnixTime",mailbox.result_unix,TID_QWORD);
+    if (ok) boolean("MeasurementValid",easiroc::hv::measurementFresh(state,backend.now?backend.now():monotonic_ms));
+    if (ok) publish("LastHandledRequestId",mailbox.handled,TID_DWORD);
+    if (!ok) {
+      easiroc::hv::fault(state,"Cannot persist HV status; hardware state unknown");
+      // Best effort invalidation even if a later acknowledgement write failed.
+      boolean("MeasurementValid",false);text("EnabledState","Unknown");text("Error",state.error);
+    }
   }
 }
 

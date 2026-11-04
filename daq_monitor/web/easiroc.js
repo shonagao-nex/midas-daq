@@ -70,6 +70,24 @@ const EXTRA_FIELDS = [
 const EXTRA_DEFAULTS = {probe1Enabled:false, probe1Channel:0, probe1Signal:4,
   probe2Enabled:false, probe2Channel:0, probe2Signal:4, pattern:3, oneChannel:0,
   hitThreshold:1, andChannels:Array(64).fill(false), triggerWidth:118};
+const HV_FIELDS = Object.freeze({
+  hvTarget:"Commands/HV/TargetVoltage_V", hvEnableValue:"Commands/HV/Enable",
+  hvEnableAvailable:"Variables/HV/EnableAvailable", hvVoltageAvailable:"Variables/HV/VoltageAvailable",
+  hvStopAvailable:"Variables/HV/StopAvailable", hvEmergencyAvailable:"Variables/HV/EmergencyAvailable",
+  hvActive:"Variables/HV/ActiveRequestId", hvResultRequest:"Variables/HV/ResultRequestId",
+  hvBackend:"Variables/HV/BackendMode", hvHeartbeat:"Variables/HV/HeartbeatUnixTime",
+  hvInProgress:"Variables/HV/InProgress", hvStateSource:"Variables/HV/StateSource",
+  hvAvailable:"Variables/HV/OperationsAvailable", hvBlocked:"Variables/HV/BlockedReason",
+  hvSet:"Variables/HV/SetVoltage_V", hvSetState:"Variables/HV/SetVoltageState",
+  hvMonitoring:"Variables/HV/MonitoringStatus", hvEnabled:"Variables/HV/EnabledState", hvRamp:"Variables/HV/RampStatus",
+  hvVoltage:"Variables/HV/MeasuredVoltage_V", hvCurrent:"Variables/HV/MeasuredCurrent_uA",
+  hvValid:"Variables/HV/MeasurementValid", hvUpdated:"Variables/HV/LastUpdateUnixTime",
+  hvUpdatedMs:"Variables/HV/LastUpdateUnixTimeMs",
+  hvResult:"Variables/HV/Result", hvError:"Variables/HV/Error",
+  hvHandled:"Variables/HV/LastHandledRequestId", hvRequest:"Commands/HV/RequestId",
+  hvLimit:"Settings/HV/CurrentLimit_uA", hvProtection:"Variables/HV/ProtectionActive"
+});
+const equipmentRoot = () => "/Equipment/EASIROC";
 const DEVICE_ROOT = "/Equipment/EASIROC/Devices";
 const LEGACY_IP = "/Equipment/EASIROC/Settings/Network/IPAddress";
 function selectPaths(base) {
@@ -78,6 +96,7 @@ function selectPaths(base) {
   ODB.runState = LEGACY_ODB.runState;
   ODB.transition = "/Runinfo/Transition in progress";
   EXTRA_FIELDS.forEach(([key, path]) => { ODB[key] = `${base}/Settings/${path}`; });
+  Object.entries(HV_FIELDS).forEach(([key, path]) => { ODB[key] = `${base}/${path}`; });
   PATHS = Object.values(ODB);
   SETTINGS_PATHS = ASIC_SETTINGS_KEYS.map(key => ODB[key]);
   if (state.extended) SETTINGS_PATHS.push(...EXTRA_FIELDS.map(([key]) => ODB[key]));
@@ -266,7 +285,9 @@ function updateUi() {
   setText("selected-status", `${statusValue("state") || "Unknown"}: ${statusValue("applyError") || ""}${blocked ? ` ${blocked}` : ""}${truth(statusValue("indeterminate")) ? " HardwareStateIndeterminate: START inhibited." : ""}`);
   document.querySelectorAll("#extra-settings input,#extra-settings select,#and-channels input").forEach(input => { input.disabled = locked || state.saving || state.reading || !state.extended; });
   element("read-button").disabled = state.saving || state.applyPending || state.reading;
-  element("ip-address").disabled = state.saving || state.applyPending || state.reading;
+  element("ip-address").disabled = state.saving || state.applyPending || state.reading || state.hvSubmitting;
+  element("read-button").disabled = element("read-button").disabled || Boolean(state.hvSubmitting);
+  updateHvUi();
 }
 
 function valuesFromRpc(rpc) {
@@ -452,16 +473,17 @@ function canonicalIp(ip) {
   return /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(ip) && ip.split(".").every(v => Number(v)<=255);
 }
 async function registeredDevices() {
-  const values = await readValues([DEVICE_ROOT, LEGACY_IP]);
+  const registryPath=equipmentRoot()+"/Devices", legacyPath=equipmentRoot()+"/Settings/Network/IPAddress";
+  const values = await readValues([registryPath, legacyPath]);
   const devices = [];
-  if (present(values[LEGACY_IP])) devices.push({id:"legacy",ip:values[LEGACY_IP],base:"/Equipment/EASIROC"});
-  const registry = values[DEVICE_ROOT];
+  if (present(values[legacyPath])) devices.push({id:"legacy",ip:values[legacyPath],base:equipmentRoot()});
+  const registry = values[registryPath];
   if (registry && typeof registry === "object") Object.entries(registry).forEach(([key, device]) => {
     // db_get_values emits lowercase keys and adjacent /name metadata.
     if (key.includes("/")) return;
     const id = registry[`${key}/name`] || key;
     if (!/^[A-Za-z0-9_-]{1,31}$/.test(id) || id.toLowerCase() === "legacy" || !device || typeof device !== "object") throw new Error("Invalid/reserved device ID");
-    devices.push({id,ip:device.ipaddress ?? device.IPAddress,base:`${DEVICE_ROOT}/${id}`});
+    devices.push({id,ip:device.ipaddress ?? device.IPAddress,base:`${registryPath}/${id}`});
   });
   const ips = new Set();
   for (const device of devices) {
@@ -477,7 +499,7 @@ async function verifySelection() {
   if (!current || current.ip !== state.selected.ip || current.base !== state.selected.base) throw new Error("Device registry changed; READ again");
 }
 async function readSelectedIp() {
-  if (state.saving || state.applyPending || state.reading) return;
+  if (state.saving || state.applyPending || state.reading || state.hvSubmitting || state.hvPreparing) return;
   state.reading = true; updateUi();
   const epoch = ++state.selectionEpoch;
   const previous = {selected:state.selected, extended:state.extended};
@@ -562,8 +584,15 @@ function selectMockScenario(name) {
 }
 
 function setupEvents() {
+  // Editing an address is local only. Never present the last READ as this IP.
+  element("ip-address").addEventListener("input", updateHvUi);
+  element("ip-address").addEventListener("change", updateHvUi);
   setupExtraInputs();
   element("read-button").addEventListener("click",readSelectedIp);
+  element("hv-enable-button").addEventListener("click", () => requestHv("Enable"));
+  element("hv-voltage-button").addEventListener("click", () => requestHv("Voltage"));
+  element("hv-stop-button").addEventListener("click", () => requestHv("Stop"));
+  element("hv-emergency-button").addEventListener("click", () => requestHv("Emergency"));
   ["asic1", "asic2"].forEach(asic => {
     element(`${asic}-dac-code`).addEventListener("input", input => { if (!state.staged) return; state.staged[asic].code = integer(input.target.value); updateUi(); });
     element(`${asic}-dac-slope`).addEventListener("change", input => { if (!state.staged) return; state.staged[asic].slope = integer(input.target.value); updateUi(); });
@@ -581,7 +610,7 @@ function initializeEasirocPage() {
   if (state.mock) {
     document.body.classList.add("mock-mode");
     element("mock-panel").hidden = false;
-    const names = ["match", "mismatch", "unknown", "indeterminate", "applying", "succeeded", "failed", "rejected", "unsaved", "nondefault_shaping", "masked_channel"];
+    const names = ["match", "mismatch", "unknown", "indeterminate", "applying", "succeeded", "failed", "rejected", "unsaved", "nondefault_shaping", "masked_channel", "hv_disabled", "hv_settling", "hv_overcurrent", "hv_stale", "hv_error"];
     names.forEach(name => { const button = document.createElement("button"); button.type = "button"; button.dataset.mockScenario = name; button.textContent = name.toUpperCase(); button.addEventListener("click", () => selectMockScenario(name)); element("mock-buttons").appendChild(button); });
     const requestedScenario = query.get("mock");
     selectMockScenario(window.EASIROC_MOCK_SCENARIOS[requestedScenario] ? requestedScenario : "match");
@@ -589,4 +618,134 @@ function initializeEasirocPage() {
     mhttpd_init("EASI Slow Control", REFRESH_INTERVAL_MS);
   }
   refresh();
+}
+
+
+// This UI only reads cached samples and submits ODB mailboxes. It never
+// performs MADC or hardware network access, including while RUNNING/PAUSED.
+const HV_TIMEOUT_MS = 120000;
+state.hvOutstanding = {};
+state.hvPreparing = false;
+state.hvSubmitting = false;
+function hvSelectionMatches() {
+  return !!state.selected && element("ip-address").value.trim() === state.selected.ip;
+}
+function hvMeasurementFresh(now = Date.now() / 1000) {
+  const precise = present(statusValue("hvUpdatedMs"));
+  const updated = Number(statusValue(precise ? "hvUpdatedMs" : "hvUpdated"));
+  // Old frontends only publish integer seconds: compare at that resolution.
+  // Their MeasurementValid still enforces their original control freshness.
+  const ageMs = precise ? Math.round(now * 1000) - updated : (Math.floor(now) - updated) * 1000;
+  const ramp = ["Ramping", "EmergencyDown", "Settling"].includes(statusValue("hvRamp"));
+  return hvSelectionMatches() && !state.reading && !state.statusUnavailable && truth(statusValue("hvValid")) && Number.isSafeInteger(updated) && updated > 0 && ageMs >= 0 && ageMs <= (ramp ? (precise ? 6000 : 2000) : 65000)
+    && ["hvVoltage", "hvCurrent"].every(key => present(statusValue(key)) && Number.isFinite(Number(statusValue(key))));
+}
+function hvReady(operation) {
+  const capability = {Enable:"hvEnableAvailable", Voltage:"hvVoltageAvailable", Stop:"hvStopAvailable", Emergency:"hvEmergencyAvailable"}[operation];
+  const selected=state.selected;
+  const pending=selected && state.hvOutstanding[selected.base];
+  return selected && hvSelectionMatches() && !state.statusUnavailable && !state.reading && !state.hvSubmitting && !state.applyPending && !truth(statusValue("inProgress")) &&
+    editAllowed() && present(statusValue("transition")) && Number(statusValue("transition"))===0 && frontendPresent() &&
+    capability && truth(statusValue(capability)) && (operation==="Emergency" || operation==="Stop" || (!pending && integer(statusValue("hvRequest"))<=integer(statusValue("hvHandled")) && !truth(statusValue("hvInProgress"))));
+}
+function updateHvUi() {
+  const base=state.selected?.base;
+  const current=hvSelectionMatches() && !state.reading;
+  const unavailable=!current || state.statusUnavailable;
+  const identity=current?`${base}|${state.selected.ip}`:null;
+  if (state.hvTargetOwner!==identity) {
+    state.hvTargetOwner=identity;
+    const target=statusValue("hvTarget");
+    element("hv-target").value=current && present(target) && Number.isFinite(Number(target))?String(target):"0";
+  }
+  const valid=hvMeasurementFresh(), limit=Number(statusValue("hvLimit"));
+  const configured=!unavailable && Number.isFinite(limit) && limit>0 && limit<0.0364*65535;
+  setText("hv-device",current?state.selected.ip:"","");
+  setText("hv-enabled",unavailable?"Unknown":statusValue("hvEnabled")||"Unknown");
+  setText("hv-set",!unavailable && statusValue("hvSetState")==="Known"?`${Number(statusValue("hvSet")).toFixed(3)} V`:"Unknown");
+  setText("hv-monitoring",unavailable?"Unknown":statusValue("hvMonitoring")||"Unknown");
+  setText("hv-voltage",valid?`${Number(statusValue("hvVoltage")).toFixed(3)} V`:"Unknown");
+  setText("hv-current",valid?`${Number(statusValue("hvCurrent")).toFixed(3)} µA`:"Unknown");
+  element("hv-current").className=valid && configured && Number(statusValue("hvCurrent"))>limit?"hv-over-limit":"";
+  setText("hv-ramp",unavailable?"Unknown":statusValue("hvRamp")||"Unknown");
+  setText("hv-validity",valid?"Valid":"Measurement unavailable or stale");
+  element("hv-validity").hidden=valid;
+  const updatedMs=present(statusValue("hvUpdatedMs"))?Number(statusValue("hvUpdatedMs")):Number(statusValue("hvUpdated"))*1000;
+  setText("hv-updated",!unavailable && Number.isSafeInteger(updatedMs) && updatedMs>0 && updatedMs<=8640000000000000?new Date(updatedMs).toISOString():"Unknown");
+  setText("hv-limit",unavailable?"Unknown":configured?`${limit} µA; protection ${truth(statusValue("hvProtection"))?"active":"inactive"}`:"Unconfigured — protection inactive");
+  const missing=!present(statusValue("hvEnableAvailable"));
+  const blocked=!base?"":!current?"READ required for this IP.":!frontendPresent()?"Frontend feeasiroc is not registered":missing?"HV capabilities unavailable.":statusValue("hvBlocked")||"";
+  setText("hv-blocked",blocked,"");
+  element("hv-blocked").hidden=!blocked;
+  let message=current?`${statusValue("hvResult")||""} ${statusValue("hvError")||""}`.trim():"";
+  const outstanding=base && state.hvOutstanding[base];
+  if(outstanding) {
+    const resultId=integer(statusValue("hvResultRequest")), handled=integer(statusValue("hvHandled")), active=integer(statusValue("hvActive"));
+    if(!state.statusUnavailable && resultId>=outstanding.id && handled>=outstanding.id && active!==outstanding.id) {
+      if(resultId!==outstanding.id) message="HV request superseded by a newer request; inspect device state.";
+      delete state.hvOutstanding[base];
+    } else if (!state.statusUnavailable && resultId===outstanding.id && active===outstanding.id &&
+        truth(statusValue("hvInProgress")) && statusValue("hvResult")==="Pending" && hvMeasurementFresh()) {
+      message=`HV RequestId ${outstanding.id}: Pending. ${statusValue("hvRamp")||""}`;
+    } else message=Date.now()-outstanding.started>HV_TIMEOUT_MS?"HV acknowledgement timed out; state Unknown. Re-submit blocked; emergency shutdown remains available.":`HV RequestId ${outstanding.id}: awaiting frontend result. ${message}`;
+  }
+  if(!current || (!outstanding && !statusValue("hvError") && ["Idle","No HV operation"].includes(message))) message="";
+  setText("hv-result",message,"");
+  element("hv-result").hidden=!message;
+  element("hv-enable-button").disabled=!hvReady("Enable");
+  element("hv-voltage-button").disabled=!hvReady("Voltage");
+  element("hv-stop-button").disabled=!hvReady("Stop");
+  element("hv-emergency-button").disabled=!hvReady("Emergency");
+  element("hv-target").disabled=!current || !editAllowed() || state.hvSubmitting || state.reading;
+}
+function confirmHv(operation,value) {
+  const note=operation==="Emergency"?"Immediate shutdown without waiting for zero voltage":operation==="Stop"?"Ramp down 10 V/step; wait for measured ±5 V at each step, verify ≤5 V at zero, then Shutdown":"HV change (昇圧4 V/step、約1秒間隔)";
+  return window.confirm(`${note}: ${operation==="Stop"?"Disable":operation} ${value} on ${state.selected.ip}. OK to proceed?`);
+}
+async function requestHv(operation) {
+  if(state.hvSubmitting || state.hvPreparing) return;
+  state.hvPreparing=true;
+  const selected=state.selected && {...state.selected}, epoch=state.selectionEpoch;
+  let submitted=false, reserved=null;
+  try {
+    if(!selected) throw new Error("READ a registered IP first");
+    await verifySelection();
+    Object.assign(state.values,await readValues());
+    if(epoch!==state.selectionEpoch || state.selected?.base!==selected.base) throw new Error("Selection changed");
+    if(!hvReady(operation)) throw new Error("HV requires STOPPED, no transition/ASIC Apply, current capabilities and an acknowledged mailbox");
+    const target=operation==="Voltage"?Number(element("hv-target").value):0;
+    if(operation==="Voltage" && (element("hv-target").value.trim()==="" || !Number.isFinite(target) || target<0 || target>62)) throw new Error("Target Voltage must be 0..62 V");
+    if(operation==="Enable" && Number(element("hv-target").value)!==0) throw new Error("Enable requires Target Voltage=0 V");
+    if(!confirmHv(operation,operation==="Voltage"?`${target} V`:operation==="Enable"?"ON at 0 V":"")) return;
+    state.hvSubmitting=true;updateUi();
+    const ids=["hvRequest","hvHandled","hvActive","hvResultRequest"].map(key=>integer(statusValue(key)));
+    if(ids.some(id=>!Number.isInteger(id)||id<0||id>=0xffffffff)) throw new Error("HV request IDs unavailable or exhausted");
+    const id=Math.max(...ids,state.hvOutstanding[selected.base]?.id||0)+1;
+    if(id>0xffffffff) throw new Error("HV request IDs exhausted");
+    const writes=[[`${selected.base}/Commands/HV/Operation`,operation],[`${selected.base}/Commands/HV/TargetVoltage_V`,target],[`${selected.base}/Commands/HV/Enable`,operation==="Enable"],[`${selected.base}/Commands/HV/RequestPayload`,`${id} ${operation} ${target}`],[`${selected.base}/Commands/HV/RequestId`,id]];
+    for(const [path,value] of writes) {
+      await verifySelection();
+      Object.assign(state.values,await readValues([ODB.runState,ODB.transition,ODB.inProgress,ODB.clients]));
+      if(!editAllowed() || !present(statusValue("transition")) || Number(statusValue("transition"))!==0 || truth(statusValue("inProgress")) || !frontendPresent()) throw new Error("DAQ/ASIC state changed before HV submission");
+      if(path.endsWith("/RequestId")) {
+        submitted=true;reserved=id;state.hvOutstanding[selected.base]={id,started:Date.now()};
+      }
+      if(state.mock) state.values[path]=value;
+      else {
+        const rpc=await boundedRpc(mjsonrpc_db_set_value(path,value),"HV request submission");
+        if(rpc.result.status[0]!==MIDAS_SUCCESS) throw new Error(`HV ODB write failed: ${path}`);
+      }
+    }
+    // Mock is an explicit UI preview; hardware policy/ramping is tested in C++.
+    if(state.mock) {
+      state.values[ODB.hvActive]=0;state.values[ODB.hvHandled]=id;state.values[ODB.hvResultRequest]=id;
+      state.values[ODB.hvResult]="Succeeded (mock only; no hardware access)";state.values[ODB.hvError]="";
+    }
+    Object.assign(state.values,await readValues());
+  } catch(error) {
+    state.hvLocalError=`${decodeError(error)}${submitted?`; HV RequestId ${reserved} completion Unknown; automatic retry blocked`:""}`;
+  } finally {
+    state.hvPreparing=false;state.hvSubmitting=false;updateUi();
+    if(state.hvLocalError) {setText("hv-result",state.hvLocalError);element("hv-result").hidden=false;state.hvLocalError="";}
+  }
 }

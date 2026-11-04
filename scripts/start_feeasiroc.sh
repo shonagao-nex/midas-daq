@@ -17,4 +17,4 @@ if [ ! -x "$frontend" ]; then
   exit 1
 fi
 
-exec "$frontend" -e "$MIDAS_EXPT_NAME"
+exec "$frontend" -e "$MIDAS_EXPT_NAME" "$@"

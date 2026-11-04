@@ -35,8 +35,8 @@ int main() {
       check(asic.input_dac.size() == 32,
             "InputDAC default does not contain 32 channels");
       check(std::all_of(asic.input_dac.begin(), asic.input_dac.end(),
-                        [](int value) { return value == 350; }),
-            "InputDAC default is not 350 for every channel");
+                        [](int value) { return value == 480; }),
+            "InputDAC default is not 480 for every channel");
       check(std::all_of(asic.channel_enabled.begin(),
                         asic.channel_enabled.end(),
                         [](bool value) { return value; }),

@@ -11,7 +11,7 @@ namespace easiroc {
 
 constexpr int kDefaultDiscriminatorDacCode = 600;
 constexpr int kDefaultDiscriminatorDacSlope = 1;
-constexpr int kDefaultInputDac = 350;
+constexpr int kDefaultInputDac = 480;
 constexpr std::size_t kInputDacChannelCount = 32;
 constexpr int kInputDacMaximum = 511;
 // ODB stores the physical capacitance in fF. Zero denotes the legacy "NoC"

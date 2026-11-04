@@ -19,7 +19,6 @@ constexpr std::uint8_t kReadReply = 0xc8;
 constexpr std::uint8_t kWriteCommand = 0x80;
 constexpr std::uint8_t kWriteReply = 0x88;
 constexpr int kTimeoutMilliseconds = 1000;
-constexpr int kMaximumAttempts = 3;
 constexpr std::size_t kHeaderSize = 8;
 constexpr std::size_t kMaximumPayload = 255;
 
@@ -49,8 +48,11 @@ std::uint32_t decodeBigEndian32(const std::uint8_t* bytes) {
 }
 }  // namespace
 
-RbcpClient::RbcpClient(std::string host, std::uint16_t port)
-    : host_(std::move(host)), port_(port) {}
+RbcpClient::RbcpClient(std::string host, std::uint16_t port, unsigned maximum_attempts)
+    : host_(std::move(host)), port_(port), maximum_attempts_(maximum_attempts) {
+  if (maximum_attempts < 1 || maximum_attempts > 3)
+    throw std::invalid_argument("RBCP maximum attempts must be 1..3");
+}
 
 std::vector<std::uint8_t> RbcpClient::read(std::uint32_t address,
                                            std::size_t length) {
@@ -86,7 +88,7 @@ void RbcpClient::write(std::uint32_t address, std::uint8_t value) {
 std::vector<std::uint8_t> RbcpClient::readPacket(std::uint32_t address,
                                                  std::uint8_t length) {
   std::string last_error = "RBCP transaction failed";
-  for (int attempt = 0; attempt < kMaximumAttempts; ++attempt) {
+  for (unsigned attempt = 0; attempt < maximum_attempts_; ++attempt) {
     const std::uint8_t request_id = packet_id_++;
     try {
       addrinfo hints{};
@@ -163,7 +165,7 @@ std::vector<std::uint8_t> RbcpClient::readPacket(std::uint32_t address,
       last_error = error.what();
     }
   }
-  throw std::runtime_error(last_error + " (after 3 attempts)");
+  throw std::runtime_error(last_error + " (after " + std::to_string(maximum_attempts_) + " attempts)");
 }
 
 void RbcpClient::writePacket(std::uint32_t address, const std::uint8_t* data,
@@ -171,7 +173,7 @@ void RbcpClient::writePacket(std::uint32_t address, const std::uint8_t* data,
   if (length == 0) return;
 
   std::string last_error = "RBCP transaction failed";
-  for (int attempt = 0; attempt < kMaximumAttempts; ++attempt) {
+  for (unsigned attempt = 0; attempt < maximum_attempts_; ++attempt) {
     const std::uint8_t request_id = packet_id_++;
     try {
       addrinfo hints{};
@@ -248,5 +250,5 @@ void RbcpClient::writePacket(std::uint32_t address, const std::uint8_t* data,
       last_error = error.what();
     }
   }
-  throw std::runtime_error(last_error + " (after 3 attempts)");
+  throw std::runtime_error(last_error + " (after " + std::to_string(maximum_attempts_) + " attempts)");
 }

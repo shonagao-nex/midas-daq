@@ -8,3 +8,34 @@ body.mock-mode #mmain{margin-left:auto!important;opacity:1!important}
 .operation-actions .save-state { grid-column: 1 / -1; text-align: center; }
 .apply-arrow { font-size: 1.8rem; }
 #extra-settings { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 1rem; }
+
+.hv-divider { margin: 2rem 0; }
+.hv-panel .hv-over-limit { color: #c00000; }
+
+.hv-emergency { border: 2px solid #a40000; color: #a40000; font-weight: bold; }
+
+.hv-panel button.hv-emergency { background: #a40000; color: white; border: 2px solid #a40000; }
+
+.device-picker { display:flex; align-items:center; flex-wrap:wrap; gap:.5rem; }
+.device-picker label { font-weight:700; }
+.device-picker input { width:15ch; border:1px solid #94a3b8; border-radius:4px; padding:.45rem; font:inherit; }
+.device-picker button,.hv-actions button { border:1px solid var(--blue); border-radius:6px; padding:.5rem .8rem; background:var(--blue); color:white; font:inherit; font-weight:700; cursor:pointer; }
+.hv-panel .section-title { margin-bottom:.75rem; }
+.hv-panel h2 { margin:0; }
+#hv-device { color:var(--muted); font-family:ui-monospace,monospace; }
+.hv-status { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.6rem 1rem; margin:0 0 1rem; }
+.hv-status div { border-bottom:1px solid var(--line); padding:.35rem 0; }
+.hv-status dt { color:var(--muted); font-size:.8rem; }
+.hv-status dd { margin:.25rem 0 0; font-weight:700; overflow-wrap:anywhere; }
+.hv-actions { display:flex; align-items:end; flex-wrap:wrap; gap:.75rem; }
+.hv-target-controls { display:flex; align-items:center; flex-wrap:wrap; gap:.5rem; }
+.hv-target-controls label { font-size:.85rem; }
+.hv-target-controls input { width:7ch; border:1px solid #94a3b8; border-radius:4px; padding:.5rem; font:inherit; }
+.hv-actions button:disabled { background:#e2e8f0; color:#64748b; border-color:#cbd5e1; cursor:not-allowed; }
+.hv-actions button.hv-emergency { margin-left:auto; background:var(--red); border:2px solid var(--red); color:white; }
+.hv-actions button.hv-emergency:disabled { background:var(--red-pale); color:var(--red); opacity:.6; }
+.hv-panel .hv-notice { color:var(--yellow); font-size:.85rem; margin:.5rem 0; }
+#hv-result { margin-top:.75rem; overflow-wrap:anywhere; }
+.hv-panel [hidden] { display:none; }
+@media(max-width:900px) { .hv-status { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:520px) { .hv-status { grid-template-columns:1fr; } .hv-actions { align-items:stretch; flex-direction:column; } .hv-actions button.hv-emergency { margin-left:0; } }
