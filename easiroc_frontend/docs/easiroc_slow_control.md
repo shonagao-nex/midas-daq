@@ -3642,3 +3642,12 @@ GUIはLastUpdateUnixTimeMsで整数ms比較することをソースとモック�
 post-observations.jsonl、verification.json、assets.json、tests.logを保存した。
 HV操作・操作用ODB変更・追加の実機診断通信は行っていない。
 本番8081・`/home/daq`は変更していない。コミット・pushは行っていない。
+
+
+## 本番反映事前調査（2026-11-05）
+
+本番8081との読取り比較・反映スクリプト評価・独立反映/復旧計画は
+[既存反映手順の調査節](../../scripts/deploy/README.md#easirochul本番反映の事前調査2026-11-05-jst)
+に集約した。EASIROCはB判定（スクリプト修正後、HV抑止で導入）。
+本番HV状態は未確認で、開発のASIC Settings/LastAppliedを移植しない。
+HV実機運用開始には別途受入が必要。今回は反映・実機通信・HV操作を実施していない。

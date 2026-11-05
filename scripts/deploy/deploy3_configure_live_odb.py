@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Converge only the explicitly owned live ODB schema on the DAQ host."""
 
+import argparse
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import urllib.request
+
+sys.dont_write_bytecode = True
+_module = importlib.util.spec_from_file_location("frontend_odb", Path(__file__).with_name("frontend_odb.py"))
+frontend_odb = importlib.util.module_from_spec(_module)
+_module.loader.exec_module(frontend_odb)
 
 
 ROOT = Path("/home/daq/midas/midas/online")
@@ -28,10 +37,13 @@ UINT32, BOOL, INT32, DOUBLE, STRING, KEY, LINK, INT64, UINT64 = (
 
 
 class Rpc:
-    def __init__(self, url=URL):
+    def __init__(self, url=URL, readonly=False):
         self.url = url
+        self.readonly = readonly
 
     def call(self, method, params):
+        if self.readonly and method not in ("db_get_values", "db_key", "db_copy", "cm_exist"):
+            raise RuntimeError("Read-only deployment preview rejected " + method)
         request = urllib.request.Request(
             self.url,
             json.dumps({"jsonrpc": "2.0", "method": method,
@@ -132,15 +144,17 @@ def specs():
         (f"{JSON_ROOT}/Links EOR", KEY, 0, None),
         ("/Programs/fevme", KEY, 0, None),
         ("/Programs/feeasiroc", KEY, 0, None),
+        ("/Programs/fehul", KEY, 0, None),
         ("/Custom", KEY, 0, None),
         ("/Custom/Path", STRING, 256, str(ROOT / "daq_monitor/web")),
         ("/Custom/DAQ", STRING, 256, "daq.html"),
         ("/Custom/Run Summary", STRING, 32, "run-summary.html"),
+        ("/Custom/EASI Slow Control", STRING, 32, "easiroc.html"),
     ]
-    for name in ("fevme", "feeasiroc"):
+    for name in ("fevme", "feeasiroc", "fehul"):
         prefix = f"/Programs/{name}"
         values.extend((
-            (f"{prefix}/Required", BOOL, 0, True),
+            (f"{prefix}/Required", BOOL, 0, name != "fehul"),
             (f"{prefix}/Watchdog timeout", INT32, 0, 10000),
             (f"{prefix}/Check interval", UINT32, 0, 180000),
             (f"{prefix}/Start command", STRING, 256,
@@ -292,7 +306,7 @@ MANAGED_VALUES = {
     "/Custom/DAQ": "daq.html",
     "/Custom/Run Summary": "run-summary.html",
 }
-for _name in ("fevme", "feeasiroc"):
+for _name in ("fevme",):
     _prefix = f"/Programs/{_name}"
     MANAGED_VALUES.update({
         f"{_prefix}/Required": True,
@@ -415,9 +429,11 @@ def daq_children(rpc, path):
     return [name for name in copied if not name.endswith("/key")]
 
 
-def inspect_daq_settings_schema(rpc):
+def inspect_daq_settings_schema(rpc, allow_missing_easiroc=False):
     """Read-only validation, shared by deploy3 preflight and deploy4."""
     for spec in daq_settings_specs():
+        if allow_missing_easiroc and spec[0].startswith("/Equipment/EASIROC/Settings/") and rpc.key(spec[0]) is None:
+            continue
         require_daq_key(rpc, *spec)
 
     analyzer = rpc.key("/Analyzer")
@@ -468,12 +484,53 @@ def inspect_schema(rpc):
         if not same_value(rpc.value(path), expected):
             raise RuntimeError(f"Managed ODB value differs: {path}")
     inspect_live_paths(rpc)
+    frontend_plan = frontend_odb.plan(rpc)
+    if frontend_plan["add"]:
+        raise RuntimeError("Missing deploy-owned frontend keys: " +
+                           ", ".join(item["path"] for item in frontend_plan["add"]))
 
 
-def configure(rpc):
+def check_checkpoint(journal_path):
+    if journal_path is None or not journal_path.exists():
+        return
+    state = json.loads(journal_path.read_text())
+    for path, item in state.get("frontend_initialization", {}).items():
+        if item.get("phase") != "written":
+            raise RuntimeError("Unfinished frontend initialization at " + path +
+                               "; inspect ODB and saved backup before an explicit repair; no automatic overwrite")
+
+
+def checkpoint_writer(journal_path):
+    if journal_path is None:
+        return None  # in-memory/unit callers; CLI always supplies the whole-deploy journal
+    if not journal_path.is_file() or json.loads(journal_path.read_text()).get("phase") != "in_progress":
+        raise RuntimeError("New frontend Settings require the active whole-deployment journal")
+
+    def record(item, phase):
+        state = json.loads(journal_path.read_text())
+        if state.get("phase") != "in_progress":
+            raise RuntimeError("Deployment journal changed during frontend initialization")
+        state.setdefault("frontend_initialization", {})[item["path"]] = {**item, "phase": phase}
+        temporary = journal_path.with_name(journal_path.name + f".frontend-{os.getpid()}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(state, stream, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, journal_path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return record
+
+
+def preflight(rpc, journal_path=None):
     require_live(rpc)
+    check_checkpoint(journal_path)
     # Fail before changing deploy-owned keys if DAQ settings need intervention.
-    inspect_daq_settings_schema(rpc)
+    inspect_daq_settings_schema(rpc, allow_missing_easiroc=True)
+    frontend_plan = frontend_odb.plan(rpc)
     # These are site/runtime prerequisites, not values that deployment rewrites.
     for path, expected in (("/Logger/Message dir", str(RUNTIME / "log")),
                            ("/Logger/Data dir", str(RUNTIME / "data")),
@@ -485,12 +542,57 @@ def configure(rpc):
             if rpc.key(f"{ELOG}/{name}") is None:
                 raise RuntimeError(f"Enabled Run Elog has missing history key: {name}")
     for path, tid, minimum, initial in specs():
-        if path == "/Custom/Path" and rpc.key(path) is not None and \
-                rpc.value(path) != str(ROOT / "daq_monitor/web"):
+        frontend_odb.validate(rpc, path, (tid, 1, minimum, initial))
+        if rpc.key(path) is not None:
+            inspect_key(rpc, path, tid, minimum)
+        if path == "/Custom/Path" and rpc.key(path) is not None and rpc.value(path) != str(ROOT / "daq_monitor/web"):
             raise RuntimeError("Existing /Custom/Path points elsewhere")
-        if path == f"{ELOG}/Web Port" and rpc.key(path) is not None and \
-                rpc.value(path) != 8081:
+        if path == f"{ELOG}/Web Port" and rpc.key(path) is not None and rpc.value(path) != 8081:
             raise RuntimeError("Existing Run Elog Web Port is not 8081")
+    for name in ("feeasiroc", "fehul"):
+        command = rpc.value(f"/Programs/{name}/Start command", missing_ok=True)
+        if command is not None and command != str(ROOT / f"scripts/start_{name}.sh"):
+            raise RuntimeError(f"Existing {name} start command needs review; not overwritten")
+        for flag in ("Auto start", "Auto stop", "Auto restart"):
+            value = rpc.value(f"/Programs/{name}/{flag}", missing_ok=True)
+            if value not in (None, False):
+                raise RuntimeError(f"Existing {name} {flag} needs review; not overwritten")
+    page = rpc.value("/Custom/EASI Slow Control", missing_ok=True)
+    if page is not None and page != "easiroc.html":
+        raise RuntimeError("Existing EASI Slow Control registration differs; not overwritten")
+    for phase, expected in (("BOR", BOR), ("EOR", EOR)):
+        directory = f"{JSON_ROOT}/Links {phase}"
+        if rpc.key(directory) is not None:
+            actual = link_map(rpc, phase)
+            allowed = {n.casefold() for n, _ in expected}
+            if any(n.casefold() not in allowed for n, _ in actual):
+                raise RuntimeError(f"Unexpected {phase} link names")
+    fixed = [{"path": path, "type": tid, "string_length": minimum, "value": initial}
+             for path, tid, minimum, initial in specs() if rpc.key(path) is None]
+    managed = [{"path": path, "value": value} for path, value in MANAGED_VALUES.items()
+               if not same_value(rpc.value(path, missing_ok=True), value)]
+    clients = {}
+    for name in ("fevme", "feeasiroc", "fehul"):
+        status = rpc.call("cm_exist", {"name": name, "unique": True})["status"]
+        if status not in (1, 103):
+            raise RuntimeError(f"Cannot inspect frontend {name}: {status}")
+        clients[name] = status == 1
+    return {"frontend": frontend_plan, "fixed_additions": fixed, "legacy_managed_updates": managed,
+            "current_frontend_clients": clients,
+            "services": ["midas-daq-monitor.service", "midas-analyzer.service"],
+            "frontends": "restore only originally running fevme/feeasiroc/fehul; no first HUL start"}
+
+
+def configure(rpc, journal_path=None):
+    planned = preflight(rpc, journal_path)
+    checkpoint = checkpoint_writer(journal_path) if planned["frontend"]["add"] else None
+    # The whole-deploy orchestrator stops these clients before calling step3.
+    for name in (("feeasiroc", "fehul") if planned["frontend"]["add"] else ()):
+        state = rpc.call("cm_exist", {"name": name, "unique": True})["status"]
+        if state != 103:
+            raise RuntimeError(f"Stop {name} before frontend Settings initialization (status {state})")
+    frontend_odb.apply(rpc, planned["frontend"], require_stopped, checkpoint)
+    for path, tid, minimum, initial in specs():
         if path == f"{STATUS}/EventSlipCount":
             ensure_signed_slips(rpc)
         else:
@@ -505,9 +607,40 @@ def configure(rpc):
     inspect_schema(rpc)
 
 
+def preview_checkout():
+    def git(*args):
+        return subprocess.run(("git", "--no-optional-locks", "-C", str(ROOT), *args),
+                              text=True, capture_output=True, check=True).stdout.strip()
+    return {"tracked_local_changes": git("status", "--short", "--untracked-files=no"),
+            "cached_incoming_files": git("diff", "--name-status", "HEAD", "origin/main"),
+            "note": "read-only check does not fetch; deploy1 fetches and displays exact incoming files before fast-forward"}
+
+
+def preview_files():
+    files = ("vme_frontend/bin/fevme", "easiroc_frontend/bin/feeasiroc", "hul_frontend/bin/fehul",
+             "daq_monitor/bin/daq_monitor", "analyzer/bin/midas_analyzer",
+             "scripts/start_feeasiroc.sh", "scripts/start_fehul.sh", "daq_monitor/web/easiroc.html",
+             "daq_monitor/web/easiroc.js", "daq_monitor/web/easiroc.css", "daq_monitor/web/easiroc-mock-data.js",
+             "daq_monitor/web/daq.html", "daq_monitor/web/daq.js")
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() if (ROOT / name).is_file()
+            else "missing (build/checkout required)" for name in files}
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Whole-deployment ODB configuration; --check is read-only")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
     try:
-        configure(Rpc())
+        if args.check:
+            rpc = Rpc(readonly=True)
+            preview = {"checkout": preview_checkout(), "files_sha256_before_build": preview_files()}
+            if preview["checkout"]["tracked_local_changes"]:
+                print(json.dumps(preview, indent=2))
+                raise RuntimeError("Tracked local changes prevent deployment; see listed files")
+            preview["odb"] = preflight(rpc, RUNTIME / "deploy-state.json")
+            print(json.dumps(preview, indent=2))
+            return 0
+        configure(Rpc(), RUNTIME / "deploy-state.json")
         print("Live ODB fixed schema verified")
     except Exception as error:
         print(f"deploy3: {error}", file=sys.stderr)

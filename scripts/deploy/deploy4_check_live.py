@@ -18,7 +18,7 @@ spec.loader.exec_module(schema)
 
 ROOT = schema.ROOT
 RUNTIME = schema.RUNTIME
-FRONTENDS = ("fevme", "feeasiroc")
+FRONTENDS = ("fevme", "feeasiroc", "fehul")
 SERVICES = ("midas-mhttpd.service", "midas-mlogger.service",
             "midas-daq-monitor.service", "midas-analyzer.service")
 
@@ -84,7 +84,7 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
     for args in (("git", "-C", str(ROOT), "diff", "--quiet"),
                  ("git", "-C", str(ROOT), "diff", "--cached", "--quiet")):
         subprocess.run(args, check=True)
-    for binary in ("vme_frontend/bin/fevme", "easiroc_frontend/bin/feeasiroc",
+    for binary in ("vme_frontend/bin/fevme", "easiroc_frontend/bin/feeasiroc", "hul_frontend/bin/fehul",
                    "daq_monitor/bin/daq_monitor", "analyzer/bin/midas_analyzer"):
         path = ROOT / binary
         if not path.is_file() or not os.access(path, os.X_OK):
@@ -94,7 +94,7 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
         tracked = ROOT / "systemd" / unit
         if not installed.is_file() or installed.read_bytes() != tracked.read_bytes():
             raise RuntimeError(f"Installed unit differs from tracked unit: {unit}")
-    for wrapper in ("scripts/start_fevme.sh", "scripts/start_feeasiroc.sh"):
+    for wrapper in ("scripts/start_fevme.sh", "scripts/start_feeasiroc.sh", "scripts/start_fehul.sh"):
         if not os.access(ROOT / wrapper, os.X_OK):
             raise RuntimeError(f"Frontend wrapper is not executable: {wrapper}")
     if (ROOT / "daq_monitor/web/runlogs").resolve() != RUNTIME / "runlogs":
@@ -127,7 +127,7 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
             if len(pids.get(name, [])) != 1:
                 raise RuntimeError(f"Expected exactly one {name} client")
             binary = ("vme_frontend/bin/fevme" if name == "fevme" else
-                      "easiroc_frontend/bin/feeasiroc")
+                      "easiroc_frontend/bin/feeasiroc" if name == "feeasiroc" else "hul_frontend/bin/fehul")
             executable_matches(pids[name][0], ROOT / binary)
     for name in SERVICES:
         active = service_active(name)
@@ -145,11 +145,19 @@ def check(expected_commit=None, expected_frontends=None, expected_services=None)
                 raise RuntimeError(f"Service {name} has no MIDAS client {client}")
     page("http://127.0.0.1:8081/?cmd=custom&page=DAQ", b"daq.js")
     page("http://127.0.0.1:8081/?cmd=custom&page=Run%20Summary", b"run-summary.js")
+    page("http://127.0.0.1:8081/?cmd=custom&page=EASI%20Slow%20Control", b"easiroc.js")
+    for name in ("easiroc.html", "easiroc.js", "easiroc.css", "easiroc-mock-data.js"):
+        # Verify actual served bytes, not only marker presence or cache status.
+        served = page("http://127.0.0.1:8081/" + name)
+        if served != (ROOT / "daq_monitor/web" / name).read_bytes():
+            raise RuntimeError("Served EASIROC asset differs from checkout: " + name)
     page("http://127.0.0.1:8081/daq.js")
     page("http://127.0.0.1:8081/run-summary.js")
     json.loads(page("http://127.0.0.1:8081/runlogs/runlog_index.json"))
     json.loads(page("http://127.0.0.1:8081/runlogs/runlog_selection.json"))
     schema.require_stopped(rpc)
+    if not frontend_running(rpc, "fehul"):
+        print("HUL software staged; first startup and hardware data acquisition are not certified")
     print(f"Live read-only smoke test passed: {commit}")
 
 
@@ -160,6 +168,7 @@ def main():
         frontends = {
             "fevme": os.environ["DEPLOY_START_FEVME"] == "1",
             "feeasiroc": os.environ["DEPLOY_START_FEEASIROC"] == "1",
+            "fehul": os.environ.get("DEPLOY_START_FEHUL", "0") == "1",
         }
     services = None
     if "DEPLOY_START_MONITOR" in os.environ:

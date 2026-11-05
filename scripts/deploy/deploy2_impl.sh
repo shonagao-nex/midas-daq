@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
+import shutil
 import time
 
 ROOT = Path("/home/daq/midas/midas/online")
@@ -22,10 +24,11 @@ DEPLOY = ROOT / "scripts/deploy"
 BINARIES = (
     "vme_frontend/bin/fevme",
     "easiroc_frontend/bin/feeasiroc",
+    "hul_frontend/bin/fehul",
     "daq_monitor/bin/daq_monitor",
     "analyzer/bin/midas_analyzer",
 )
-FRONTENDS = ("fevme", "feeasiroc")
+FRONTENDS = ("fevme", "feeasiroc", "fehul")
 SERVICES = ("midas-daq-monitor.service", "midas-analyzer.service")
 
 sys.dont_write_bytecode = True
@@ -81,7 +84,9 @@ def read_journal():
 
 def started_flags():
     return {
-        "frontends": {name: os.environ[f"DEPLOY_START_{name.upper()}"] == "1"
+        "frontends": {name: (os.environ[f"DEPLOY_START_{name.upper()}"] == "1"
+                              if f"DEPLOY_START_{name.upper()}" in os.environ
+                              else frontend_running(name))
                       for name in FRONTENDS},
         "services": {"midas-daq-monitor.service":
                      os.environ["DEPLOY_START_MONITOR"] == "1",
@@ -206,8 +211,12 @@ def build_and_test():
     env = os.environ.copy()
     env["MIDASSYS"] = "/home/daq/midas/midas_src"
     env["ROOTSYS"] = "/home/daq/root/current"
+    from scripts.deploy.midas_build import link_libraries
+    extra = shlex.join(link_libraries(Path(env["MIDASSYS"])))
+    hul_libs = shlex.join([str(Path(env["MIDASSYS"]) / "lib/libmidas.a"), "-lm", "-lz", "-lutil", "-lpthread"]) + " " + extra
     run("make", "-C", "vme_frontend", "fevme", env=env)
-    run("make", "-C", "easiroc_frontend", "feeasiroc", env=env)
+    run("make", "-C", "easiroc_frontend", "feeasiroc", "LDLIBS=" + extra, env=env)
+    run("make", "-C", "hul_frontend", "all", "LDLIBS=" + hul_libs, env=env)
     run("make", "-C", "daq_monitor", "daq_monitor", env=env)
     run("cmake", "-S", "analyzer", "-B", "analyzer/build",
         "-DROOTANA_DIR=/home/daq/midas/rootana",
@@ -215,7 +224,8 @@ def build_and_test():
         "-DCMAKE_BUILD_TYPE=Release", env=env)
     run("cmake", "--build", "analyzer/build", "-j2", env=env)
     run("make", "-C", "vme_frontend", "check", env=env)
-    run("make", "-C", "easiroc_frontend", "check", env=env)
+    run("make", "-C", "easiroc_frontend", "check", "check-web", "NODE=" + env.get("NODE", "node"), "LDLIBS=" + extra, env=env)
+    run("make", "-C", "hul_frontend", "check", "LDLIBS=" + hul_libs, env=env)
     run("make", "-C", "daq_monitor", "check", env=env)
     run("ctest", "--test-dir", "analyzer/build", "--output-on-failure", env=env)
     run(sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests",
@@ -248,6 +258,7 @@ def smoke(commit, started):
     env["DEPLOY_TARGET_SHA"] = commit
     env["DEPLOY_START_FEVME"] = "1" if started["frontends"]["fevme"] else "0"
     env["DEPLOY_START_FEEASIROC"] = "1" if started["frontends"]["feeasiroc"] else "0"
+    env["DEPLOY_START_FEHUL"] = "1" if started["frontends"].get("fehul", False) else "0"
     env["DEPLOY_START_MONITOR"] = "1" if started["services"][SERVICES[0]] else "0"
     env["DEPLOY_START_ANALYZER"] = "1" if started["services"][SERVICES[1]] else "0"
     run(sys.executable, DEPLOY / "deploy4_check_live.py", env=env)
@@ -266,14 +277,26 @@ def main():
         raise RuntimeError("Checkout changed after bootstrap")
     schema.require_live(rpc)
     verify_installed_units()
+    # Preview every known schema mismatch before stopping clients or modifying ODB.
+    planned = schema.preflight(rpc, JOURNAL)
+    print(json.dumps({"files_sha256_before_build": schema.preview_files(),
+                      "odb": planned}, indent=2), flush=True)
+    if not shutil.which(os.environ.get("NODE", "node")):
+        raise RuntimeError("NODE executable required for EASIROC GUI mock tests")
+    from scripts.deploy.midas_build import link_libraries
+    link_libraries(Path("/home/daq/midas/midas_src"))
     old = read_journal()
     if old and old["phase"] == "in_progress":
         started = old["started"]
+        if "fehul" not in started["frontends"]:
+            if frontend_running("fehul"):
+                raise RuntimeError("Old recovery journal has no HUL state; inspect before resuming")
+            started["frontends"]["fehul"] = False
         print("Resuming prior incomplete deployment state", flush=True)
     else:
         started = started_flags()
     if old and old["phase"] == "complete" and old["commit"] == commit and \
-            old.get("binaries") == binary_hashes():
+            old.get("binaries") == binary_hashes() and not planned["frontend"]["add"]:
         # A repeated invocation does not disturb running processes or hardware.
         backup_odb(commit)
         run(sys.executable, DEPLOY / "deploy3_configure_live_odb.py")
@@ -282,6 +305,8 @@ def main():
         return
     backup_odb(commit)
     state = {"phase": "in_progress", "commit": commit, "started": started}
+    if old and old["phase"] == "in_progress" and "frontend_initialization" in old:
+        state["frontend_initialization"] = old["frontend_initialization"]
     atomic_json(JOURNAL, state)
     stop_for_build(started)
     build_and_test()
@@ -290,6 +315,9 @@ def main():
     ensure_selection()
     restore(started)
     smoke(commit, started)
+    current_journal = read_journal()
+    if current_journal and "frontend_initialization" in current_journal:
+        state["frontend_initialization"] = current_journal["frontend_initialization"]
     state.update(phase="complete", binaries=binary_hashes())
     atomic_json(JOURNAL, state)
     print(f"Deployment complete: {commit}", flush=True)
