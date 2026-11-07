@@ -163,6 +163,9 @@ def specs():
             (f"{prefix}/Auto stop", BOOL, 0, False),
             (f"{prefix}/Auto restart", BOOL, 0, False),
             (f"{prefix}/Alarm class", STRING, 32, ""),
+            # cm_set_client_info() default; al_check() reads this even if not Required.
+            # Runtime history: initialize only when absent, never put in MANAGED_VALUES.
+            (f"{prefix}/First failed", UINT32, 0, 0),
         ))
     for name, command in ANALYZER_PROGRAMS.items():
         prefix = f"/Programs/{name}"

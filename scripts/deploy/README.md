@@ -121,6 +121,46 @@ bash -n scripts/deploy/deploy1_init.sh scripts/deploy/deploy2_impl.sh
 python3 -m py_compile scripts/deploy/deploy3_configure_live_odb.py scripts/deploy/deploy4_check_live.py
 ```
 
+## HUL ProgramsのFirst failed欠損によるSIGABRT（2026-11-05）
+
+本番デプロイ時、`/Programs/fehul/First failed`が存在せず、
+`daq_monitor`と`odbedit`がSIGABRTで終了する障害が発生した（障害情報は作業依頼による）。
+開発ソースではdeploy3がHULのProgramsを部分的に作成し、通常はMIDASの
+クライアント登録が用意する`First failed`を作成していなかった。
+全体デプロイは新規HULを起動しないため、その登録による補完も行われない。
+
+参照MIDAS `/home/nagao/midas/midas_src/src/midas.cxx`の
+`cm_set_client_info()`は`First failed`を`(uint32_t)0`で定義する。
+`src/alarm.cxx`の`al_check()`はProgramsの各ディレクトリについて、
+`Required=false`でも`First failed`を読み、停止検出時刻を記録し、
+稼働検出時などに0へ戻す。欠損した子キーの参照は`src/odbxx.cxx`で例外となる。
+HULが任意参加・未起動でも、この監視用キーを省略できない。
+
+開発版deploy3のfevme・feeasiroc・fehul共通schemaへ
+`First failed`（UINT32 / MIDAS DWORD、1要素、初期値0）を追加した。
+既存値は監視履歴なので非ゼロを含め保持し、`MANAGED_VALUES`には含めない。
+型・要素数不一致はpreflightでODB書込み前に拒否し、自動変換・削除はしない。
+同じschemaを使うdeploy4でも欠損・型・要素数を検出する。
+3 frontendの定義はMIDAS標準9項目（Required、Watchdog timeout、Check interval、
+Start command、Auto start、Auto stop、Auto restart、Alarm class、First failed）を満たす。
+`scripts/frontend_programs.odb`の既存VME/EASIROC定義も`First failed = DWORD : 0`で整合する。
+他のProgramsの設定と全体デプロイの順序・起動復元規則は変更しない。
+
+復旧は別途承認された本番保守作業として、実DAQホストの通常シェルで行う。
+RUNをSTOPPED・遷移なしに保ち、既存のバックアップと復旧journalを保持する。
+mhttpd 8081のODBエディタ等で対象実験を確認し、`/Programs/fehul`の9項目を検査する。
+`First failed`が欠損する場合だけDWORD・1要素・0を作成する。
+既存の正常値を0へ戻したり、型・要素数不一致のキーを削除して作り直したりしない。
+不一致は現状を記録し、個別の修復方針を決めてから再開する。
+修正版を使い、上記Failure and recoveryに従って`deploy1_init.sh`を再実行し、
+deploy4と元のサービス状態の復旧を確認する。キー補完目的のfehul起動やODB全体のloadは不要。
+
+今回の作業は開発ソースとメモリ内ODBモックだけで検証する。
+空のProgramsツリーの新規作成、0/非ゼロ/UINT32最大値の保持、
+型・要素数不一致の書込み前拒否、他Programs不変、previewとsmokeの検出、
+全体デプロイの回帰を対象とする。本番8081・`/home/daq`、開発ODB、
+サービス・実機は操作せず、実ODBでの復旧・SIGABRT解消は未検証。
+
 ## ODB settings scope and comparison
 
 Steps 3 and 4 validate the existence, type, scalar/array length, and required

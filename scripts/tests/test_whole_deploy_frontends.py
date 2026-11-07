@@ -121,6 +121,129 @@ class MemoryRpc:
             raise AssertionError('Unexpected mutation ' + method)
 
 
+class ProgramsSchemaTest(unittest.TestCase):
+    names = ('fevme', 'feeasiroc', 'fehul')
+
+    def configure(self, rpc):
+        with patch.object(schema, 'require_live', lambda r: schema.require_stopped(r)):
+            schema.configure(rpc)
+
+    def test_empty_programs_create_complete_midas_records(self):
+        rpc = MemoryRpc()
+        rpc.keys.clear()
+        rpc.values.clear()
+        rpc.add('/Runinfo/State', schema.INT32, 1)
+        rpc.add('/Runinfo/Transition in progress', schema.INT32, 0)
+        # Empty mock Programs tree; these are all nine cm_set_client_info fields.
+        fields = {'Required': (schema.BOOL, None),
+                  'Watchdog timeout': (schema.INT32, 10000),
+                  'Check interval': (schema.UINT32, 180000),
+                  'Start command': (schema.STRING, None),
+                  'Auto start': (schema.BOOL, False),
+                  'Auto stop': (schema.BOOL, False),
+                  'Auto restart': (schema.BOOL, False),
+                  'Alarm class': (schema.STRING, ''),
+                  'First failed': (schema.UINT32, 0)}
+        for spec in schema.specs():
+            if any(spec[0] == '/Programs/' + name or
+                   spec[0].startswith('/Programs/' + name + '/') for name in self.names):
+                schema.ensure_key(rpc, *spec)
+        for name in self.names:
+            prefix = '/Programs/' + name
+            self.assertEqual(set(rpc.copy(prefix)) - {key for key in rpc.copy(prefix)
+                                                     if key.endswith('/key')}, set(fields))
+            for field, (tid, initial) in fields.items():
+                path = prefix + '/' + field
+                self.assertTrue(schema.inspect_key(rpc, path, tid, 0))
+                if initial is not None:
+                    self.assertEqual(rpc.value(path), initial, path)
+            self.assertEqual(rpc.value(prefix + '/Required'), name != 'fehul')
+            self.assertEqual(rpc.value(prefix + '/Start command'),
+                             str(schema.ROOT / f'scripts/start_{name}.sh'))
+
+    def test_existing_first_failed_and_other_programs_are_preserved(self):
+        for value in (0, 1770000123, 0xffffffff):
+            with self.subTest(value=value):
+                rpc = MemoryRpc()
+                for name in self.names:
+                    rpc.add(f'/Programs/{name}/First failed', schema.UINT32, value)
+                rpc.add('/Programs/site_only/First failed', schema.UINT32, 123)
+                rpc.add('/Programs/site_only/Required', schema.BOOL, True)
+                before = {path: (copy.deepcopy(key), rpc.value(path))
+                          for path, key in rpc.keys.items()
+                          if path.startswith('/Programs/') and key['type'] != schema.KEY}
+                other_programs = {name: rpc.copy('/Programs/' + name)
+                                  for name in ('fevme', 'feeasiroc', 'ana',
+                                               'ana_hist_odb_init', 'site_only')}
+                self.configure(rpc)
+                for path, data in before.items():
+                    self.assertEqual((rpc.key(path), rpc.value(path)), data, path)
+                for name, data in other_programs.items():
+                    self.assertEqual(rpc.copy('/Programs/' + name), data, name)
+                calls = copy.deepcopy(rpc.calls)
+                self.configure(rpc)
+                self.assertEqual(rpc.calls, calls)
+                for name in self.names:
+                    path = f'/Programs/{name}/First failed'
+                    self.assertNotIn(path, schema.MANAGED_VALUES)
+                    self.assertEqual(rpc.value(path), value)
+
+    def test_first_failed_type_or_count_mismatch_blocks_all_writes(self):
+        for name in self.names:
+            for tid, count in ((schema.INT32, 1), (schema.UINT64, 1),
+                               (schema.STRING, 1), (schema.BOOL, 1),
+                               (schema.UINT32, 0), (schema.UINT32, 2)):
+                with self.subTest(name=name, tid=tid, count=count):
+                    rpc = MemoryRpc()
+                    path = f'/Programs/{name}/First failed'
+                    rpc.add(path, tid, [123, 456] if count == 2 else 123, count)
+                    before = copy.deepcopy((rpc.keys, rpc.values))
+                    with self.assertRaisesRegex(RuntimeError, path):
+                        self.configure(rpc)
+                    self.assertEqual((rpc.keys, rpc.values), before)
+                    self.assertEqual(rpc.calls, [])
+
+    def test_legacy_programs_missing_first_failed_are_completed(self):
+        rpc = MemoryRpc()
+        for name in ('fevme', 'feeasiroc'):
+            path = f'/Programs/{name}/First failed'
+            del rpc.keys[path]
+            del rpc.values[path]
+        before = copy.deepcopy(rpc.values)
+        self.configure(rpc)
+        for name in self.names:
+            path = f'/Programs/{name}/First failed'
+            self.assertTrue(schema.inspect_key(rpc, path, schema.UINT32, 0))
+            self.assertEqual(rpc.value(path), 0)
+        for path, value in before.items():
+            self.assertEqual(rpc.values[path], value, path)
+
+    def test_preview_lists_missing_first_failed_without_writes(self):
+        rpc = MemoryRpc()
+        with patch.object(schema, 'require_live', lambda r: schema.require_stopped(r)):
+            plan = schema.preflight(rpc)
+        self.assertIn({'path': '/Programs/fehul/First failed', 'type': schema.UINT32,
+                       'string_length': 0, 'value': 0}, plan['fixed_additions'])
+        self.assertEqual(rpc.calls, [])
+
+    def test_configure_and_smoke_require_first_failed(self):
+        rpc = MemoryRpc()
+        self.configure(rpc)
+        path = '/Programs/fehul/First failed'
+        self.assertEqual(rpc.value(path), 0)
+        calls = copy.deepcopy(rpc.calls)
+        for replacement in (None, {'type': schema.INT32, 'num_values': 1},
+                            {'type': schema.UINT32, 'num_values': 2}):
+            with self.subTest(key=replacement):
+                if replacement is None:
+                    del rpc.keys[path]
+                else:
+                    rpc.keys[path] = replacement
+                with self.assertRaisesRegex(RuntimeError, path):
+                    schema.inspect_schema(rpc)
+                self.assertEqual(rpc.calls, calls)
+
+
 class SchemaIntegrationTest(unittest.TestCase):
     def configure(self, rpc):
         with patch.object(schema, 'require_live', lambda r: schema.require_stopped(r)):
