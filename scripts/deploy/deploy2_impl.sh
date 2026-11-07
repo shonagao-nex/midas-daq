@@ -228,7 +228,7 @@ def build_and_test():
     run("make", "-C", "hul_frontend", "check", "LDLIBS=" + hul_libs, env=env)
     run("make", "-C", "daq_monitor", "check", env=env)
     run("ctest", "--test-dir", "analyzer/build", "--output-on-failure", env=env)
-    run(sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests",
+    run(sys.executable, "-m", "unittest", "discover", "-b", "-s", "scripts/tests",
         "-p", "test_*.py", env=env)
 
 
