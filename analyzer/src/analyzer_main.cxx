@@ -109,6 +109,14 @@ class EventInspectorFactory : public TAFactory {
       TARootHelper::fgHttpServer = server;
     }
 
+    if (auto* server = TARootHelper::fgHttpServer) {
+      const std::filesystem::path assets(ANA_ROOT_WEB_ASSETS);
+      const auto online = assets / "online.htm";
+      const auto draw = assets / "draw.htm";
+      if (std::filesystem::is_regular_file(online)) server->SetDefaultPage(online.string());
+      if (std::filesystem::is_regular_file(draw)) server->SetDrawPage(draw.string());
+    }
+
     // manalyzer calls module Init() after TMFE has connected, including while
     // the run is stopped (when no TARunObject exists). This makes the initial
     // histogram configuration check observable without starting a run.

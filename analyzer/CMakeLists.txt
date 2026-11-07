@@ -71,6 +71,23 @@ target_include_directories(midas_analyzer PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/decoder"
 )
 
+# Keep the installed ROOT Web templates, inserting only the small-pad default.
+set(root_web_dir "${CMAKE_CURRENT_BINARY_DIR}/root-web")
+set(root_web_settings "${CMAKE_CURRENT_SOURCE_DIR}/web/root-web.mjs")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${root_web_settings}")
+file(READ "${root_web_settings}" root_web_setup)
+foreach(page IN ITEMS online draw)
+  set(template "${ROOT_BINDIR}/../js/files/${page}.htm")
+  if(EXISTS "${template}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${template}")
+    file(READ "${template}" html)
+    string(REPLACE "      buildGUI(" "${root_web_setup}\n      buildGUI(" configured_html "${html}")
+    if(NOT html STREQUAL configured_html)
+      file(GENERATE OUTPUT "${root_web_dir}/${page}.htm" CONTENT "${configured_html}")
+    endif()
+  endif()
+endforeach()
+target_compile_definitions(midas_analyzer PRIVATE ANA_ROOT_WEB_ASSETS="${root_web_dir}")
 target_compile_options(midas_analyzer PRIVATE
   -Wall
   -Wextra
