@@ -120,6 +120,10 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
       result.init_page_odb = true;
       continue;
     }
+    if (argument == "--init-waveform-odb") {
+      result.init_waveform_odb = true;
+      continue;
+    }
     if (argument == "--debug-events") {
       result.inspector_options.debug_events = true;
       continue;
@@ -214,8 +218,9 @@ AnalyzerCliResult ParseAnalyzerCli(const std::vector<std::string>& arguments) {
   result.inspector_options.mode =
       offline ? AnalyzerMode::kOffline : AnalyzerMode::kOnline;
 
-  if (result.init_hist_odb || result.init_page_odb) {
-    if ((result.init_hist_odb && result.init_page_odb) ||
+  if (result.init_hist_odb || result.init_page_odb || result.init_waveform_odb) {
+    if ((int(result.init_hist_odb) + int(result.init_page_odb) +
+         int(result.init_waveform_odb) > 1) ||
         !requested_input.empty() || !positional_inputs.empty() ||
         !requested_output.empty() || has_limit || has_legacy_root_output ||
         has_http_port || result.inspector_options.debug_events ||
@@ -264,6 +269,7 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "  " << program_name << " -f INPUT [offline options]\n"
        << "  " << program_name << " --init-hist-odb [connection options]\n\n"
        << "  " << program_name << " --init-page-odb [connection options]\n\n"
+       << "  " << program_name << " --init-waveform-odb [connection options]\n\n"
        << "Options:\n"
        << "  -f FILE    Input MIDAS file for offline analysis\n"
        << "  -w FILE    Offline ROOT output filename\n"
@@ -279,6 +285,9 @@ std::string AnalyzerHelp(const std::string& program_name) {
        << "  --init-page-odb\n"
        << "      Create four default Online Pages in MIDAS ODB and exit.\n"
        << "      Existing /Analyzer/Pages is never overwritten.\n\n"
+       << "  --init-waveform-odb\n"
+       << "      Add 8 V1720E waveforms and a 3x3 page to initialized ODB.\n"
+       << "      Refuses existing FADC0 or V1720E_Waveforms; no overwrites.\n\n"
        << "Online defaults:\n"
        << "  No -f selects live MIDAS mode and enables ROOT THttpServer on "
           "0.0.0.0:8082. No ROOT file is created.\n"

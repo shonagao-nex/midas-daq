@@ -6,6 +6,7 @@
 #include "TDirectory.h"
 #include "TFile.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -86,6 +87,7 @@ PageManager& EventInspector::Pages() {
 void EventInspector::BeginRun(TARunInfo* runinfo) {
   diagnostics_.Reset();
   decoded_events_ = 0;
+  fadc_events_ = 0;
   decoded_limit_reached_ = false;
   builder_.Clear();
   monitor_pending_ = false;
@@ -97,7 +99,10 @@ void EventInspector::BeginRun(TARunInfo* runinfo) {
     std::printf("EventBuilder expected sources: %s\n",
                 ExpectedSourcesName(expected_sources));
   }
-  if (online) histogram_prescale_.BeginRun(runinfo->fOdb);
+  if (online) {
+    histogram_prescale_.BeginRun(runinfo->fOdb);
+    waveform_prescale_.BeginRun(runinfo->fOdb);
+  }
   auto histogram_configs = online
                                ? histogram_config_loader_.Load(runinfo->fOdb)
                                : HistogramConfigLoader::Result{
@@ -148,8 +153,16 @@ void EventInspector::ConsumeDecodedEvent(const DecodedEvent& event) {
     return;
   ++decoded_events_;
   if (tree_writer_) tree_writer_->Fill(event);
-  if (histogram_prescale_.ShouldFill(options_.mode, decoded_events_))
-    Histograms().Fill(event);
+  const bool fill_histograms =
+      histogram_prescale_.ShouldFill(options_.mode, decoded_events_);
+  const auto& channels = event.v1720.fadc0;
+  const bool has_waveform = options_.mode == AnalyzerMode::kOnline &&
+      std::any_of(channels.begin(), channels.end(),
+                  [](const auto& samples) { return !samples.empty(); });
+  const bool fill_waveforms = has_waveform &&
+      waveform_prescale_.ShouldFill(options_.mode, ++fadc_events_);
+  if (fill_histograms || fill_waveforms)
+    Histograms().Fill(event, fill_histograms, fill_waveforms);
   if (options_.decoded_event_limit > 0 &&
       decoded_events_ >= options_.decoded_event_limit)
     decoded_limit_reached_ = true;
@@ -161,6 +174,7 @@ void EventInspector::PollOnlineControls(TARunInfo* runinfo) {
   next_online_poll_ = now + std::chrono::seconds(1);
 
   histogram_prescale_.Poll(runinfo->fOdb);
+  waveform_prescale_.Poll(runinfo->fOdb);
 
   auto loaded = histogram_config_loader_.Load(runinfo->fOdb);
   const bool histogram_changed =

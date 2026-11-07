@@ -11,24 +11,26 @@ namespace ana {
 
 class OnlineHistogramPrescale {
  public:
-  static constexpr const char* kOdbPath = "/Analyzer/OnlineHistogram/FillPrescale";
+  enum class Kind { kHistogram, kWaveform };
 
-  // Called only after an online MIDAS connection exists. Existing values are
-  // read without modification; a missing integer key is created with value 1.
-  static bool EnsureOdb(MVOdb* odb);
+  explicit OnlineHistogramPrescale(Kind kind = Kind::kHistogram);
+
+  // Create the selected key with its default when absent.
+  static bool EnsureOdb(MVOdb* odb, Kind kind = Kind::kHistogram);
 
   void BeginRun(MVOdb* odb);
   void Poll(MVOdb* odb);
 
-  // decoded_event_count is the one-based count at ConsumeDecodedEvent.
-  bool ShouldFill(AnalyzerMode mode, std::size_t decoded_event_count) const;
+  // One-based count of events eligible for this kind of plot.
+  bool ShouldFill(AnalyzerMode mode, std::size_t event_count) const;
   int EffectiveValue() const { return effective_value_; }
 
  private:
   void Read(MVOdb* odb, bool announce);
   void Apply(int requested, bool announce);
 
-  int effective_value_ = 1;
+  Kind kind_;
+  int effective_value_;
   bool warned_invalid_ = false;
   bool warned_read_error_ = false;
 };

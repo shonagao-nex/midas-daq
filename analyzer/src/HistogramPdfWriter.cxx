@@ -4,6 +4,7 @@
 
 #include "TCanvas.h"
 #include "TH1.h"
+#include "TMultiGraph.h"
 #include "TLatex.h"
 
 #include <cstdio>
@@ -59,8 +60,17 @@ bool HistogramPdfWriter::Write(const HistogramManager& manager,
     canvas.Clear();
     const std::string title = "Run " + std::to_string(run_number) + " - " +
                               histogram->GetName();
-    histogram->SetTitle(title.c_str());
-    histogram->Draw("HIST");
+    if (auto* history = dynamic_cast<TMultiGraph*>(histogram.get())) {
+      // Keep the axis labels embedded in the multigraph title.
+      const std::string old_title = history->GetTitle();
+      const auto axes = old_title.find(';');
+      const auto axis_titles = axes == std::string::npos ? "" : old_title.substr(axes);
+      history->SetTitle((title + axis_titles).c_str());
+      history->Draw("AL");
+    } else {
+      histogram->SetTitle(title.c_str());
+      histogram->Draw("HIST");
+    }
 
     TLatex label;
     label.SetNDC(true);

@@ -14,6 +14,7 @@ struct AnalyzerCliResult {
   bool show_help = false;
   bool init_hist_odb = false;
   bool init_page_odb = false;
+  bool init_waveform_odb = false;
   int root_web_port = 0;  // Online only; zero means no ROOT HTTP server.
   EventInspectorOptions inspector_options;
   std::vector<std::string> manalyzer_arguments;

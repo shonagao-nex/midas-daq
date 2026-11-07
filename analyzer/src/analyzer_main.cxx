@@ -46,6 +46,17 @@ int InitializeOdb(const ana::AnalyzerCliResult& options) {
   }
 
   std::unique_ptr<MVOdb> odb(MakeMidasOdb(database));
+  if (options.init_waveform_odb) {
+    std::string error;
+    const bool okay = ana::InitializeWaveformOdb(odb.get(), &error);
+    odb.reset();
+    const int disconnected = cm_disconnect_experiment();
+    if (!okay) std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+    if (disconnected != CM_SUCCESS)
+      std::fprintf(stderr, "ERROR: MIDAS disconnect failed (%d)\n", disconnected);
+    if (okay) std::printf("Created 8 FADC0 waveforms and Pages/V1720E_Waveforms\n");
+    return okay && disconnected == CM_SUCCESS ? 0 : 1;
+  }
   const bool page_initialization = options.init_page_odb;
   const bool pages_created =
       page_initialization && ana::PageConfigLoader{}.CreateDefaults(odb.get());
@@ -123,11 +134,11 @@ class EventInspectorFactory : public TAFactory {
     TMFE* mfe = TMFE::Instance();
     if (!prescale_odb_checked_ && mfe && mfe->fOdbRoot) {
       prescale_odb_checked_ = true;
-      if (!ana::OnlineHistogramPrescale::EnsureOdb(mfe->fOdbRoot))
-        std::fprintf(stderr,
-                     "WARNING: cannot initialize %s; online histogram "
-                     "fill will use 1 until the key is available\n",
-                     ana::OnlineHistogramPrescale::kOdbPath);
+      using Prescale = ana::OnlineHistogramPrescale;
+      if (!Prescale::EnsureOdb(mfe->fOdbRoot))
+        std::fprintf(stderr, "WARNING: cannot initialize FillPrescale; using 1\n");
+      if (!Prescale::EnsureOdb(mfe->fOdbRoot, Prescale::Kind::kWaveform))
+        std::fprintf(stderr, "WARNING: cannot initialize WaveformPrescale; using 200\n");
     }
     if (!pdf_watch_active_ && mfe && mfe->fOdbRoot) {
       HNDLE database = 0;
@@ -218,7 +229,7 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
-  if (parsed.init_hist_odb || parsed.init_page_odb)
+  if (parsed.init_hist_odb || parsed.init_page_odb || parsed.init_waveform_odb)
     return InitializeOdb(parsed);
 
   if (parsed.inspector_options.mode == ana::AnalyzerMode::kOffline &&

@@ -5,6 +5,9 @@
 #include "TCanvas.h"
 #include "TDirectory.h"
 #include "TH1.h"
+#include "TGraph.h"
+#include "TList.h"
+#include "TMultiGraph.h"
 #include "TMemFile.h"
 
 #include <cstdio>
@@ -137,6 +140,25 @@ int main() {
   okay &= Check(pages.Rebuild(&histograms), "rebuild after histogram deletion");
   pages.Clear();
   histograms.EndRun();
+  histograms.SetConfigs(ana::DefaultWaveformConfigs());
+  histograms.BeginRun(&output, false);
+  pages.BeginRun(&output, &histograms);
+  pages.ApplyConfigs({{"Waveforms", 3, 3, {"FADC0/h_fadc0_ch00"}}}, &histograms);
+  auto* waveform_canvas = dynamic_cast<TCanvas*>(
+      output.GetDirectory("Pages")->Get("Waveforms"));
+  auto* waveform_pad = waveform_canvas ? waveform_canvas->GetPad(1) : nullptr;
+  auto* history = dynamic_cast<TMultiGraph*>(histograms.FindPlot("FADC0/h_fadc0_ch00"));
+  ana::DecodedEvent waveform_event;
+  waveform_event.v1720.fadc0[0] = {100, 200};
+  histograms.Fill(waveform_event);
+  auto* trace = history ? static_cast<TGraph*>(history->GetListOfGraphs()->Last()) : nullptr;
+  okay &= Check(waveform_pad && history && trace &&
+                    waveform_pad->GetListOfPrimitives()->FindObject(history) &&
+                    trace->GetPointY(1) == 200,
+                "page holds the same multigraph as live updates");
+  pages.Clear();
+  histograms.EndRun();
+
   if (!okay) return 1;
   std::printf("PageManager tests passed\n");
   return 0;

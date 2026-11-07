@@ -19,6 +19,8 @@ struct HistogramOdbInitializationResult {
 };
 
 HistogramOdbInitializationResult InitializeHistogramOdb(MVOdb* odb);
+// Requires existing Histograms and Pages; never overwrites either target.
+bool InitializeWaveformOdb(MVOdb* odb, std::string* error);
 
 }  // namespace ana
 

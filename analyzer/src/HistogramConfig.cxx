@@ -3,6 +3,7 @@
 #include "ExpressionResolver.h"
 
 #include <cstdio>
+#include <cmath>
 #include <set>
 #include <string>
 #include <utility>
@@ -99,7 +100,7 @@ HistogramConfigValidationResult ValidateHistogramConfigs(
       ++result.skipped;
       continue;
     }
-    if (config.type != "TH1D") {
+    if (config.type != "TH1D" && config.type != "Waveform") {
       std::fprintf(stderr,
                    "WARNING: histogram \"%s\" skipped: unsupported Type "
                    "\"%s\"\n",
@@ -115,23 +116,9 @@ HistogramConfigValidationResult ValidateHistogramConfigs(
       ++result.skipped;
       continue;
     }
-    if (config.bins <= 0) {
-      std::fprintf(stderr,
-                   "WARNING: histogram \"%s\" skipped: Bins must be > 0\n",
-                   config.hist_name.c_str());
-      ++result.skipped;
-      continue;
-    }
-    if (!(config.min < config.max)) {
-      std::fprintf(stderr,
-                   "WARNING: histogram \"%s\" skipped: Min must be less "
-                   "than Max\n",
-                   config.hist_name.c_str());
-      ++result.skipped;
-      continue;
-    }
-
-    const ParsedExpression expression = resolver.Parse(config.expression);
+    const ParsedExpression expression = config.type == "Waveform"
+        ? resolver.ParseWaveform(config.expression)
+        : resolver.Parse(config.expression);
     if (!expression.IsValid()) {
       std::fprintf(stderr,
                    "WARNING: histogram \"%s\" skipped: invalid Expression "
@@ -142,10 +129,55 @@ HistogramConfigValidationResult ValidateHistogramConfigs(
       continue;
     }
 
+    const bool hit_counts = expression.kind == VariableKind::kHitChannels;
+    if (!hit_counts && config.bins <= 0) {
+      std::fprintf(stderr,
+                   "WARNING: histogram \"%s\" skipped: Bins must be > 0\n",
+                   config.hist_name.c_str());
+      ++result.skipped;
+      continue;
+    }
+    if (!hit_counts && !(config.min < config.max)) {
+      std::fprintf(stderr,
+                   "WARNING: histogram \"%s\" skipped: Min must be less "
+                   "than Max\n",
+                   config.hist_name.c_str());
+      ++result.skipped;
+      continue;
+    }
+
+    if (config.type == "Waveform" &&
+        (!std::isfinite(config.min) || !std::isfinite(config.max) ||
+         config.min < -0.5 || config.max > 10000000.5 ||
+         std::floor(config.min + 0.5) != config.min + 0.5 ||
+         config.max - config.min != config.bins)) {
+      std::fprintf(stderr,
+                   "WARNING: waveform %s requires one bin per sample, "
+                   "with half-integer edges (e.g. -0.5 .. 255.5)\n",
+                   config.hist_name.c_str());
+      ++result.skipped;
+      continue;
+    }
+
+
     result.configs.push_back(config);
   }
 
   return result;
+}
+
+std::vector<HistogramConfig> DefaultWaveformConfigs() {
+  std::vector<HistogramConfig> configs;
+  for (int channel = 0; channel < 8; ++channel) {
+    char name[64], expression[32], title[64], slot[16];
+    std::snprintf(name, sizeof(name), "h_fadc0_ch%02d", channel);
+    std::snprintf(expression, sizeof(expression), "fadc0[%d]", channel);
+    std::snprintf(title, sizeof(title), "V1720E waveform Ch.%d", channel);
+    std::snprintf(slot, sizeof(slot), "Ch%02d", channel);
+    configs.push_back({name, "Waveform", expression, 256, -0.5, 255.5, "",
+                       true, title, "Sample index", "ADC value", "FADC0", slot});
+  }
+  return configs;
 }
 
 }  // namespace ana

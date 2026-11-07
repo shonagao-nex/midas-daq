@@ -68,11 +68,16 @@ bool PageManager::BuildCanvas(const PageConfig& config,
     TPad* pad = dynamic_cast<TPad*>(canvas->cd(static_cast<int>(index + 1)));
     if (!pad) continue;
     pad->Clear();
+    if (wide_page) {
+      pad->SetLeftMargin(0.16);
+      pad->SetBottomMargin(0.17);
+    }
     if (index >= config.pads.size() || config.pads[index].empty()) continue;
-    TH1* histogram = histograms
-                         ? histograms->FindHistogram(config.pads[index])
-                         : nullptr;
-    if (histogram) histogram->Draw();
+    auto* plot = histograms ? histograms->FindPlot(config.pads[index]) : nullptr;
+    if (auto* histogram = dynamic_cast<TH1*>(plot))
+      histogram->Draw(histogram->GetOption());
+    else if (plot)
+      plot->Draw("AL");
   }
   canvas->Modified();
   canvas->Update();

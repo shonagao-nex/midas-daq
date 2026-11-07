@@ -158,6 +158,7 @@ target_link_libraries(histogram_manager_test PRIVATE
   ROOT::Core
   ROOT::RIO
   ROOT::Hist
+  ROOT::Graf
 )
 add_test(NAME histogram_manager_test COMMAND histogram_manager_test)
 

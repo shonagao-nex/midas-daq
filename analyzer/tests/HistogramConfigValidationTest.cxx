@@ -61,6 +61,31 @@ int main() {
                     !result.configs[1].enabled,
                 "disabled valid config should be retained");
 
+  auto waves = ana::DefaultWaveformConfigs();
+  okay &= Check(ana::ValidateHistogramConfigs(waves).skipped == 0,
+                "eight waveform defaults validate");
+  const std::vector<std::string> bad_wave_expressions{
+      "fadc0[8]", "qdc0[0]", "fadc0[0][0]", "fadc0[-1]", "fadc0[0]junk"};
+  for (const auto& text : bad_wave_expressions) {
+    auto bad = waves.front();
+    bad.expression = text;
+    okay &= Check(ana::ValidateHistogramConfigs({bad}).skipped == 1,
+                  "waveform rejects invalid channel or scalar expression");
+  }
+  auto bad_wave = waves.front();
+  bad_wave.bins = 128;
+  okay &= Check(ana::ValidateHistogramConfigs({bad_wave}).skipped == 1,
+                "waveform rejects rebinning that would merge samples");
+  bad_wave = waves.front();
+  bad_wave.min = 0;
+  bad_wave.max = 256;
+  okay &= Check(ana::ValidateHistogramConfigs({bad_wave}).skipped == 1,
+                "waveform requires sample-centered bins");
+  auto scalar_wave = waves.front();
+  scalar_wave.type = "TH1D";
+  okay &= Check(ana::ValidateHistogramConfigs({scalar_wave}).skipped == 1,
+                "ordinary TH1D cannot take a whole waveform expression");
+
   if (!okay) return 1;
   std::printf("HistogramConfig validation tests passed\n");
   return 0;

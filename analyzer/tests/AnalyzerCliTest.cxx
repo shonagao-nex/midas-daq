@@ -169,6 +169,21 @@ int main() {
       ana::ParseAnalyzerCli({"midas_analyzer", "--mt"});
   okay &= Check(!multithread.okay, "--mt should be rejected");
 
+  const auto wave_init = ana::ParseAnalyzerCli(
+      {"midas_analyzer", "--init-waveform-odb", "-Edaq-dev"});
+  okay &= Check(wave_init.okay && wave_init.init_waveform_odb &&
+                    wave_init.midas_experiment == "daq-dev" &&
+                    wave_init.root_web_port == 0,
+                "waveform management mode does not start event loop or ROOT server");
+  for (const auto& incompatible : std::vector<std::vector<std::string>>{
+           {"-R8182"}, {"-f", "run.mid"}, {"--init-page-odb"},
+           {"--init-hist-odb"}, {"-n", "1"}, {"--debug-events"}}) {
+    std::vector<std::string> args{"midas_analyzer", "--init-waveform-odb"};
+    args.insert(args.end(), incompatible.begin(), incompatible.end());
+    okay &= Check(!ana::ParseAnalyzerCli(args).okay,
+                  "waveform initialization rejects analysis and other management modes");
+  }
+
   if (!okay) return 1;
   std::printf("Analyzer CLI tests passed\n");
   return 0;

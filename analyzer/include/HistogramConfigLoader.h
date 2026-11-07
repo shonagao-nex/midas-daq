@@ -24,6 +24,7 @@ class HistogramConfigLoader {
   // Reserved for a future explicit administrative initialization action.
   // Normal online startup and live reload do not call this method.
   bool CreateDefaults(MVOdb* odb) const;
+  bool CreateWaveformDefaults(MVOdb* odb) const;
 
   static constexpr const char* kOdbPath = "/Analyzer/Histograms";
 };

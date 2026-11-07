@@ -259,7 +259,7 @@ ODB path or use an ODB API. Channel index 0 is the first element of each array:
 The fields mean:
 
 - `HistName`: ROOT object name at each channel index.
-- `Type`: histogram class; currently only `TH1D` is supported.
+- `Type`: `TH1D` for a value distribution, or `Waveform` for the latest V1720E trace.
 - `Expression`: one supported `DecodedEvent` value to fill.
 - `Bins`, `Min`, `Max`: axis bin count and limits (`Bins > 0`, `Min < Max`).
 - `Cut`: selection expression; currently only the empty string is supported.
@@ -272,8 +272,9 @@ and `ETTR0` (64). Every slot is created by the shared
 `DefaultHistogramConfigs()` generator. All slots are enabled by default for
 new ODB initialization; an existing ODB tree retains its current values.
 TLE/TTR and ETLE/ETTR defaults use the first hit (`[0]`). FADC waveform data
-is still decoded and written to the offline ROOT tree, but the default
-histogram configuration no longer includes FADC0. The Event group has 400
+is decoded and written to the offline ROOT tree. The ordinary default
+histogram configuration does not include FADC0; add the optional latest-waveform
+definitions using `--init-waveform-odb` as described below. The Event group has 400
 bins from 0 to 400; the other groups have 512 bins, with their existing axis
 limits. Existing ODB groups, including FADC0, are still loaded as configured
 until an operator updates them.
@@ -306,6 +307,22 @@ example `Histograms/QDC0/h_qdc0_ch05`. Disabled slots have no ROOT object;
 enabling a slot books and fills it, including during live reload. The ROOT web
 server is the standard THttpServer. When `/Analyzer/Pages` is absent, four
 standard canvases are provided from in-memory page defaults.
+
+### TDC hit counts by channel
+
+For a `TH1D`, `Expression = "hit_channels(tdc0[1], tdc0[5], tle0[3])"`
+creates a labeled bin for each channel, from left to right in expression order.
+`tdc0[ch]` selects V775; `tle0[ch]` and `ttr0[ch]` select V1190 leading and
+trailing edges; `etle0[ch]` and `ettr0[ch]` select EASIROC leading and trailing
+edges. Use one channel index per argument. Mixed sources are labeled by source
+and channel. Duplicate channels and out-of-range indices are rejected.
+
+Each channel contributes one count per selected event if any decoded TDC value
+for that channel is strictly positive. Missing values and zero are excluded.
+The bin count and axis labels come from the expression. Keep the ODB `Bins`,
+`Min`, and `Max` fields for schema compatibility. `FillPrescale` applies as for
+other `TH1D` plots. Set the ODB `Expression` string size large enough for the full
+list; the development example for V775 ch0 through ch15 uses 4096 bytes.
 
 ## ROOT Web pages
 
@@ -351,6 +368,58 @@ EOR clears pending builder state but retains the final histogram and Page
 objects. The
 standard mhttpd ODB editor can be used to edit the schema; there is no custom
 HTML page.
+
+## V1720E waveform history
+
+Optional `Type = "Waveform"` definitions display ADC versus zero-based sample
+index. A `TMultiGraph` overlays the last 20 received `TGraph` traces for each
+channel in ROOT Web, Pages, and PDF export. The newest trace is dark and thick,
+and older traces are progressively lighter. When full, the oldest graph is
+reused for the new trace. `Expression = "fadc0[ch]"` selects one of the eight
+channels (0..7). The `TH1D` expression `fadc0[ch][sample]` still fills a
+histogram of one sample's ADC values.
+
+To add all eight definitions and a 3x3 page to an existing initialized ODB,
+run on the actual DAQ host with the development experiment selected:
+
+```sh
+MIDAS_EXPTAB=/home/nagao/midas/midas/exptab \
+MIDAS_EXPT_NAME=daq-dev \
+./bin/midas_analyzer --init-waveform-odb -Edaq-dev
+```
+
+This explicit command adds `/Analyzer/Histograms/FADC0` and
+`/Analyzer/Pages/V1720E_Waveforms`, reads them back, and exits without starting
+a ROOT server or subscribing to events. It requires existing Histograms and
+Pages directories, checks histogram name collisions, and refuses to write if
+either target already exists. Existing settings and pages are preserved.
+For a fresh ODB, run `--init-hist-odb` and `--init-page-odb` first. Normal
+startup and polling never add waveform definitions automatically.
+
+The eight `FADC0` array entries use names `h_fadc0_ch00` .. `h_fadc0_ch07`.
+Defaults show 256 samples, matching the current frontend record length:
+`Bins = 256`, `Min = -0.5`, `Max = 255.5`. Bin centers are the integer sample
+indices, starting at zero. To show samples 64..127, set `Bins = 64`,
+`Min = 63.5`, `Max = 127.5`. Waveforms require one bin per sample and
+half-integer edges; they cannot be rebinned to merge samples. Samples outside
+the configured window are omitted. Y is fixed to 0..4096 ADC, statistics are
+hidden, and points are connected by a line. X uses sample indices. A shorter
+trace contains only its received samples. A missing or empty channel keeps its
+own history and receives no new trace for that event.
+
+ROOT Web exposes the traces below `manalyzer/Histograms/FADC0` and the canvas
+below `manalyzer/Pages/V1720E_Waveforms`. Custom detector pages can refer to
+`FADC0/h_fadc0_ch00` etc. Enable ROOT Web monitoring/auto-refresh to see updates.
+`/Analyzer/OnlineHistogram/WaveformPrescale` is an integer created at online
+startup with default `200`. For each run, the first decoded event with FADC
+samples is selected, then every 200th FADC event (1, 201, 401, ...). Changing
+this value in ODB takes effect at the next online controls poll. Missing or
+invalid values use 200. Ordinary histograms use their own `FillPrescale`.
+The history is per channel, so slots can refer to different event numbers if
+channels were missing. STOP retains the history, and BOR clears it.
+On an existing stopped analyzer, restart only the development analyzer after
+building to load the new implementation and ODB definitions. It is not necessary
+to start a DAQ run to publish the empty page. Hardware readout is unchanged.
 
 ## Online histogram fill prescale
 

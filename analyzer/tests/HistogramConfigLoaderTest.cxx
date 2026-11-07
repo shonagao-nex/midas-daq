@@ -104,7 +104,7 @@ class TrackingOdb final : public MVOdb {
   bool IsReadOnly() const override { return false; }
 
   MVOdb* Chdir(const char* path, bool create, MVOdbError* error) override {
-    SetOk(error);
+    // Match MidasOdb: successful Chdir does not clear a previous error.
     if (create) ++state_->create_operations;
     Node* current = node_;
     std::string remaining = path ? path : "";
@@ -115,7 +115,10 @@ class TrackingOdb final : public MVOdb {
       if (!part.empty()) {
         auto found = current->children.find(part);
         if (found == current->children.end()) {
-          if (!create) return nullptr;
+          if (!create) {
+            if (error) error->fError = true;
+            return nullptr;
+          }
           found = current->children
                       .emplace(part, std::make_unique<Node>())
                       .first;
@@ -550,6 +553,32 @@ int main() {
                     selected(ana::AnalyzerMode::kOnline) == 17426,
                 "live 10-to-1 update should restore full histogram fill");
 
+  using Prescale = ana::OnlineHistogramPrescale;
+  okay &= Check(Prescale::EnsureOdb(&prescale_odb, Prescale::Kind::kWaveform),
+                "startup creates a separate waveform key");
+  Prescale waveform_prescale(Prescale::Kind::kWaveform);
+  waveform_prescale.BeginRun(&prescale_odb);
+  const auto online = ana::AnalyzerMode::kOnline;
+  okay &= Check(waveform_prescale.EffectiveValue() == 200 &&
+                    waveform_prescale.ShouldFill(online, 1) &&
+                    !waveform_prescale.ShouldFill(online, 200) &&
+                    waveform_prescale.ShouldFill(online, 201) &&
+                    prescale.ShouldFill(online, 200),
+                "default waveform factor selects events 1, 201, ... independently");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "WaveformPrescale", 40);
+  const int prescale_writes = prescale_odb.WriteOperations();
+  okay &= Check(Prescale::EnsureOdb(&prescale_odb, Prescale::Kind::kWaveform) &&
+                    prescale_odb.WriteOperations() == prescale_writes,
+                "startup preserves the configured waveform factor");
+  waveform_prescale.Poll(&prescale_odb);
+  okay &= Check(waveform_prescale.EffectiveValue() == 40 &&
+                    waveform_prescale.ShouldFill(online, 41),
+                "waveform factor can be changed at runtime");
+  prescale_odb.SetInteger("Analyzer/OnlineHistogram", "WaveformPrescale", 0);
+  waveform_prescale.Poll(&prescale_odb);
+  okay &= Check(waveform_prescale.EffectiveValue() == 200,
+                "invalid waveform factor falls back to 200");
+
   ana::PageConfigLoader page_loader;
   TrackingOdb page_odb;
   const auto page_fallback = page_loader.Load(&page_odb);
@@ -580,6 +609,45 @@ int main() {
                     page_loader.Load(&page_odb).pages ==
                         initialized_pages.pages,
                 "existing page tree must reject initialization without writes");
+
+  TrackingOdb waveform_odb;
+  std::string waveform_error;
+  okay &= Check(!ana::InitializeWaveformOdb(&waveform_odb, &waveform_error) &&
+                    waveform_odb.CreateOperations() == 0 &&
+                    waveform_odb.WriteOperations() == 0,
+                "waveform initialization requires existing trees without writes");
+  waveform_odb.AddHistogram(first);
+  page_loader.CreateDefaults(&waveform_odb);
+  const auto old_histograms = loader.Load(&waveform_odb).configs;
+  const auto old_pages = page_loader.Load(&waveform_odb).pages;
+  okay &= Check(ana::InitializeWaveformOdb(&waveform_odb, &waveform_error),
+                "explicit waveform initialization succeeds with existing user settings");
+  const auto with_waveforms = loader.Load(&waveform_odb).configs;
+  const auto with_wave_pages = page_loader.Load(&waveform_odb).pages;
+  okay &= Check(with_waveforms.size() == old_histograms.size() + 8 &&
+                    with_wave_pages.size() == old_pages.size() + 1,
+                "adds eight channels and one page");
+  for (const auto& c : old_histograms)
+    okay &= Check(std::find(with_waveforms.begin(), with_waveforms.end(), c) !=
+                      with_waveforms.end(), "preserves existing histograms");
+  for (const auto& p : old_pages)
+    okay &= Check(std::find(with_wave_pages.begin(), with_wave_pages.end(), p) !=
+                      with_wave_pages.end(), "preserves existing pages");
+  const int writes_before_repeat = waveform_odb.WriteOperations();
+  const int creates_before_repeat = waveform_odb.CreateOperations();
+  okay &= Check(!ana::InitializeWaveformOdb(&waveform_odb, &waveform_error) &&
+                    waveform_odb.WriteOperations() == writes_before_repeat &&
+                    waveform_odb.CreateOperations() == creates_before_repeat,
+                "repeat initialization refuses without any writes");
+  TrackingOdb collision_odb;
+  auto collision = first;
+  collision.hist_name = "h_fadc0_ch00";
+  collision_odb.AddHistogram(collision);
+  page_loader.CreateDefaults(&collision_odb);
+  const int before_collision = collision_odb.WriteOperations();
+  okay &= Check(!ana::InitializeWaveformOdb(&collision_odb, &waveform_error) &&
+                    collision_odb.WriteOperations() == before_collision,
+                "name collision is rejected before writing either target");
 
   if (!okay) return 1;
   std::printf("HistogramConfigLoader tests passed\n");

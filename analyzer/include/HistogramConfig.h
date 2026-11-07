@@ -32,6 +32,7 @@ struct HistogramConfigValidationResult {
 };
 
 std::vector<HistogramConfig> DefaultHistogramConfigs();
+std::vector<HistogramConfig> DefaultWaveformConfigs();
 
 HistogramConfigValidationResult ValidateHistogramConfigs(
     const std::vector<HistogramConfig>& configs);

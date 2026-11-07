@@ -21,7 +21,7 @@ bool Check(bool condition, const std::string& message) {
 }  // namespace
 
 int main() {
-  const std::vector<ana::HistogramConfig> configs{
+  std::vector<ana::HistogramConfig> configs{
       {"filled", "TH1D", "event", 10, 0.0, 10.0, "", true, "Filled",
        "Event", "Counts", "Event", "Ch00"},
       {"empty", "TH1D", "qdc0[0]", 10, 0.0, 10.0, "", true, "Empty",
@@ -30,15 +30,19 @@ int main() {
        "Disabled", "Event", "Counts", "Event", "Ch01"},
   };
 
+  configs.push_back(ana::DefaultWaveformConfigs().front());
+
   TMemFile parent("histogram_pdf_writer_test.root", "RECREATE");
   ana::HistogramManager manager(configs);
   bool okay = Check(manager.BeginRun(&parent, false),
                     "histograms should book for PDF test");
   ana::DecodedEvent event;
   event.counters.event = 5;
+  event.v1720.fadc0[0] = {500, 1200, 600};
   manager.Fill(event);
 
-  constexpr const char* output = "/tmp/histogram_pdf_writer_test.pdf";
+  const auto output = (std::filesystem::current_path() /
+                       "histogram_pdf_writer_test.pdf").string();
   ana::HistogramPdfWriter writer;
   std::string error;
   okay &= Check(writer.Write(manager, 62, output, &error),
@@ -54,11 +58,12 @@ int main() {
                 "output should have a PDF header");
   okay &= Check(contents.find("%%EOF") != std::string::npos,
                 "multipage PDF should be closed");
-  okay &= Check(manager.ActiveCount() == 2,
-                "disabled histogram should not be exported");
+  okay &= Check(manager.ActiveCount() == 3 &&
+                    contents.find("/Count 3") != std::string::npos,
+                "PDF contains both enabled histograms and the waveform page");
   manager.EndRun();
 
   if (!okay) return 1;
-  std::printf("HistogramPdfWriter tests passed: 2 enabled pages\n");
+  std::printf("HistogramPdfWriter tests passed: 3 enabled pages\n");
   return 0;
 }

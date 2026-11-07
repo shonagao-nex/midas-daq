@@ -172,4 +172,18 @@ bool HistogramConfigLoader::CreateDefaults(MVOdb* odb) const {
   }
   return true;
 }
+bool HistogramConfigLoader::CreateWaveformDefaults(MVOdb* odb) const {
+  if (!odb || odb->IsReadOnly()) return false;
+  auto directory = FindDirectory(odb);
+  if (!directory) return false;
+  MVOdbError error;
+  OdbPtr existing(directory->Chdir("FADC0", false, &error));
+  if (existing) return false;
+  Arrays arrays;
+  for (const auto& config : DefaultWaveformConfigs()) arrays.Add(config);
+  error = MVOdbError{};
+  OdbPtr group(directory->Chdir("FADC0", true, &error));
+  return group && !error.fError && WriteGroup(group.get(), arrays);
+}
+
 }  // namespace ana

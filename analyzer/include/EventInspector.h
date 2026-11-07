@@ -42,6 +42,8 @@ class EventInspector : public TARunObject {
   bool decoded_limit_reached_ = false;
   bool monitor_pending_ = false;
   OnlineHistogramPrescale histogram_prescale_;
+  OnlineHistogramPrescale waveform_prescale_{OnlineHistogramPrescale::Kind::kWaveform};
+  std::size_t fadc_events_ = 0;
   std::unique_ptr<RootTreeWriter> tree_writer_;
   OnlineHistogramState* online_state_ = nullptr;  // Factory-owned; online only.
   HistogramConfigLoader histogram_config_loader_;

@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace ana {
 
@@ -26,13 +27,23 @@ enum class VariableKind {
   kEtle0,
   kEttr0,
   kFadc0,
+  kHitChannels,
 };
+
+struct TdcChannel {
+  VariableKind kind;
+  std::size_t channel;
+  std::string label;
+};
+
+bool HasPositiveHit(const TdcChannel& channel, const DecodedEvent& event);
 
 struct ParsedExpression {
   VariableKind kind = VariableKind::kInvalid;
   std::size_t channel = 0;
   std::size_t subindex = 0;
   std::string error;
+  std::vector<TdcChannel> hit_channels{};
 
   bool IsValid() const { return kind != VariableKind::kInvalid; }
 };
@@ -45,6 +56,7 @@ struct ResolveResult {
 class ExpressionResolver {
  public:
   ParsedExpression Parse(const std::string& expression) const;
+  ParsedExpression ParseWaveform(const std::string& expression) const;
   ResolveResult Resolve(const ParsedExpression& expression,
                         const DecodedEvent& event) const;
   ResolveResult Resolve(const std::string& expression,
