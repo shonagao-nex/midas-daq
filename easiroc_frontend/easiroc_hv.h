@@ -6,7 +6,7 @@
 namespace easiroc::hv {
 constexpr double kMaxVoltage = 62;
 constexpr double kDefaultCurrentLimitUa = 20;
-constexpr double kNearZeroVoltage = 1;
+constexpr double kNearZeroVoltage = 5;
 // Normal descent only; Enable and unknown-setpoint admission stay at 1 V.
 constexpr double kNormalDownTolerance = 5;
 constexpr double kMaxCurrentUa = 0.0364 * 65535;
