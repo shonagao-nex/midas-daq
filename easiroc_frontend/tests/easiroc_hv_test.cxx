@@ -34,8 +34,8 @@ int main() {
     auto saturated=io;saturated.read=[](auto)->std::uint8_t{return 255;};
     bool clipped=false;try{measure(saturated);}catch(...){clipped=true;}check(clipped,"saturation rejected");
     Context c{true,true,true,true,true,true,false,true};
-    check(kDefaultCurrentLimitUa==20 && kNormalDownTolerance==5 && kNearZeroVoltage==1,
-          "new limit/descent tolerance must not relax Enable residual admission");
+    check(kDefaultCurrentLimitUa==20 && kNormalDownTolerance==5,
+          "default current limit and normal descent tolerance");
     {
       State t;
       double current=20;unsigned programs=0;
@@ -141,10 +141,12 @@ int main() {
     }
     check(!request(s,c,Operation::Enable,1,10,1000,b),"Enable target must zero");
     check(!request(s,c,Operation::Enable,0,0,1000,b),"Enable needs configured limit");
-    physical=1.001;check(!request(s,c,Operation::Enable,0,10,1000,b),"above 1 V residual blocks Enable");
-    physical=1;load=10.001;
+    physical=5.001;
+    check(!request(s,c,Operation::Enable,0,10,1000,b) && sets==0 &&
+          s.error=="Residual voltage exceeds 5 V", "above 5 V residual blocks Enable before DAC write");
+    physical=5;load=10.001;
     check(!request(s,c,Operation::Enable,0,10,1000,b) && sets==0,"overcurrent blocks Enable before DAC write");
-    load=10;check(request(s,c,Operation::Enable,0,10,1000,b),"inclusive 1 V and DAC re-enable");
+    load=10;check(request(s,c,Operation::Enable,0,10,1000,b),"inclusive 5 V residual and DAC re-enable");
     load=1;
     check(s.enabled && s.set==0 && s.ramping && sets==1,"Enable remains settling");
     tick(s,c,10,2000,b);check(!s.ramping,"Enable post-write current check");

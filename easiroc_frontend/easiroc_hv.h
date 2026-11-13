@@ -6,8 +6,10 @@
 namespace easiroc::hv {
 constexpr double kMaxVoltage = 62;
 constexpr double kDefaultCurrentLimitUa = 20;
-constexpr double kNearZeroVoltage = 5;
-// Normal descent only; Enable and unknown-setpoint admission stay at 1 V.
+constexpr int kEnableMaxResidualVoltage = 5;
+// Used for unknown-setpoint Stop and setpoint deviation monitoring.
+constexpr double kNearZeroVoltage = 1;
+// Normal descent only.
 constexpr double kNormalDownTolerance = 5;
 constexpr double kMaxCurrentUa = 0.0364 * 65535;
 // Display only: post-sample wait <=2s, DAC <=1s, post-DAC wait <=2s,

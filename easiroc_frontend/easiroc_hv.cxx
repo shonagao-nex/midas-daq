@@ -112,7 +112,8 @@ bool request(State& s, const Context& c, Operation operation, double target,
       // the first DAC byte can release shutdown before zero is transferred.
       if (s.enabled_known && s.enabled) return reject(kAlreadyEnabledReason);
       sample(s,b,now);
-      if (s.measured.voltage>kNearZeroVoltage) return reject("Residual voltage exceeds 1 V");
+      if (s.measured.voltage>kEnableMaxResidualVoltage)
+        return reject("Residual voltage exceeds " + std::to_string(kEnableMaxResidualVoltage) + " V");
       if (s.measured.current>limit) return reject("CurrentLimit exceeded; cannot Enable");
       writeSet(s,0,b,completed(b,now));
       s.target=0;
