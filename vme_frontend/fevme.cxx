@@ -73,6 +73,7 @@ static const DWORD V7XX_EVENT_COUNTER_MASK = 0x00FFFFFF;
 static const DWORD V1190_EVENT_COUNTER_MASK = 0x003FFFFF;
 
 /* Finite ready/handshake polling limits. */
+static const unsigned V792_READY_MAX_POLLS = 100;
 static const unsigned V1190_READY_MAX_POLLS = 100;
 static const unsigned V775_READY_MAX_POLLS = 100;
 static const unsigned V1720E_READY_MAX_POLLS = 100;
@@ -903,6 +904,22 @@ static V1190EventInfo read_v1190_event(DWORD (&data)[V1190_MAX_EVENT_WORDS])
   return readout.event;
 }
 
+static bool wait_for_v792_data_ready()
+{
+  for (unsigned poll = 0; poll < V792_READY_MAX_POLLS; ++poll) {
+    WORD status = 0;
+    if (!vme_read16(V792_BASE + V792_CSR1_RO, status, "V792 Status1"))
+      return false;
+    if (status & 0x0001u)
+      return true;
+    if (poll + 1 < V792_READY_MAX_POLLS)
+      ss_sleep(1);
+  }
+  cm_msg(MERROR, frontend_name, "V792 DataReady timeout after %u polls",
+         V792_READY_MAX_POLLS);
+  return false;
+}
+
 static bool wait_for_v1190_data_ready()
 {
   WORD status = 0;
@@ -916,7 +933,7 @@ static bool wait_for_v1190_data_ready()
       ss_sleep(1);
   }
   cm_msg(MERROR, frontend_name,
-       "V1190 DataReady timeout after %u polls; V792 FIFO was not consumed",
+       "V1190 DataReady timeout after %u polls; no FIFO was consumed",
        V1190_READY_MAX_POLLS);
   return false;
 }
@@ -930,7 +947,7 @@ static bool wait_for_v775_data_ready()
       ss_sleep(1);
   }
   cm_msg(MERROR, frontend_name,
-       "V775 DataReady timeout after %u polls; V792 FIFO was not consumed",
+       "V775 DataReady timeout after %u polls; no FIFO was consumed",
        V775_READY_MAX_POLLS);
   return false;
 }
@@ -963,7 +980,7 @@ static bool wait_for_v1720e_data_ready()
   mark_run_counters_dirty();
   cm_msg(MERROR, frontend_name,
        "V1720E DataReady timeout after %u polls (Event Stored %u); "
-       "V792 FIFO was not consumed",
+       "no FIFO was consumed",
        V1720E_READY_MAX_POLLS, event_stored);
   return false;
 }
@@ -1272,12 +1289,11 @@ static void publish_vme_enabled_for_run()
 
 static bool validate_v792_event_source_dependency()
 {
-  if (!gVmeConfig.v792.enabled &&
+  if (!gVmeState.single_event_busy_enabled_for_run && !gVmeConfig.v792.enabled &&
     (gV1190Config.run_settings.enabled || gVmeConfig.v775.enabled ||
      gV1720State.run.settings.enabled)) {
     cm_msg(MERROR, frontend_name,
-         "V792 must be enabled when any VME physics readout module "
-         "is enabled");
+         "VME readout requires V792 or RPV130 SingleEventBusyEnabled");
     return false;
   }
   return true;
@@ -2197,8 +2213,7 @@ INT begin_of_run(INT run_number, char *error)
   }
   if (!validate_v792_event_source_dependency()) {
     snprintf(error, 256,
-         "V792 must be enabled when any VME physics readout module "
-         "is enabled");
+         "VME readout requires V792 or RPV130 SingleEventBusyEnabled");
     mark_configuration_failed(run_number);
     return finish(FE_ERR_ODB);
   }
@@ -2473,7 +2488,7 @@ INT frontend_loop()
 }
 
 
-// Detect a ready VME event without consuming data
+// Detect an accepted FIN1 trigger or a ready V792 event without consuming data.
 INT poll_event(INT source, INT count, BOOL test)
 {
   if (!gVmeState.frontend_enabled_for_run)
@@ -2481,8 +2496,26 @@ INT poll_event(INT source, INT count, BOOL test)
   if (!global_busy::readout_allowed())
     return 0;
   if (!gVme || gVmeState.readout_failed ||
-    !gVmeConfig.v792.enabled ||
     (gV1720State.run.settings.enabled && !gV1720State.lifecycle.started))
+    return 0;
+  if (gVmeState.single_event_busy_enabled_for_run) {
+    for (INT i = 0; i < count; ++i) {
+      bool busy1 = false;
+      uint8_t csr1 = 0;
+      const int status = rpv130_read_busy1(gVme, RPV130_BASE_ADDRESS, &busy1, &csr1);
+      if (test)
+        continue;
+      if (status != MVME_SUCCESS ||
+          (csr1 & RPV130_CSR1_CHANNEL1_ARMED) != RPV130_CSR1_CHANNEL1_ARMED) {
+        fail_single_event_busy("FIN1 disarmed or CSR1 read failed during polling");
+        return 0;
+      }
+      if (busy1)
+        return 1;
+    }
+    return 0;
+  }
+  if (!gVmeConfig.v792.enabled)
     return 0;
   for (INT i = 0; i < count; ++i) {
     if (v792_DataReady(gVme, V792_BASE) && !test) {
@@ -2663,15 +2696,10 @@ INT read_vme_event(char *pevent, INT off)
   if (!gVme || gVmeState.readout_failed)
     return 0;
   if (gVmeState.single_event_busy_enabled_for_run) {
-    bool busy1 = false;
-    uint8_t csr1 = 0;
-    const int busy_status = rpv130_read_busy1(
-      gVme, RPV130_BASE_ADDRESS, &busy1, &csr1);
-    if (busy_status != MVME_SUCCESS ||
-      !busy1 ||
-      (csr1 & RPV130_CSR1_CHANNEL1_ARMED) !=
-        RPV130_CSR1_CHANNEL1_ARMED) {
-      fail_single_event_busy("FIN1 BUSY1 absent, disarmed, or CSR1 read failed");
+    // poll_event observed BUSY1. It remains latched until the event is read.
+    const uint8_t tag = SERIAL_NUMBER(pevent) & 0x07u;
+    if (rpv130_pulse_event_tag(gVme, RPV130_BASE_ADDRESS, tag) != MVME_SUCCESS) {
+      fail_single_event_busy("RPV130 event tag pulse write failed");
       return 0;
     }
     if (!publish_rpv130_busy_state(true, true)) {
@@ -2680,9 +2708,10 @@ INT read_vme_event(char *pevent, INT off)
     }
   }
 
-  // V792 is the primary trigger. Do not consume it until every enabled peer FIFO is ready.
-  bool peers_ready = true;
-  if (gV1190Config.run_settings.enabled) {
+  // FIN1 can arrive before V792 is ready. Check every enabled FIFO before reading.
+  bool peers_ready = !gVmeState.single_event_busy_enabled_for_run ||
+    !gVmeConfig.v792.enabled || wait_for_v792_data_ready();
+  if (peers_ready && gV1190Config.run_settings.enabled) {
     peers_ready = wait_for_v1190_data_ready();
   }
   if (peers_ready && gVmeConfig.v775.enabled) {
@@ -2797,6 +2826,20 @@ INT read_vme_event(char *pevent, INT off)
 
   if (!check_event_counter_match(v792, v1190, v775, v1720_event)) {
     if (gVmeState.single_event_busy_enabled_for_run) {
+      const auto format_counter = [](bool enabled, DWORD counter) -> std::string {
+        if (!enabled)
+          return "disabled";
+        char value[11];
+        snprintf(value, sizeof(value), "0x%06X", counter);
+        return value;
+      };
+      cm_msg(MERROR, frontend_name,
+             "Event counter mismatch: MIDAS serial=%u V792=%s V775=%s V1720E=%s V1190=%s",
+             SERIAL_NUMBER(pevent),
+             format_counter(gVmeConfig.v792.enabled, v792.event_counter).c_str(),
+             format_counter(gVmeConfig.v775.enabled, v775.event_counter).c_str(),
+             format_counter(v1720_event != nullptr, v1720.event_counter).c_str(),
+             format_counter(gV1190Config.run_settings.enabled, v1190.event_counter).c_str());
       fail_single_event_busy("participating module event counters differ");
       return 0;
     }

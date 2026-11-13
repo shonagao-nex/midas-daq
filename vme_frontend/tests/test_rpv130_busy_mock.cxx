@@ -18,6 +18,7 @@ int fail_write_call = 0;
 bool keep_busy = false;
 bool drop_enable3 = false;
 std::vector<uint8_t> writes;
+std::vector<uint16_t> pulse_writes;
 std::vector<char> csr1_accesses;
 
 void reset(uint8_t value) {
@@ -29,6 +30,7 @@ void reset(uint8_t value) {
     keep_busy = false;
     drop_enable3 = false;
     writes.clear();
+    pulse_writes.clear();
     csr1_accesses.clear();
 }
 }
@@ -63,11 +65,16 @@ extern "C" int mvme_read(MVME_INTERFACE *, void *dst,
     std::memcpy(dst, &value, sizeof(value));
     return MVME_SUCCESS;
 }
-extern "C" int mvme_write(MVME_INTERFACE *, mvme_addr_t address,
+extern "C" int mvme_write(MVME_INTERFACE *vme, mvme_addr_t address,
                            void *src, mvme_size_t count) {
-    assert(address == RPV130_BASE_ADDRESS + 0x0C && count == 2);
+    assert(vme->am == MVME_AM_A16_ND && vme->dmode == MVME_DMODE_D16 && count == 2);
     uint16_t value = 0;
     std::memcpy(&value, src, sizeof(value));
+    if (address == RPV130_BASE_ADDRESS + 0x08) {
+        pulse_writes.push_back(value);
+        return fail_write_call ? MVME_ACCESS_ERROR : MVME_SUCCESS;
+    }
+    assert(address == RPV130_BASE_ADDRESS + 0x0C);
     writes.push_back(static_cast<uint8_t>(value));
     csr1_accesses.push_back('W');
     if (static_cast<int>(writes.size()) == fail_write_call)
@@ -90,6 +97,19 @@ int main() {
     MVME_INTERFACE vme = {};
     vme.am = MVME_AM_A24_ND;
     vme.dmode = MVME_DMODE_D32;
+    reset(0x38);
+    for (uint8_t tag = 0; tag < 8; ++tag)
+        assert(rpv130_pulse_event_tag(&vme, RPV130_BASE_ADDRESS, tag) == MVME_SUCCESS);
+    assert(pulse_writes == std::vector<uint16_t>({1, 3, 5, 7, 9, 11, 13, 15}));
+    assert(csr1_accesses.empty() && read_calls == 0 && csr1 == 0x38);
+    assert(vme.am == MVME_AM_A24_ND && vme.dmode == MVME_DMODE_D32);
+
+    reset(0x38);
+    fail_write_call = 1;
+    assert(rpv130_pulse_event_tag(&vme, RPV130_BASE_ADDRESS, 0) == MVME_ACCESS_ERROR);
+    assert(pulse_writes == std::vector<uint16_t>({1}) && csr1_accesses.empty());
+    assert(vme.am == MVME_AM_A24_ND && vme.dmode == MVME_DMODE_D32);
+
     uint8_t raw = 0;
     bool busy = false;
     reset(RPV130_CSR1_BUSY1 | RPV130_CSR1_CHANNEL1_ARMED);
@@ -196,9 +216,16 @@ int main() {
     const auto write = source.find("rpv130_clear_busy1_and_rearm(", arm);
     assert(arm != std::string::npos && gate != std::string::npos &&
            gate < write);
+    const auto poll = source.find("INT poll_event(");
+    const auto fin1_poll = source.find("rpv130_read_busy1(", poll);
+    const auto fallback_poll = source.find("v792_DataReady(", poll);
+    assert(poll != std::string::npos && fin1_poll < fallback_poll);
     const auto event = source.find("INT read_vme_event(");
     const auto event_gate = source.find("if (gVmeState.single_event_busy_enabled_for_run)", event);
     const auto event_write = source.find("rpv130_clear_busy1_preserving_enable_state(", event);
+    const auto tag_write = source.find("rpv130_pulse_event_tag(", event);
+    const auto v792_ready = source.find("wait_for_v792_data_ready()", event);
+    assert(event_gate < tag_write && tag_write < v792_ready && v792_ready < event_write);
     assert(event != std::string::npos && event_gate < event_write &&
            source.find("rpv130_clear_busy1_preserving_enable_state_timed(", event)
                == std::string::npos);

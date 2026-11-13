@@ -8,6 +8,7 @@ const mvme_addr_t RPV130_LATCH1  = 0x00;
 const mvme_addr_t RPV130_LATCH2  = 0x02;
 const mvme_addr_t RPV130_RSFF    = 0x04;
 const mvme_addr_t RPV130_THROUGH = 0x06;
+const mvme_addr_t RPV130_PULSE   = 0x08;
 const mvme_addr_t RPV130_CSR1    = 0x0C;
 const mvme_addr_t RPV130_CSR2    = 0x0E;
 
@@ -133,6 +134,19 @@ int rpv130_read_busy1(MVME_INTERFACE *mvme, mvme_addr_t base,
         if (csr1) *csr1 = raw;
     }
     return result;
+}
+
+int rpv130_pulse_event_tag(MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t tag)
+{
+    int saved_am = 0, saved_dmode = 0;
+    const int select_result = select_rpv130_mode(mvme, &saved_am, &saved_dmode);
+    if (select_result != MVME_SUCCESS)
+        return select_result;
+
+    const uint8_t outputs = 1u | ((tag & 0x07u) << 1);
+    const int write_result = write_d16(mvme, base + RPV130_PULSE, outputs);
+    const int restore_result = restore_mode(mvme, saved_am, saved_dmode);
+    return write_result == MVME_SUCCESS ? restore_result : write_result;
 }
 
 static int write_channel1_sequence(MVME_INTERFACE *mvme, mvme_addr_t base,

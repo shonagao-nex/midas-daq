@@ -89,6 +89,10 @@ int main() {
                             "INT read_vme_configuration_event(");
   gate_before_access(poll, "v792_DataReady(",
                      "poll_event can access VME before readout is allowed");
+  gate_before_access(poll, "rpv130_read_busy1(",
+                     "poll_event can read FIN1 BUSY before readout is allowed");
+  gate_before_access(read, "rpv130_pulse_event_tag(",
+                     "read_vme_event can pulse the event tag before readout is allowed");
   gate_before_access(read, "wait_for_v1190_data_ready(",
                      "read_vme_event can access VME before readout is allowed");
   std::cout << "test_readout_gate_contract: passed\n";

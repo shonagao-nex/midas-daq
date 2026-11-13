@@ -42,6 +42,8 @@ int rpv130_read_status(MVME_INTERFACE *mvme, mvme_addr_t base,
 /* CSR1 D5 is the FIN1-driven hardware BUSY1 state. */
 int rpv130_read_busy1(MVME_INTERFACE *mvme, mvme_addr_t base,
                       bool *busy, uint8_t *csr1);
+/* Pulse OUT0 and the asserted tag bits on OUT1-3 in one write. */
+int rpv130_pulse_event_tag(MVME_INTERFACE *mvme, mvme_addr_t base, uint8_t tag);
 /* BOR arm: CLR1, then ENABLE1|MASK1; preserve unrelated ENABLE3. */
 int rpv130_clear_busy1_and_rearm(MVME_INTERFACE *mvme, mvme_addr_t base,
                                   uint8_t *csr1);
