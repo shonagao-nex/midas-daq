@@ -156,6 +156,10 @@ std::string easiroc_alarm_detail(const std::string& reason) {
                         "/DAQ/Status/Frontends/EASIROC/OverflowCount",
                         "over-threshold flag");
   if (!detail.empty()) return detail;
+  detail = count_detail(
+      reason, "/DAQ/Status/Frontends/EASIROC/MissingHGADCEventCount",
+      "missing HG ADC");
+  if (!detail.empty()) return detail;
   return count_detail(
       reason, "/DAQ/Status/Frontends/EASIROC/EventContentErrorCount",
       "content error");

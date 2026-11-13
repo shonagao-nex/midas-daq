@@ -47,6 +47,7 @@ struct EasirocRawStatus {
   std::uint64_t timeout_count = 0;
   std::uint64_t overflow_count = 0;
   std::uint64_t event_content_error_count = 0;
+  std::uint64_t missing_hg_adc_event_count = 0;
 };
 
 struct ConfigurationRawStatus {

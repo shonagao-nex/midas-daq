@@ -1401,14 +1401,7 @@ INT poll_event(INT, INT, BOOL test) {
         ++g_state.runtime.statistics.adc_overflow_count;
     }
     try {
-      auto decoded = easiroc::organizeEvent(event);
-      if (decoded.missing_high_gain) {
-        auto& count = g_state.runtime.statistics.event_content_error_count;
-        if (++count == 1)
-          cm_msg(MINFO, "poll_event",
-                 "Missing HG ADC channel; recording invalid ADC event and continuing");
-      }
-      g_state.pending_events.push_back(std::move(decoded));
+      g_state.pending_events.push_back(easiroc::organizeEvent(event));
     } catch (const std::exception& exception) {
       ++g_state.runtime.statistics.event_content_error_count;
       handle_acquisition_error(exception.what());
@@ -1446,6 +1439,12 @@ INT read_physics_event(char* pevent, INT) {
     bk_create(pevent, "EAER", TID_WORD, reinterpret_cast<void**>(&data));
     *data++ = 1;  // Missing HG ADC. Both gain arrays are invalid.
     bk_close(pevent, data);
+    ++g_state.runtime.statistics.missing_hg_adc_event_count;
+    cm_msg(MINFO, "read_physics_event",
+           "WARNING: Run %d event %u (MIDAS serial): missing HG ADC channel; "
+           "ADC marked invalid, acquisition continuing",
+           g_state.run_snapshot.run_number,
+           static_cast<unsigned>(SERIAL_NUMBER(pevent)));
   }
 
   // EALG payload generation and validation are active, but writing this bank

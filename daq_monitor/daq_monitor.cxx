@@ -360,6 +360,7 @@ struct StatusInputs {
   std::uint64_t easiroc_timeout_count;
   std::uint64_t overflow_count;
   std::uint64_t easiroc_event_content_error_count;
+  std::uint64_t easiroc_missing_hg_adc_event_count;
   LoggerSource logger;
   daq_monitor::RunParticipation run_participation;
 };
@@ -529,6 +530,9 @@ void collect_easiroc_inputs(StatusInputs* inputs) {
   read_value(gDatabase,
       "/Equipment/EASIROC/Variables/Statistics/EventContentErrorCount",
       TID_QWORD, &easiroc_event_content_error_count);
+  read_value(gDatabase,
+      "/Equipment/EASIROC/Variables/Statistics/MissingHGADCEventCount",
+      TID_QWORD, &inputs->easiroc_missing_hg_adc_event_count);
 }
 
 //************************************//
@@ -631,6 +635,8 @@ StatusDecision evaluate_status_inputs(const StatusInputs& inputs,
   raw_status.easiroc.overflow_count = overflow_count;
   raw_status.easiroc.event_content_error_count =
       easiroc_event_content_error_count;
+  raw_status.easiroc.missing_hg_adc_event_count =
+      inputs.easiroc_missing_hg_adc_event_count;
   raw_status.vme_configuration = {
       vme_configuration_ok != FALSE, vme_configuration_run_number,
       vme_configuration_checked_unix};
@@ -848,6 +854,8 @@ bool publish_easiroc_status(const StatusInputs& inputs,
           TID_QWORD);
   PUBLISH("/DAQ/Status/Frontends/EASIROC/EventContentErrorCount",
           easiroc_event_content_error_count, TID_QWORD);
+  PUBLISH("/DAQ/Status/Frontends/EASIROC/MissingHGADCEventCount",
+          inputs.easiroc_missing_hg_adc_event_count, TID_QWORD);
 #undef PUBLISH
   return ok;
 }
