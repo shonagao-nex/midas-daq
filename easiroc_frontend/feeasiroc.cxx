@@ -1401,7 +1401,14 @@ INT poll_event(INT, INT, BOOL test) {
         ++g_state.runtime.statistics.adc_overflow_count;
     }
     try {
-      g_state.pending_events.push_back(easiroc::organizeEvent(event));
+      auto decoded = easiroc::organizeEvent(event);
+      if (decoded.missing_high_gain) {
+        auto& count = g_state.runtime.statistics.event_content_error_count;
+        if (++count == 1)
+          cm_msg(MINFO, "poll_event",
+                 "Missing HG ADC channel; recording invalid ADC event and continuing");
+      }
+      g_state.pending_events.push_back(std::move(decoded));
     } catch (const std::exception& exception) {
       ++g_state.runtime.statistics.event_content_error_count;
       handle_acquisition_error(exception.what());
@@ -1434,6 +1441,12 @@ INT read_physics_event(char* pevent, INT) {
   bk_create(pevent, "EAHG", TID_WORD, reinterpret_cast<void**>(&data));
   for (const auto value : payloads.high_gain) *data++ = value;
   bk_close(pevent, data);
+
+  if (event.missing_high_gain) {
+    bk_create(pevent, "EAER", TID_WORD, reinterpret_cast<void**>(&data));
+    *data++ = 1;  // Missing HG ADC. Both gain arrays are invalid.
+    bk_close(pevent, data);
+  }
 
   // EALG payload generation and validation are active, but writing this bank
   // is intentionally disabled until low-gain storage is requested.

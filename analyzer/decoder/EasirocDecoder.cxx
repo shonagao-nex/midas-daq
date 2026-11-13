@@ -45,8 +45,18 @@ bool EasirocDecoder::Decode(TMEvent& event, DecodedEvent& output) const {
     return false;
   const char* data = event.GetBankData(adc);
   if (!data) return false;
-  for (std::size_t channel = 0; channel < output.easiroc.eadc0.size(); ++channel)
-    output.easiroc.eadc0[channel] = ReadWord(data, channel);
+  TMBank* adc_error = event.FindBank("EAER");
+  if (adc_error) {
+    if (adc_error->type != TID_WORD ||
+        adc_error->data_size != sizeof(std::uint16_t))
+      return false;
+    const char* error_data = event.GetBankData(adc_error);
+    if (!error_data || ReadWord(error_data, 0) != 1) return false;
+    output.easiroc.eadc0.fill(kInvalidValue);
+  } else {
+    for (std::size_t channel = 0; channel < output.easiroc.eadc0.size(); ++channel)
+      output.easiroc.eadc0[channel] = ReadWord(data, channel);
+  }
 
   if (!DecodeHits(event, "ETLE", output.easiroc.etle0) ||
       !DecodeHits(event, "ETTR", output.easiroc.ettr0))

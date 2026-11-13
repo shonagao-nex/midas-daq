@@ -1,8 +1,13 @@
 #include "EventBuilder.h"
 #include "EventDiagnostics.h"
+#include "RootTreeWriter.h"
+
+#include "TMemFile.h"
+#include "TTree.h"
 
 #include "midasio.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -27,22 +32,73 @@ TMEvent VmeEvent(std::uint32_t serial) {
   return event;
 }
 
-TMEvent EasirocEvent(std::uint32_t serial) {
+TMEvent EasirocEvent(std::uint32_t serial, bool missing_hg = false) {
   TMEvent event;
   event.Init(1, 0, serial);
-  const std::array<std::uint16_t, 64> adc_words{};
+  std::array<std::uint16_t, 64> adc_words{};
+  adc_words.fill(static_cast<std::uint16_t>(serial));
   event.AddBank("EAHG", TID_WORD,
                 reinterpret_cast<const char*>(adc_words.data()),
                 sizeof(adc_words));
+  if (missing_hg) {
+    const std::uint16_t flag = 1;
+    event.AddBank("EAER", TID_WORD, reinterpret_cast<const char*>(&flag),
+                  sizeof(flag));
+  }
   event.AddBank("ETLE", TID_WORD, "", 0);
   event.AddBank("ETTR", TID_WORD, "", 0);
   return event;
 }
 
+bool CheckMissingHgSequence() {
+  TMemFile file("missing-hg.root", "RECREATE");
+  ana::RootTreeWriter writer;
+  if (!Check(writer.BeginRun(&file), "could not initialize ROOT tree"))
+    return false;
+
+  ana::EventBuilder builder([&writer](const ana::DecodedEvent& event) {
+    writer.Fill(event);
+  });
+  for (std::uint32_t serial = 1; serial <= 3; ++serial) {
+    auto vme = VmeEvent(serial);
+    auto easiroc = EasirocEvent(serial, serial == 2);
+    builder.AddEvent(vme, ana::RawEventSource::kVme);
+    builder.AddEvent(easiroc, ana::RawEventSource::kEasiroc);
+  }
+  bool okay = Check(builder.GetStatistics().paired == 3 &&
+                        builder.GetStatistics().decoder_errors == 0 &&
+                        builder.PendingCount() == 0,
+                    "normal, missing HG, normal must produce three pairs");
+  auto* tree = file.Get<TTree>("tree");
+  if (!Check(tree && tree->GetEntries() == 3, "ROOT must contain three rows"))
+    return false;
+
+  Long64_t event = 0, vme = 0, easiroc = 0, v792 = 0;
+  std::array<Int_t, 64> adc{};
+  if (!Check(tree->SetBranchAddress("event", &event) >= 0 &&
+                 tree->SetBranchAddress("vme_counter", &vme) >= 0 &&
+                 tree->SetBranchAddress("easiroc_counter", &easiroc) >= 0 &&
+                 tree->SetBranchAddress("v792_counter", &v792) >= 0 &&
+                 tree->SetBranchAddress("eadc0", adc.data()) >= 0,
+             "could not read ROOT counters and ADC"))
+    return false;
+  for (Long64_t i = 0; i < 3; ++i) {
+    const auto serial = i + 1;
+    okay &= Check(tree->GetEntry(i) > 0 && event == serial &&
+                      vme == serial && easiroc == serial && v792 == serial,
+                  "ROOT row must preserve the VME and EASIROC pairing");
+    const int expected = serial == 2 ? -999 : static_cast<int>(serial);
+    okay &= Check(std::all_of(adc.begin(), adc.end(),
+                              [expected](int value) { return value == expected; }),
+                  "ROOT must contain 64 invalid ADC values only in the flagged row");
+  }
+  return okay;
+}
+
 }  // namespace
 
 int main() {
-  bool okay = true;
+  bool okay = CheckMissingHgSequence();
   std::size_t emitted = 0;
   ana::EventBuilder builder([&emitted](const ana::DecodedEvent&) { ++emitted; });
 

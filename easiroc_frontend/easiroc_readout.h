@@ -21,13 +21,14 @@ struct TdcHit {
 struct DecodedEvent {
   std::array<std::uint16_t, kAdcChannelCount> high_gain{};
   std::array<std::uint16_t, kAdcChannelCount> low_gain{};
+  bool missing_high_gain = false;
   std::vector<TdcHit> leading;
   std::vector<TdcHit> trailing;
 };
 
-// Organizes one decoded wire event for readout. Exactly one HG and one LG word
-// per channel are required. Scaler and unknown words are rejected because the
-// acquisition mode enables ADC/TDC only.
+// Organizes one decoded wire event for readout. Missing HG marks the ADC
+// payload invalid. Duplicate ADC words, LG-only omissions, scaler and
+// unknown words are rejected.
 DecodedEvent organizeEvent(const Event& event);
 
 // MIDAS-independent payload representation. ETLE and ETTR contain repeating

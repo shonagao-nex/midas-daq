@@ -195,6 +195,8 @@ add_executable(event_builder_test
   tests/EventBuilderTest.cxx
   src/EventBuilder.cxx
   src/EventDiagnostics.cxx
+  src/RootTreeWriter.cxx
+  "${CMAKE_CURRENT_BINARY_DIR}/G__RootTreeTypes.cxx"
   decoder/V792Decoder.cxx
   decoder/V775Decoder.cxx
   decoder/V1190Decoder.cxx
@@ -206,7 +208,9 @@ target_include_directories(event_builder_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/decoder"
 )
 target_compile_options(event_builder_test PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(event_builder_test PRIVATE rootana::rootana midas::midas)
+target_link_libraries(event_builder_test PRIVATE rootana::rootana midas::midas
+  ROOT::Core ROOT::RIO ROOT::Tree
+)
 add_test(NAME event_builder_test COMMAND event_builder_test)
 
 add_executable(histogram_config_loader_test

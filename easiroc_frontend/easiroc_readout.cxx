@@ -46,11 +46,15 @@ DecodedEvent organizeEvent(const Event& event) {
     }
   }
 
-  for (std::size_t channel = 0; channel < kAdcChannelCount; ++channel) {
-    if (!have_high_gain[channel])
-      throw std::runtime_error("missing HG ADC channel in event");
-    if (!have_low_gain[channel])
-      throw std::runtime_error("missing LG ADC channel in event");
+  for (const bool present : have_high_gain)
+    result.missing_high_gain |= !present;
+
+  if (result.missing_high_gain) {
+    result.high_gain.fill(0);
+    result.low_gain.fill(0);
+  } else {
+    for (const bool present : have_low_gain)
+      if (!present) throw std::runtime_error("missing LG ADC channel in event");
   }
   return result;
 }

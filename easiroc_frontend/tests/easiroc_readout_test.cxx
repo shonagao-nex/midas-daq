@@ -84,10 +84,25 @@ int main() {
                                               5, 2, 1600}),
           "TDC bank payload is not channel,hit,value triplets");
 
+    auto missing_hg = event;
+    missing_hg.data.erase(missing_hg.data.begin());
+    --missing_hg.data_size;
+    const auto incomplete = easiroc::organizeEvent(missing_hg);
+    const auto invalid = easiroc::makeBankPayloads(incomplete);
+    check(incomplete.missing_high_gain &&
+              invalid.high_gain == decltype(invalid.high_gain){} &&
+              invalid.low_gain == decltype(invalid.low_gain){},
+          "missing HG must invalidate all ADC channels");
+    check(invalid.leading == payloads.leading &&
+              invalid.trailing == payloads.trailing,
+          "missing HG must preserve valid TDC hits");
+
     auto next_event = makeEvent();
     addTdc(&next_event, easiroc::DataType::kTdcLeading, 5, 1700);
     const auto next_decoded = easiroc::organizeEvent(next_event);
-    check(next_decoded.leading.size() == 1 &&
+    check(!next_decoded.missing_high_gain &&
+              next_decoded.high_gain[0] == 100 &&
+              next_decoded.leading.size() == 1 &&
               next_decoded.leading[0].hit == 1,
           "hit count did not reset between events");
 
