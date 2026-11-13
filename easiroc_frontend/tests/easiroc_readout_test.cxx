@@ -84,24 +84,38 @@ int main() {
                                               5, 2, 1600}),
           "TDC bank payload is not channel,hit,value triplets");
 
-    auto missing_hg = event;
-    missing_hg.data.erase(missing_hg.data.begin());
-    --missing_hg.data_size;
-    const auto incomplete = easiroc::organizeEvent(missing_hg);
-    const auto invalid = easiroc::makeBankPayloads(incomplete);
-    check(incomplete.missing_high_gain &&
-              invalid.high_gain == decltype(invalid.high_gain){} &&
-              invalid.low_gain == decltype(invalid.low_gain){},
-          "missing HG must invalidate all ADC channels");
-    check(invalid.leading == payloads.leading &&
-              invalid.trailing == payloads.trailing,
-          "missing HG must preserve valid TDC hits");
+    struct MissingAdc {
+      bool high_gain;
+      bool low_gain;
+    };
+    for (const MissingAdc missing :
+         {MissingAdc{true, false}, MissingAdc{false, true},
+          MissingAdc{true, true}}) {
+      auto incomplete_event = event;
+      if (missing.low_gain)
+        incomplete_event.data.erase(incomplete_event.data.begin() + 1);
+      if (missing.high_gain)
+        incomplete_event.data.erase(incomplete_event.data.begin());
+      incomplete_event.data_size =
+          static_cast<std::uint16_t>(incomplete_event.data.size());
+      const auto incomplete = easiroc::organizeEvent(incomplete_event);
+      const auto invalid = easiroc::makeBankPayloads(incomplete);
+      check(incomplete.missing_high_gain == missing.high_gain &&
+                incomplete.missing_low_gain == missing.low_gain,
+            "missing gain flags must match the missing ADC words");
+      check(invalid.high_gain == decltype(invalid.high_gain){} &&
+                invalid.low_gain == decltype(invalid.low_gain){},
+            "missing HG or LG must invalidate all ADC channels");
+      check(invalid.leading == payloads.leading &&
+                invalid.trailing == payloads.trailing,
+            "missing HG or LG must preserve valid TDC hits");
+    }
 
     auto next_event = makeEvent();
     addTdc(&next_event, easiroc::DataType::kTdcLeading, 5, 1700);
     const auto next_decoded = easiroc::organizeEvent(next_event);
-    check(!next_decoded.missing_high_gain &&
-              next_decoded.high_gain[0] == 100 &&
+    check(!next_decoded.missing_high_gain && !next_decoded.missing_low_gain &&
+              next_decoded.high_gain[0] == 100 && next_decoded.low_gain[0] == 200 &&
               next_decoded.leading.size() == 1 &&
               next_decoded.leading[0].hit == 1,
           "hit count did not reset between events");

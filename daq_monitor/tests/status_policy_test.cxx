@@ -186,6 +186,12 @@ void test_easiroc_integrity() {
                   Severity::kWarning);
   EXPECT(evaluate_easiroc(RunState::kRunning, raw).reason ==
          "EASIROC missing HG ADC channel");
+  raw.missing_hg_adc_event_count = 0;
+  raw.missing_lg_adc_event_count = 2;
+  expect_severity(evaluate_easiroc(RunState::kRunning, raw),
+                  Severity::kWarning);
+  EXPECT(evaluate_easiroc(RunState::kRunning, raw).reason ==
+         "EASIROC missing LG ADC channel");
   expect_severity(evaluate_easiroc(RunState::kStopped, raw), Severity::kOk);
   raw.event_content_error_count = 1;
   expect_severity(evaluate_easiroc(RunState::kRunning, raw), Severity::kError);

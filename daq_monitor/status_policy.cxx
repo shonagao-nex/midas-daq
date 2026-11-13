@@ -127,6 +127,8 @@ ComponentStatus evaluate_easiroc(RunState run_state,
     return status(Severity::kError, "EASIROC event content error detected");
 
   if (raw.connected && raw.status_fresh) {
+    if (is_run_active(run_state) && raw.missing_lg_adc_event_count > 0)
+      return status(Severity::kWarning, "EASIROC missing LG ADC channel");
     if (is_run_active(run_state) && raw.missing_hg_adc_event_count > 0)
       return status(Severity::kWarning, "EASIROC missing HG ADC channel");
     if (is_run_active(run_state) && raw.overflow_count > 0)

@@ -455,6 +455,8 @@ bool publish_runtime_variables(const RuntimePublishView& view) {
                 view.runtime.statistics.event_content_error_count);
   PUBLISH_QWORD(statistics.c_str(), "MissingHGADCEventCount",
                 view.runtime.statistics.missing_hg_adc_event_count);
+  PUBLISH_QWORD(statistics.c_str(), "MissingLGADCEventCount",
+                view.runtime.statistics.missing_lg_adc_event_count);
   PUBLISH_QWORD(statistics.c_str(), "ADCOverflowCount",
                 view.runtime.statistics.adc_overflow_count);
   PUBLISH_QWORD(statistics.c_str(), "LastDrainBytes",

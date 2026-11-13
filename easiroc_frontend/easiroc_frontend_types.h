@@ -27,6 +27,7 @@ struct RuntimeStatistics {
   std::uint64_t decode_error_count = 0;
   std::uint64_t event_content_error_count = 0;
   std::uint64_t missing_hg_adc_event_count = 0;
+  std::uint64_t missing_lg_adc_event_count = 0;
   std::uint64_t adc_overflow_count = 0;
   std::uint64_t last_drain_bytes = 0;
   std::uint64_t total_drain_bytes = 0;

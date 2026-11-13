@@ -48,13 +48,12 @@ DecodedEvent organizeEvent(const Event& event) {
 
   for (const bool present : have_high_gain)
     result.missing_high_gain |= !present;
+  for (const bool present : have_low_gain)
+    result.missing_low_gain |= !present;
 
-  if (result.missing_high_gain) {
+  if (result.missing_high_gain || result.missing_low_gain) {
     result.high_gain.fill(0);
     result.low_gain.fill(0);
-  } else {
-    for (const bool present : have_low_gain)
-      if (!present) throw std::runtime_error("missing LG ADC channel in event");
   }
   return result;
 }

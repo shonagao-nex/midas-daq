@@ -1435,16 +1435,22 @@ INT read_physics_event(char* pevent, INT) {
   for (const auto value : payloads.high_gain) *data++ = value;
   bk_close(pevent, data);
 
-  if (event.missing_high_gain) {
+  if (event.missing_high_gain || event.missing_low_gain) {
     bk_create(pevent, "EAER", TID_WORD, reinterpret_cast<void**>(&data));
-    *data++ = 1;  // Missing HG ADC. Both gain arrays are invalid.
+    *data++ = 1;  // Both ADC gain arrays are invalid.
     bk_close(pevent, data);
-    ++g_state.runtime.statistics.missing_hg_adc_event_count;
+    g_state.runtime.statistics.missing_hg_adc_event_count +=
+        event.missing_high_gain;
+    g_state.runtime.statistics.missing_lg_adc_event_count +=
+        event.missing_low_gain;
+    const char* missing_gain = event.missing_high_gain
+                                   ? (event.missing_low_gain ? "HG and LG" : "HG")
+                                   : "LG";
     cm_msg(MINFO, "read_physics_event",
-           "WARNING: Run %d event %u (MIDAS serial): missing HG ADC channel; "
+           "WARNING: Run %d event %u (MIDAS serial): missing %s ADC channel; "
            "ADC marked invalid, acquisition continuing",
            g_state.run_snapshot.run_number,
-           static_cast<unsigned>(SERIAL_NUMBER(pevent)));
+           static_cast<unsigned>(SERIAL_NUMBER(pevent)), missing_gain);
   }
 
   // EALG payload generation and validation are active, but writing this bank
