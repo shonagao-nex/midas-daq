@@ -21,7 +21,6 @@ struct Access {
   const char *log_source;
   bool (*read16)(MVME_INTERFACE *, DWORD, WORD &, const char *);
   bool (*write16)(MVME_INTERFACE *, DWORD, WORD, const char *);
-  int (*read_thresholds)(MVME_INTERFACE *, DWORD, WORD *);
 };
 
 struct Readback {

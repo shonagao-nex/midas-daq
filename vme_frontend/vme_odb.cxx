@@ -222,6 +222,7 @@ bool publish_run_snapshot(const VmeRunSnapshot &snapshot)
          TID_BOOL);
 
 #define SNAP_V792(base, object) \
+    SNAP(base "/ChannelEnableMask", object.channel_enable_mask, 1, TID_DWORD); \
     SNAP(base "/Enabled", object.enabled, 1, TID_BOOL); \
     SNAP(base "/Iped", object.iped, 1, TID_WORD); \
     SNAP(base "/ZeroSuppressionEnabled", object.zero_suppression_enabled, 1, TID_BOOL); \
@@ -250,6 +251,7 @@ bool publish_run_snapshot(const VmeRunSnapshot &snapshot)
 #undef SNAP_V1190
 
 #define SNAP_V775(base, object) \
+    SNAP(base "/ChannelEnableMask", object.channel_enable_mask, 1, TID_DWORD); \
     SNAP(base "/Enabled", object.enabled, 1, TID_BOOL); \
     SNAP(base "/FullScaleRange", object.full_scale_range, 1, TID_WORD); \
     SNAP(base "/OverRangeEnabled", object.over_range_enabled, 1, TID_BOOL); \
@@ -617,6 +619,7 @@ bool ensure_v792_settings_schema(const V792Settings &d)
 {
     char p[256];
 #define E792(n, m, t) do { if (!make_odb_path(p,sizeof(p),V792_SETTINGS_PATH,n) || !ensure_odb_value(p,&d.m,sizeof(d.m),1,t)) return false; } while (0)
+    E792("ChannelEnableMask", channel_enable_mask, TID_DWORD);
     E792("Enabled", enabled, TID_BOOL);
     E792("Iped", iped, TID_WORD);
     E792("ZeroSuppressionEnabled", zero_suppression_enabled, TID_BOOL);
@@ -659,6 +662,7 @@ bool ensure_v775_settings_schema(const V775Settings &d)
 {
     char p[256];
 #define E775(n, m, t) do { if (!make_odb_path(p,sizeof(p),V775_SETTINGS_PATH,n) || !ensure_odb_value(p,&d.m,sizeof(d.m),1,t)) return false; } while (0)
+    E775("ChannelEnableMask", channel_enable_mask, TID_DWORD);
     E775("Enabled", enabled, TID_BOOL);
     E775("FullScaleRange", full_scale_range, TID_WORD);
     E775("OverRangeEnabled", over_range_enabled, TID_BOOL);
@@ -679,6 +683,7 @@ bool read_v792_settings(V792Settings &s)
 {
     V792Settings n = {}; char p[256];
 #define R792(k,m,t) do { if (!make_odb_path(p,sizeof(p),V792_SETTINGS_PATH,k) || !get_absolute_odb_value(p,&n.m,sizeof(n.m),t)) return false; } while (0)
+    R792("ChannelEnableMask", channel_enable_mask, TID_DWORD);
     R792("Enabled",enabled,TID_BOOL); R792("Iped",iped,TID_WORD);
     R792("ZeroSuppressionEnabled",zero_suppression_enabled,TID_BOOL);
     R792("AllTriggerEnabled",all_trigger_enabled,TID_BOOL);
@@ -712,6 +717,7 @@ bool read_v775_settings(V775Settings &s)
 {
     V775Settings n = {}; char p[256];
 #define R775(k,m,t) do { if (!make_odb_path(p,sizeof(p),V775_SETTINGS_PATH,k) || !get_absolute_odb_value(p,&n.m,sizeof(n.m),t)) return false; } while (0)
+    R775("ChannelEnableMask", channel_enable_mask, TID_DWORD);
     R775("Enabled",enabled,TID_BOOL); R775("FullScaleRange",full_scale_range,TID_WORD);
     R775("OverRangeEnabled",over_range_enabled,TID_BOOL); R775("LowThresholdEnabled",low_threshold_enabled,TID_BOOL);
     R775("CommonStop",common_stop,TID_BOOL); R775("EmptyProgramEnabled",empty_program_enabled,TID_BOOL);

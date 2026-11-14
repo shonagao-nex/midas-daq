@@ -772,13 +772,13 @@ static bool vme_write16(DWORD address, WORD value, const char *description)
 // Bind V792 configuration to the existing checked VME access functions.
 static v792_config::Access v792_configuration_access()
 {
-  return {gVme, V792_BASE, frontend_name, vme_read16_at, vme_write16_at, v792_ThresholdRead};
+  return {gVme, V792_BASE, frontend_name, vme_read16_at, vme_write16_at};
 }
 
 // Bind V775 configuration to the existing checked VME access functions.
 static v775_config::Access v775_configuration_access()
 {
-  return {gVme, V775_BASE, frontend_name, vme_read16_at, vme_write16_at, v775_ThresholdRead};
+  return {gVme, V775_BASE, frontend_name, vme_read16_at, vme_write16_at};
 }
 
 // Bind V1190 clear to the existing checked VME access functions.

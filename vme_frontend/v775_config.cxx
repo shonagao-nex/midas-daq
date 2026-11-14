@@ -1,4 +1,5 @@
 #include "v775_config.h"
+#include "v7xx_channel_mask.h"
 #include <cstring>
 
 namespace v775_config {
@@ -7,6 +8,7 @@ V775Settings default_v775_settings()
 {
     V775Settings s = {};
     s.enabled = FALSE;
+    s.channel_enable_mask = 0xFFFFFFFFu;
     s.full_scale_range = 0x00FF; // nominal 140 ns / 35 ps LSB
     s.over_range_enabled = TRUE;
     s.low_threshold_enabled = TRUE;
@@ -60,7 +62,9 @@ bool configure_for_run(const Access &access, const V775Settings &settings)
   v775_run_bits(settings, set, clear);
   return access.write16(access.vme, access.base + V775_FULL_SCALE_RANGE, settings.full_scale_range, "V775 Full Scale Range") &&
          access.write16(access.vme, access.base + V775_BIT_SET2, set, "V775 run bits set") &&
-         access.write16(access.vme, access.base + V775_BIT_CLEAR2, clear, "V775 run bits clear");
+         access.write16(access.vme, access.base + V775_BIT_CLEAR2, clear, "V775 run bits clear") &&
+         v7xx_channel_mask::apply(access, V775_THRESHOLD_BASE, settings.channel_enable_mask,
+                                 "V775 channel mask");
 }
 
 // Read V775 registers and compare all run settings.
@@ -70,7 +74,8 @@ VerifyStatus verify_configuration(const Access &access, const V775Settings &sett
       !access.read16(access.vme, access.base + V775_BIT_SET2, result.bits, "V775 Bit Set 2 verify") ||
       !access.read16(access.vme, access.base + V775_FIRMWARE_REVISION, result.firmware, "V775 Firmware") ||
       !access.read16(access.vme, access.base + V775_FCLR_WINDOW, result.fast_clear, "V775 Fast Clear") ||
-      access.read_thresholds(access.vme, access.base, result.thresholds) != V775_MAX_CHANNELS)
+      !v7xx_channel_mask::readback(access, V775_THRESHOLD_BASE, result.thresholds,
+                                   "V775 channel mask verify"))
     return VerifyStatus::ReadFailure;
 
   const auto verify = [&](const char *item, unsigned expected, unsigned actual) {
@@ -89,6 +94,8 @@ VerifyStatus verify_configuration(const Access &access, const V775Settings &sett
   VERIFY_BIT("SlidingScale", sliding_scale_enabled, V775_BIT2_SLIDE_ENABLE);
   VERIFY_BIT("AllTrigger", all_trigger_enabled, V775_BIT2_ALL_TRIGGER);
 #undef VERIFY_BIT
+  ok = verify("ChannelEnableMask", settings.channel_enable_mask,
+              v7xx_channel_mask::enabled_mask(result.thresholds)) && ok;
   return ok ? VerifyStatus::Matched : VerifyStatus::Mismatch;
 }
 

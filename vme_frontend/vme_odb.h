@@ -24,6 +24,7 @@ struct V1720ESettings {
 struct V792Settings {
     BOOL enabled;
     WORD iped;
+    DWORD channel_enable_mask; // Bit n enables channel n.
     BOOL zero_suppression_enabled;
     BOOL all_trigger_enabled;
 };
@@ -50,6 +51,7 @@ struct V1190Settings {
 struct V775Settings {
     BOOL enabled;
     WORD full_scale_range;
+    DWORD channel_enable_mask; // Bit n enables channel n.
     BOOL over_range_enabled;
     BOOL low_threshold_enabled;
     BOOL common_stop;
