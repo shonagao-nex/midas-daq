@@ -7,8 +7,9 @@ if (!new URLSearchParams(window.location.search).has('smallpad')) {
   settings.SmallPad = { width: 80, height: 60 };
 }
 
-// Set the initial vertical scale of the SciFi canvases.
-const sciFiPages = new Set([
+// Set the initial vertical scale of selected histogram canvases.
+const logYPages = new Set([
+  'QDC0_00_31',
   'SciFi_1X_1Y_ADC', 'SciFi_1X_1Y_TDC_Leading',
   'SciFi_2X_2Y_ADC', 'SciFi_2X_2Y_TDC_Leading',
 ]);
@@ -17,7 +18,7 @@ TFramePainter.prototype.createXY = function(opts) {
   const painter = this.getPadPainter();
   const pad = painter?.getRootPad();
   const canvas = painter?.getCanvPainter()?.getRootPad();
-  if (opts?.ndim === 1 && pad && sciFiPages.has(canvas?.fName) && !painter._interactively_changed)
+  if (opts?.ndim === 1 && pad && logYPages.has(canvas?.fName) && !painter._interactively_changed)
     pad.fLogy = 1;
   return createXY.call(this, opts);
 };
